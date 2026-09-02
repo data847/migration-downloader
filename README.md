@@ -16,6 +16,27 @@ and retry-free error reporting:
 `X-GitHub-Api-Version` defaults to `2022-11-28` for user scope and `2026-03-10`
 for org scope, exactly as the document specifies; both are overridable.
 
+## Step 1: the token
+
+The one manual step, straight from the document. Create a PAT with:
+
+| | Scopes |
+|---|---|
+| GitHub, personal repos | `repo` + `user` |
+| GitHub, org repos | `repo` + `admin:org` — and you must be an org **Owner** or hold the [Migrator role](https://docs.github.com/en/migrations/ado/granting-the-migrator-role) |
+| GitLab | `api` + `write_repository` (a *legacy* token on GitLab.com) |
+
+Then either paste it into the UI (used for that run only, never stored), or put
+it in an env file so you never paste it again:
+
+```bash
+printf 'GITHUB_TOKEN=ghp_…\nGITLAB_TOKEN=glpat-…\n' > .env && chmod 600 .env
+DATALABS_ENV_FILE="$PWD/.env" ./run.sh
+```
+
+Inside the DataLabs workspace this is already handled — the one `.env` at the
+workspace root is picked up automatically.
+
 ## Run the UI
 
 ```bash
@@ -23,8 +44,10 @@ for org scope, exactly as the document specifies; both are overridable.
 ./run.sh --port 9000
 ```
 
-First run creates `.venv` (bundled `uv`, Python 3.12, Flask only — the API
-clients are stdlib). Inside the DataLabs workspace it is also registered in
+Requires Python 3.9+ and nothing else. First run creates `.venv` — the DataLabs
+bundled `uv` if present, `uv` from PATH if you have it, otherwise
+`python3 -m venv` — and installs Flask, the only dependency (the API clients
+are stdlib). Inside the DataLabs workspace it is also registered in
 `.claude/launch.json` as `migration-downloader`.
 
 The page: pick GitHub/GitLab, pick the host, pick user/org, choose the repos,

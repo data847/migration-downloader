@@ -13,10 +13,21 @@ The workspace root is searched first, so the vendored copy can never shadow it.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+STANDALONE = not (HERE.parent / "datalabs_paths.py").is_file()
+
+# Standalone checkout: `datalabs_paths` resolves to vendor/, which would put its
+# notion of the root inside vendor/ and scatter outputs there. Anchor the three
+# invariants on the component directory instead — unless the caller (or the
+# Dockerfile) already set them, which always wins.
+if STANDALONE:
+    os.environ.setdefault("DATALABS_ENV_FILE", str(HERE / ".env"))
+    os.environ.setdefault("DATALABS_OUTPUTS_DIR", str(HERE / "outputs"))
+    os.environ.setdefault("DATALABS_CLONES_DIR", str(HERE / "clones"))
 
 for entry in (str(HERE.parent), str(HERE)):   # workspace root wins
     if entry not in sys.path:
