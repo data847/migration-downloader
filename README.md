@@ -23,13 +23,70 @@ for org scope, exactly as the document specifies; both are overridable.
 ./run.sh --port 9000
 ```
 
-Also registered in `.claude/launch.json` as `migration-downloader`.
 First run creates `.venv` (bundled `uv`, Python 3.12, Flask only — the API
-clients are stdlib).
+clients are stdlib). Inside the DataLabs workspace it is also registered in
+`.claude/launch.json` as `migration-downloader`.
 
 The page: pick GitHub/GitLab, user/org, paste repos one per line, start. The
 run log streams live (POST → state transitions → download progress), then each
-archive appears with its size, SHA-256 and a download link.
+archive appears with its size and SHA-256.
+
+### Downloading
+
+Archives are on disk under `outputs/migration-downloader/<run>/` either way,
+but the UI can hand them straight to the browser:
+
+- **Download** per archive, in the Archives table;
+- **Download all (.zip)** for a whole run — the tarballs are bundled *stored*,
+  not recompressed, so it is a fast repackage rather than a second squeeze;
+- **.zip** per past run, in the Output folders table.
+
+### Runs survive reloads and restarts
+
+Every run's state and full log are written to
+`outputs/migration-downloader/.jobs/` as it progresses:
+
+- **Reload the page** mid-run and it re-attaches: the log replays and keeps
+  streaming, download buttons appear when it finishes.
+- **Restart the server** (or the container) and the run is restored as
+  `interrupted` — the archive is still building on GitHub/GitLab regardless of
+  what happens here. Press **Resume this run** and it polls the *same*
+  migration id (step 2 skipped), reuses the same output folder, and skips any
+  archive already downloaded. Nothing is re-exported needlessly.
+- The **Runs** table lists every run with its state; **View** reopens any log.
+
+## Docker
+
+```bash
+./docker-build.sh              # or: docker compose build
+docker compose up -d           # http://127.0.0.1:8765
+docker compose logs -f
+```
+
+The image is `python:3.12-slim`, runs as non-root uid 10001, and carries no
+secrets — both invariants arrive as mounts, declared in `docker-compose.yml`:
+
+| Host | Container | |
+|---|---|---|
+| `../outputs` | `/data/outputs` | archives, manifests, job records |
+| `../.env` | `/app/secrets/.env` | read-only |
+
+`DATALABS_OUTPUTS_DIR` and `DATALABS_ENV_FILE` point at those paths, so job
+records land on the host and survive `docker compose down`. Standalone (outside
+the DataLabs tree) mount your own:
+
+```bash
+docker run -d -p 8765:8765 \
+  -v "$PWD/archives:/data/outputs" \
+  -v "$PWD/.env:/app/secrets/.env:ro" \
+  migration-downloader:latest
+```
+
+The CLI works in the container too:
+
+```bash
+docker exec migration-downloader python cli.py github --scope org --org TEST_ORG guava
+```
 
 ## CLI
 
@@ -42,14 +99,18 @@ archive appears with its size, SHA-256 and a download link.
 
 Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
 
-## Invariants
+## Invariants (DataLabs workspace)
 
 - **Tokens** come from `DataLabs/.env` (`GH_TOKEN`/`GITHUB_TOKEN`,
   `GITLAB_TOKEN`) via `datalabs_paths`; a PAT typed into the UI overrides for
   that run only and is never persisted or logged (only masked).
 - **Outputs**: `outputs/migration-downloader/<run>/` — the tarballs plus a
-  `manifest.json` per run (targets, migration ids, sizes, checksums, errors).
-  Nothing is written anywhere else; no clone store is touched.
+  `manifest.json` per run (targets, migration ids, sizes, checksums, errors),
+  and `.jobs/` for the run records. Nothing is written anywhere else; no clone
+  store is touched.
+- `bootstrap.py` resolves `datalabs_paths` from the workspace root first and
+  `vendor/` only as a fallback, so the vendored copy the image needs can never
+  shadow the real one. `./docker-build.sh` refreshes it.
 
 ## Notes
 
