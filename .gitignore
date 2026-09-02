@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+outputs/
+
+# only the vendored copy is tracked; a stray root copy would shadow the
+# workspace root definition of the invariants
+/datalabs_paths.py

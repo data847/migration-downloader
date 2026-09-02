@@ -1,0 +1,18 @@
+services:
+  migration-downloader:
+    build: .
+    image: migration-downloader:latest
+    container_name: migration-downloader
+    ports:
+      - "8765:8765"
+    volumes:
+      # invariant #2 — archives, manifests and job records land in the one
+      # outputs root on the host, not inside the container
+      - ../outputs:/data/outputs
+      # invariant #1 — the one env file, read-only. A symlink would not resolve
+      # inside a bind mount, so mount the file itself.
+      - ../.env:/app/secrets/.env:ro
+    environment:
+      DATALABS_OUTPUTS_DIR: /data/outputs
+      DATALABS_ENV_FILE: /app/secrets/.env
+    restart: unless-stopped

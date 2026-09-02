@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migration Downloader</title>
+<style>
+  :root{
+    color-scheme:light dark;
+    --bg:#0f1115; --panel:#171a21; --panel-2:#1e222b; --line:#2a2f3a;
+    --fg:#e6e9ef; --muted:#9aa4b6; --accent:#5b9dff; --accent-fg:#fff;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --pad:24px;
+  }
+  @media (prefers-color-scheme:light){
+    :root{ --bg:#f6f7f9; --panel:#fff; --panel-2:#f0f2f5; --line:#dfe3ea;
+           --fg:#12151b; --muted:#5c6675; --accent:#1f6feb; }
+  }
+  *{box-sizing:border-box}
+  html,body{max-width:100%;overflow-x:hidden}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-text-size-adjust:100%}
+  header{padding:16px var(--pad);border-bottom:1px solid var(--line);
+    display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+    position:sticky;top:0;background:var(--bg);z-index:5}
+  h1{font-size:17px;margin:0;font-weight:650}
+  header .sub{color:var(--muted);font-size:12.5px}
+  main{display:grid;grid-template-columns:minmax(320px,400px) minmax(0,1fr);
+    align-items:start}
+  .form{padding:18px var(--pad);border-right:1px solid var(--line);
+    position:sticky;top:53px;max-height:calc(100vh - 53px);overflow-y:auto}
+  .right{padding:18px var(--pad);display:flex;flex-direction:column;gap:16px;min-width:0}
+  @media (max-width:900px){
+    :root{--pad:16px}
+    main{grid-template-columns:1fr}
+    .form{border-right:0;border-bottom:1px solid var(--line);position:static;
+      max-height:none;overflow:visible}
+    header{position:static}
+    /* narrow screens scroll the table sideways instead of squeezing each
+       cell into a one-character-per-line column */
+    .scroll table{min-width:560px}
+    .scroll td,.scroll th{padding:9px 12px}
+    td.mono{white-space:nowrap;word-break:normal}
+    pre#log{font-size:12px;max-height:44vh}
+  }
+  @media (max-width:420px){ .scroll table{min-width:480px} }
+  fieldset{border:0;padding:0;margin:0 0 14px;min-width:0}
+  label{display:block;font-size:11.5px;color:var(--muted);margin:0 0 5px;
+    text-transform:uppercase;letter-spacing:.05em}
+  input[type=text],input[type=password],input[type=number],textarea{
+    width:100%;background:var(--panel);color:var(--fg);border:1px solid var(--line);
+    border-radius:8px;padding:10px 11px;font:inherit;font-size:16px;min-height:42px}
+  textarea{min-height:104px;font-family:var(--mono);font-size:13px;resize:vertical}
+  input:focus,textarea:focus{outline:2px solid color-mix(in srgb,var(--accent) 55%,transparent);
+    outline-offset:-1px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 130px;min-width:0}
+  .seg{display:flex;background:var(--panel);border:1px solid var(--line);
+    border-radius:9px;padding:3px;gap:3px}
+  .seg button{flex:1;background:transparent;border:0;color:var(--muted);
+    padding:9px 8px;border-radius:6px;font:inherit;font-size:14px;cursor:pointer;
+    min-height:38px}
+  .seg button[aria-pressed=true]{background:var(--panel-2);color:var(--fg);
+    box-shadow:inset 0 0 0 1px var(--line)}
+  .check{display:flex;align-items:center;gap:9px;margin:10px 0;color:var(--fg);
+    font-size:14px;text-transform:none;letter-spacing:0;min-height:34px}
+  .check input{width:auto;min-height:0;accent-color:var(--accent);
+    width:17px;height:17px;flex:none}
+  .hint{color:var(--muted);font-size:12.5px;margin-top:6px}
+  .hint code{background:var(--panel-2);padding:1px 4px;border-radius:4px;font-size:11.5px}
+  button.primary{width:100%;background:var(--accent);color:var(--accent-fg);border:0;
+    border-radius:9px;padding:13px;font:inherit;font-weight:600;cursor:pointer;min-height:46px}
+  button.primary:disabled{opacity:.5;cursor:default}
+  .ghost{background:transparent;color:var(--fg);border:1px solid var(--line);
+    border-radius:8px;padding:7px 11px;font:inherit;font-size:13px;cursor:pointer;
+    min-height:34px;white-space:nowrap;text-decoration:none;display:inline-flex;
+    align-items:center;gap:6px}
+  .ghost:hover{border-color:var(--accent);color:var(--accent)}
+  .ghost.hot{border-color:var(--accent);color:var(--accent)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    overflow:hidden;min-width:0}
+  .card h2{margin:0;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--muted);padding:11px 14px;border-bottom:1px solid var(--line);
+    display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+  .card h2 .acts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  pre#log{margin:0;padding:14px;font-family:var(--mono);font-size:12.5px;
+    max-height:min(50vh,520px);overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;
+    white-space:nowrap}
+  td.mono{font-family:var(--mono);font-size:12px;word-break:break-all}
+  tr:last-child td{border-bottom:0}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;
+    border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .pill.run{color:var(--accent);border-color:var(--accent)}
+  .pill.ok{color:var(--ok);border-color:var(--ok)}
+  .pill.bad{color:var(--bad);border-color:var(--bad)}
+  .pill.warn{color:var(--warn);border-color:var(--warn)}
+  a{color:var(--accent)}
+  .steps{display:flex;gap:6px;flex-wrap:wrap}
+  .steps span{font-size:11.5px;color:var(--muted);background:var(--panel);
+    border:1px solid var(--line);border-radius:6px;padding:4px 9px}
+  .paths{font-family:var(--mono);font-size:11.5px;color:var(--muted);word-break:break-all}
+  .banner{background:var(--panel-2);border:1px solid var(--warn);border-radius:10px;
+    padding:11px 14px;font-size:13.5px;display:flex;gap:12px;align-items:center;
+    justify-content:space-between;flex-wrap:wrap}
+  details summary{cursor:pointer;color:var(--muted);font-size:12.5px;margin-bottom:10px;
+    min-height:30px}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>Migration Downloader</h1>
+  <span class="sub">GitHub Migration API &amp; GitLab Export API — initiate, poll, download</span>
+</header>
+
+<main>
+  <form class="form" id="form" autocomplete="off">
+    <div class="seg" role="group" aria-label="Provider">
+      <button type="button" data-provider="github" aria-pressed="true">GitHub</button>
+      <button type="button" data-provider="gitlab" aria-pressed="false">GitLab</button>
+    </div>
+
+    <fieldset style="margin-top:14px">
+      <label for="token">Personal access token</label>
+      <input type="password" id="token" placeholder="paste PAT, or leave blank to use .env">
+      <div class="hint" id="token-hint"></div>
+    </fieldset>
+
+    <div data-only="github">
+      <fieldset>
+        <label>Repository owner type</label>
+        <div class="seg" role="group" aria-label="Scope">
+          <button type="button" data-scope="user" aria-pressed="true">User repos</button>
+          <button type="button" data-scope="org" aria-pressed="false">Org repos</button>
+        </div>
+        <div class="hint" id="scope-hint"></div>
+      </fieldset>
+      <fieldset data-only="org" hidden>
+        <label for="org">Organization</label>
+        <input type="text" id="org" placeholder="TEST_ORG">
+      </fieldset>
+    </div>
+
+    <fieldset>
+      <label for="targets" id="targets-label">Repositories (one per line)</label>
+      <textarea id="targets" placeholder="google/guava"></textarea>
+      <div class="hint" id="targets-hint"></div>
+    </fieldset>
+
+    <fieldset>
+      <div class="row">
+        <div><label for="poll">Poll interval (s)</label>
+          <input type="number" id="poll" value="15" min="5" max="300"></div>
+        <div><label for="timeout">Timeout (s)</label>
+          <input type="number" id="timeout" value="3600" min="60" step="60"></div>
+      </div>
+    </fieldset>
+
+    <details>
+      <summary>Advanced</summary>
+      <fieldset>
+        <label for="run_name">Run name (output folder)</label>
+        <input type="text" id="run_name" placeholder="auto: github-20260902T…Z">
+      </fieldset>
+      <fieldset>
+        <label for="api_base">API base URL</label>
+        <input type="text" id="api_base" placeholder="https://api.github.com">
+        <div class="hint">GitHub Enterprise or self-hosted GitLab.</div>
+      </fieldset>
+      <fieldset data-only="github">
+        <label for="api_version">X-GitHub-Api-Version</label>
+        <input type="text" id="api_version" placeholder="user 2022-11-28 · org 2026-03-10">
+      </fieldset>
+      <label class="check" data-only="github">
+        <input type="checkbox" id="lock_repositories"> Lock repositories during migration</label>
+      <label class="check" data-only="github">
+        <input type="checkbox" id="single_archive"> One archive for all repos</label>
+      <label class="check">
+        <input type="checkbox" id="verify_checksum" checked> Compute SHA-256 of each archive</label>
+    </details>
+
+    <button class="primary" id="go" type="submit">Start migration &amp; download</button>
+    <div class="hint" style="margin-top:12px">
+      Archives are written to<br><span class="paths">{{ outputs_dir }}</span>
+    </div>
+  </form>
+
+  <div class="right">
+    <div class="banner" id="banner" hidden>
+      <span id="banner-text"></span>
+      <span class="acts" style="display:flex;gap:8px">
+        <button class="ghost hot" id="resume" type="button">Resume this run</button>
+        <button class="ghost" id="dismiss" type="button">Dismiss</button>
+      </span>
+    </div>
+
+    <div class="steps">
+      <span>1 · PAT (manual)</span><span>2 · initiate</span>
+      <span>3 · poll status</span><span>4 · download archive</span>
+    </div>
+
+    <div class="card">
+      <h2><span id="log-title">Run log</span>
+        <span class="acts">
+          <span class="pill" id="state">idle</span>
+          <button class="ghost" id="cancel" type="button" hidden>Cancel</button>
+        </span>
+      </h2>
+      <pre id="log">Fill in the form and press start.
+
+Step 1 (creating the PAT) is manual — see the instruction document.
+Everything after that runs here: POST the migration, poll until the
+state is exported / finished, then download the tarball.
+
+Runs survive a page reload and a server restart — this page re-attaches
+to whatever is in flight.</pre>
+    </div>
+
+    <div class="card" id="results-card" hidden>
+      <h2>Archives
+        <span class="acts">
+          <a class="ghost hot" id="zip" href="#" hidden>⬇ Download all (.zip)</a>
+        </span>
+      </h2>
+      <div class="scroll">
+        <table><thead><tr><th>Target</th><th>ID</th><th>Size</th><th>SHA-256</th><th></th></tr></thead>
+        <tbody id="results"></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Runs <button class="ghost" id="refresh" type="button">Refresh</button></h2>
+      <div class="scroll">
+        <table><thead><tr><th>Started (UTC)</th><th>Provider</th><th>Targets</th>
+          <th>State</th><th></th></tr></thead>
+        <tbody id="jobs"><tr><td colspan="5" style="color:var(--muted)">—</td></tr></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Output folders</h2>
+      <div class="scroll">
+        <table><thead><tr><th>Run</th><th>Provider</th><th>Archives</th><th></th></tr></thead>
+        <tbody id="runs"><tr><td colspan="4" style="color:var(--muted)">—</td></tr></tbody></table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }} };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const KEY = 'md.jobId';
+let provider = 'github', scope = 'user', jobId = null, since = 0, timer = null;
+
+/* ── form wiring ─────────────────────────────────────────────────────── */
+function syncVisibility(){
+  document.querySelectorAll('[data-only]').forEach(el => {
+    const key = el.dataset.only;
+    el.hidden = !(key === provider || (key === 'org' && provider === 'github' && scope === 'org'));
+  });
+  const gh = provider === 'github';
+  $('targets-label').textContent = gh
+    ? (scope === 'org' ? 'Repositories (bare names, one per line)' : 'Repositories (owner/repo, one per line)')
+    : 'Projects (namespace/project, one per line)';
+  $('targets').placeholder = gh ? (scope === 'org' ? 'guava' : 'google/guava') : 'group/subgroup/project';
+  $('api_base').placeholder = gh ? 'https://api.github.com' : 'https://gitlab.com';
+  $('scope-hint').innerHTML = scope === 'org'
+    ? 'PAT needs <code>repo</code> + <code>admin:org</code>; you must be an Owner or hold the Migrator role.'
+    : 'PAT needs <code>repo</code> + <code>user</code>.';
+  $('targets-hint').innerHTML = gh
+    ? 'Full URLs and <code>.git</code> suffixes are accepted.'
+    : 'PAT needs <code>api</code> + <code>write_repository</code>. Numeric project IDs and nested subgroups work.';
+  const env = ENV[provider];
+  $('token-hint').innerHTML = env
+    ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
+    : `No ${provider} token found in <code>{{ env_file }}</code>; paste one above.`;
+}
+document.querySelectorAll('[data-provider]').forEach(b => b.onclick = () => {
+  provider = b.dataset.provider;
+  document.querySelectorAll('[data-provider]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  syncVisibility();
+});
+document.querySelectorAll('[data-scope]').forEach(b => b.onclick = () => {
+  scope = b.dataset.scope;
+  document.querySelectorAll('[data-scope]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  syncVisibility();
+});
+
+/* ── log + results ───────────────────────────────────────────────────── */
+function setState(text, cls){ const el = $('state'); el.textContent = text; el.className = 'pill ' + (cls || ''); }
+const STATE_CLS = {running:'run', done:'ok', partial:'warn', error:'bad', cancelled:'warn', interrupted:'warn'};
+
+function append(lines){
+  if(!lines || !lines.length) return;
+  const log = $('log');
+  const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+  log.textContent += lines.join('\n') + '\n';
+  if(stick) log.scrollTop = log.scrollHeight;
+}
+function renderResults(manifest){
+  const card = $('results-card');
+  if(!manifest || !manifest.archives || !manifest.archives.length){ card.hidden = true; return; }
+  const run = (manifest.output_dir || '').split('/').pop();
+  card.hidden = false;
+  const any = manifest.archives.some(a => a.ok);
+  $('zip').hidden = !any;
+  $('zip').href = `/api/archive-zip/${encodeURIComponent(run)}`;
+  $('results').innerHTML = manifest.archives.map(a => {
+    const file = a.path ? a.path.split('/').pop() : '';
+    const dl = a.ok
+      ? `<a class="ghost" href="/api/archive/${encodeURIComponent(run)}/${encodeURIComponent(file)}">⬇ Download</a>`
+      : '';
+    const status = a.ok
+      ? `<span class="mono">${esc(file)}</span>`
+      : `<span class="pill bad">${esc((a.error || 'failed').slice(0,90))}</span>`;
+    return `<tr><td class="mono">${esc(a.target)}<div style="color:var(--muted)">${status}</div></td>
+      <td class="mono">${esc(a.migration_id || '—')}</td><td>${esc(a.size || '—')}</td>
+      <td class="mono">${a.sha256 ? esc(a.sha256.slice(0,12)) + '…' : '—'}</td>
+      <td style="text-align:right">${dl}</td></tr>`;
+  }).join('');
+}
+
+/* ── job attach / poll ───────────────────────────────────────────────── */
+function attach(id, {replay = true} = {}){
+  jobId = id; localStorage.setItem(KEY, id);
+  if(replay){ $('log').textContent = ''; since = 0; }
+  clearInterval(timer);
+  timer = setInterval(poll, 1200);
+  poll();
+}
+async function poll(){
+  if(!jobId) return;
+  const res = await fetch(`/api/jobs/${jobId}?since=${since}`);
+  if(!res.ok){ clearInterval(timer); return; }
+  const job = await res.json();
+  append(job.lines); since = job.total_lines;
+  const running = job.state === 'running';
+  $('log-title').textContent = `Run log · ${job.created_utc.replace('T',' ').slice(0,19)}Z`;
+  setState(job.state, STATE_CLS[job.state] || '');
+  $('cancel').hidden = !running;
+  $('go').disabled = running;
+  renderResults(job.manifest);
+  if(!running){
+    clearInterval(timer);
+    banner(job);
+    loadJobs(); loadRuns();
+  }
+}
+function banner(job){
+  if(job.resumable){
+    $('banner').hidden = false;
+    $('banner-text').textContent = job.state === 'interrupted'
+      ? 'This run was cut off by a server restart — its archive is still building remotely.'
+      : `${job.state}: some targets did not finish.`;
+    $('resume').dataset.job = job.id;
+  } else $('banner').hidden = true;
+}
+$('dismiss').onclick = () => $('banner').hidden = true;
+$('resume').onclick = async () => {
+  const res = await fetch(`/api/jobs/${$('resume').dataset.job}/resume`,
+    {method:'POST', headers:{'Content-Type':'application/json'},
+     body: JSON.stringify({token: $('token').value})});
+  const data = await res.json();
+  if(!res.ok){ append(['ERROR ' + data.error]); return; }
+  $('banner').hidden = true;
+  attach(data.id);
+};
+$('cancel').onclick = () => fetch(`/api/jobs/${jobId}/cancel`, {method:'POST'});
+$('refresh').onclick = () => { loadJobs(); loadRuns(); };
+
+$('form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const payload = { provider, scope,
+    org: $('org').value, token: $('token').value, targets: $('targets').value,
+    poll_interval: $('poll').value, timeout: $('timeout').value,
+    api_base: $('api_base').value, api_version: $('api_version').value,
+    run_name: $('run_name').value,
+    lock_repositories: $('lock_repositories').checked,
+    single_archive: $('single_archive').checked,
+    verify_checksum: $('verify_checksum').checked };
+  $('go').disabled = true; $('banner').hidden = true;
+  $('log').textContent = ''; $('results-card').hidden = true; since = 0;
+  setState('starting', 'run');
+  const res = await fetch('/api/jobs', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if(!res.ok){ setState('error','bad'); append(['ERROR ' + data.error]); $('go').disabled = false; return; }
+  attach(data.id);
+};
+
+/* ── listings ────────────────────────────────────────────────────────── */
+async function loadJobs(){
+  const {jobs} = await (await fetch('/api/jobs')).json();
+  $('jobs').innerHTML = jobs.length ? jobs.map(j => `<tr>
+      <td class="mono">${esc(j.created_utc.replace('T',' ').slice(0,19))}</td>
+      <td>${esc(j.provider)}</td>
+      <td class="mono">${esc(j.targets.slice(0,2).join(', '))}${j.targets.length>2 ? ` +${j.targets.length-2}` : ''}</td>
+      <td><span class="pill ${STATE_CLS[j.state]||''}">${esc(j.state)}</span></td>
+      <td style="text-align:right"><button class="ghost" data-view="${esc(j.id)}">View</button></td>
+    </tr>`).join('') : '<tr><td colspan="5" style="color:var(--muted)">no runs yet</td></tr>';
+  $('jobs').querySelectorAll('[data-view]').forEach(b =>
+    b.onclick = () => attach(b.dataset.view));
+}
+async function loadRuns(){
+  const {runs} = await (await fetch('/api/runs')).json();
+  $('runs').innerHTML = runs.length ? runs.map(r => `<tr>
+      <td class="mono">${esc(r.name)}</td><td>${esc(r.provider)}</td>
+      <td>${r.ok} ok${r.failed ? ` · <span class="pill bad">${r.failed} failed</span>` : ''}</td>
+      <td style="text-align:right">${r.ok ? `<a class="ghost" href="/api/archive-zip/${encodeURIComponent(r.name)}">⬇ .zip</a>` : ''}</td>
+    </tr>`).join('') : '<tr><td colspan="4" style="color:var(--muted)">no output folders yet</td></tr>';
+}
+
+/* ── boot: re-attach to whatever is in flight ────────────────────────── */
+(async function boot(){
+  syncVisibility(); loadJobs(); loadRuns();
+  const {active} = await (await fetch('/api/jobs')).json();
+  const remembered = localStorage.getItem(KEY);
+  const id = active || remembered;
+  if(!id) return;
+  const res = await fetch(`/api/jobs/${id}?since=0`);
+  if(!res.ok){ localStorage.removeItem(KEY); return; }
+  attach(id);
+})();
+</script>
+</body>
+</html>

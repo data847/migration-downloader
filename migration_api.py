@@ -1,0 +1,364 @@
+"""GitHub + GitLab migration/export API clients.
+
+Implements the four-step flows from *Coding Pilot - Upload Instructions v1.0*:
+
+GitHub (user or org)          GitLab (project)
+  1. PAT (supplied)             1. PAT (supplied)
+  2. POST  .../migrations       2. POST  /projects/:path/export
+  3. GET   .../migrations/:id   3. GET   /projects/:path/export
+  4. GET   .../:id/archive      4. GET   /projects/:id/export/download
+
+Stdlib only (urllib) so the component needs nothing but Flask for its UI.
+Tokens are never written to the log stream.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+# Header versions exactly as the instruction document specifies them.
+GITHUB_API_VERSION_USER = "2022-11-28"
+GITHUB_API_VERSION_ORG = "2026-03-10"
+GITHUB_API_BASE = "https://api.github.com"
+GITLAB_API_BASE = "https://gitlab.com"
+
+DOWNLOAD_CHUNK = 1024 * 1024
+
+Logger = Callable[[str], None]
+
+
+class MigrationError(RuntimeError):
+    """Any non-recoverable failure in a migration/export run."""
+
+
+def _noop(_message: str) -> None:
+    pass
+
+
+def mask(token: str) -> str:
+    if not token:
+        return "<empty>"
+    return f"{token[:4]}…{token[-4:]} ({len(token)} chars)" if len(token) > 12 else "<short token>"
+
+
+def _request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict,
+    body: Optional[bytes] = None,
+    timeout: int = 60,
+):
+    req = urllib.request.Request(url, data=body, method=method)
+    for key, value in headers.items():
+        req.add_header(key, value)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _json_request(url: str, *, method: str = "GET", headers: dict, payload=None, timeout: int = 60):
+    body = json.dumps(payload).encode() if payload is not None else None
+    if body is not None:
+        headers = {**headers, "Content-Type": "application/json"}
+    try:
+        with _request(url, method=method, headers=headers, body=body, timeout=timeout) as resp:
+            raw = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as exc:  # surface GitHub/GitLab's own message
+        detail = exc.read().decode("utf-8", "replace")[:600]
+        raise MigrationError(f"HTTP {exc.code} {method} {url}\n{detail}") from None
+    except urllib.error.URLError as exc:
+        raise MigrationError(f"network error {method} {url}: {exc.reason}") from None
+    if not raw.strip():
+        return status, {}
+    try:
+        return status, json.loads(raw)
+    except json.JSONDecodeError:
+        return status, {"raw": raw.decode("utf-8", "replace")}
+
+
+def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int = 120) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with _request(url, headers=headers, timeout=timeout) as resp, partial.open("wb") as fh:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            next_mark = 0
+            while True:
+                chunk = resp.read(DOWNLOAD_CHUNK)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if total:
+                    pct = int(done * 100 / total)
+                    if pct >= next_mark:
+                        log(f"    downloading… {pct}% ({human(done)} / {human(total)})")
+                        next_mark = pct - pct % 10 + 10
+                elif done >= next_mark:
+                    log(f"    downloading… {human(done)}")
+                    next_mark = done + 25 * 1024 * 1024
+    except urllib.error.HTTPError as exc:
+        partial.unlink(missing_ok=True)
+        detail = exc.read().decode("utf-8", "replace")[:600]
+        raise MigrationError(f"HTTP {exc.code} downloading archive\n{detail}") from None
+    except urllib.error.URLError as exc:
+        partial.unlink(missing_ok=True)
+        raise MigrationError(f"network error downloading archive: {exc.reason}") from None
+    partial.replace(dest)
+    return dest
+
+
+def human(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(DOWNLOAD_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def safe_name(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in text).strip("-") or "archive"
+
+
+@dataclass
+class ArchiveResult:
+    target: str
+    path: Optional[Path] = None
+    bytes: int = 0
+    digest: str = ""
+    migration_id: Optional[str] = None
+    state: str = ""
+    error: str = ""
+    skipped: bool = False
+    meta: dict = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        return {
+            "target": self.target,
+            "path": str(self.path) if self.path else "",
+            "bytes": self.bytes,
+            "size": human(self.bytes) if self.bytes else "",
+            "sha256": self.digest,
+            "migration_id": self.migration_id,
+            "state": self.state,
+            "error": self.error,
+            "skipped": self.skipped,
+            "ok": bool(self.path) and not self.error,
+        }
+
+
+# ── GitHub ───────────────────────────────────────────────────────────────────
+
+
+class GitHubMigration:
+    """Steps 2-4 of the GitHub Migration API, for a user or an org."""
+
+    TERMINAL_OK = "exported"
+    TERMINAL_BAD = {"failed", "failed_garbage_collecting"}
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        scope: str = "user",
+        org: str = "",
+        api_base: str = GITHUB_API_BASE,
+        api_version: str = "",
+        lock_repositories: bool = False,
+        log: Logger = _noop,
+    ):
+        if scope not in {"user", "org"}:
+            raise MigrationError("scope must be 'user' or 'org'")
+        if scope == "org" and not org:
+            raise MigrationError("an organization name is required for org scope")
+        if not token:
+            raise MigrationError("a GitHub personal access token is required")
+        self.token = token
+        self.scope = scope
+        self.org = org.strip("/")
+        self.api_base = api_base.rstrip("/")
+        self.api_version = api_version or (
+            GITHUB_API_VERSION_USER if scope == "user" else GITHUB_API_VERSION_ORG
+        )
+        self.lock_repositories = lock_repositories
+        self.log = log
+
+    # -- plumbing ----------------------------------------------------------
+    @property
+    def _headers(self) -> dict:
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": self.api_version,
+            "User-Agent": "DataLabs-migration-downloader",
+        }
+
+    @property
+    def _root(self) -> str:
+        return (
+            f"{self.api_base}/user/migrations"
+            if self.scope == "user"
+            else f"{self.api_base}/orgs/{self.org}/migrations"
+        )
+
+    def normalise(self, repo: str) -> str:
+        """user scope wants `owner/repo`; org scope wants the bare repo name."""
+        repo = repo.strip().strip("/")
+        if repo.startswith(("http://", "https://")):
+            repo = urllib.parse.urlparse(repo).path.strip("/")
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        if self.scope == "org":
+            return repo.split("/")[-1]
+        return repo
+
+    def whoami(self) -> str:
+        _status, data = _json_request(f"{self.api_base}/user", headers=self._headers)
+        return data.get("login", "?")
+
+    # -- step 2 ------------------------------------------------------------
+    def start(self, repos: Iterable[str]) -> str:
+        names = [self.normalise(r) for r in repos if r.strip()]
+        if not names:
+            raise MigrationError("no repositories given")
+        payload = {"lock_repositories": self.lock_repositories, "repositories": names}
+        self.log(f"  POST {self._root}  repositories={names}")
+        _status, data = _json_request(self._root, method="POST", headers=self._headers, payload=payload)
+        migration_id = data.get("id")
+        if not migration_id:
+            raise MigrationError(f"no migration id in response: {json.dumps(data)[:400]}")
+        self.log(f"  migration id = {migration_id} (state {data.get('state')})")
+        return str(migration_id)
+
+    # -- step 3 ------------------------------------------------------------
+    def status(self, migration_id: str) -> dict:
+        _status, data = _json_request(f"{self._root}/{migration_id}", headers=self._headers)
+        return data
+
+    def wait(self, migration_id: str, *, interval: int = 15, timeout: int = 3600, cancelled=None) -> dict:
+        deadline = time.time() + timeout
+        last = ""
+        while True:
+            if cancelled and cancelled():
+                raise MigrationError("cancelled while waiting for the archive")
+            data = self.status(migration_id)
+            state = data.get("state", "?")
+            if state != last:
+                self.log(f"  state = {state}")
+                last = state
+            if state == self.TERMINAL_OK:
+                return data
+            if state in self.TERMINAL_BAD:
+                raise MigrationError(f"migration {migration_id} ended in state '{state}'")
+            if time.time() > deadline:
+                raise MigrationError(
+                    f"timed out after {timeout}s waiting for migration {migration_id} (last state '{state}')"
+                )
+            self._sleep(interval, cancelled)
+
+    @staticmethod
+    def _sleep(seconds: int, cancelled=None) -> None:
+        for _ in range(max(1, seconds)):
+            if cancelled and cancelled():
+                return
+            time.sleep(1)
+
+    # -- step 4 ------------------------------------------------------------
+    def download(self, migration_id: str, dest: Path) -> Path:
+        url = f"{self._root}/{migration_id}/archive"
+        self.log(f"  GET {url}")
+        return _download(url, dest, headers=self._headers, log=self.log)
+
+
+# ── GitLab ───────────────────────────────────────────────────────────────────
+
+
+class GitLabExport:
+    """Steps 2-4 of the GitLab project export API."""
+
+    TERMINAL_OK = "finished"
+    TERMINAL_BAD = {"none", "regeneration_in_progress_failed"}
+
+    def __init__(self, token: str, *, api_base: str = GITLAB_API_BASE, log: Logger = _noop):
+        if not token:
+            raise MigrationError("a GitLab personal access token is required")
+        self.token = token
+        self.api_base = api_base.rstrip("/")
+        self.log = log
+
+    @property
+    def _headers(self) -> dict:
+        return {"PRIVATE-TOKEN": self.token, "User-Agent": "DataLabs-migration-downloader"}
+
+    def normalise(self, project: str) -> str:
+        project = project.strip().strip("/")
+        if project.startswith(("http://", "https://")):
+            project = urllib.parse.urlparse(project).path.strip("/")
+        if project.endswith(".git"):
+            project = project[:-4]
+        return project
+
+    def _project_url(self, project: str, suffix: str = "") -> str:
+        ident = project if project.isdigit() else urllib.parse.quote(project, safe="")
+        return f"{self.api_base}/api/v4/projects/{ident}{suffix}"
+
+    def whoami(self) -> str:
+        _status, data = _json_request(f"{self.api_base}/api/v4/user", headers=self._headers)
+        return data.get("username", "?")
+
+    # -- step 2 ------------------------------------------------------------
+    def start(self, project: str) -> None:
+        url = self._project_url(project, "/export")
+        self.log(f"  POST {url}")
+        status, _data = _json_request(url, method="POST", headers=self._headers)
+        self.log(f"  HTTP {status} — export scheduled" if status in (200, 202) else f"  HTTP {status}")
+
+    # -- step 3 ------------------------------------------------------------
+    def status(self, project: str) -> dict:
+        _status, data = _json_request(self._project_url(project, "/export"), headers=self._headers)
+        return data
+
+    def wait(self, project: str, *, interval: int = 15, timeout: int = 3600, cancelled=None) -> dict:
+        deadline = time.time() + timeout
+        last = ""
+        while True:
+            if cancelled and cancelled():
+                raise MigrationError("cancelled while waiting for the export")
+            data = self.status(project)
+            state = data.get("export_status", "?")
+            if state != last:
+                self.log(f"  export_status = {state}")
+                last = state
+            if state == self.TERMINAL_OK:
+                return data
+            if state in self.TERMINAL_BAD and last:
+                raise MigrationError(f"export of {project} ended in state '{state}'")
+            if time.time() > deadline:
+                raise MigrationError(
+                    f"timed out after {timeout}s waiting for the export of {project} (last state '{state}')"
+                )
+            GitHubMigration._sleep(interval, cancelled)
+
+    # -- step 4 ------------------------------------------------------------
+    def download(self, project: str, dest: Path, *, project_id: Optional[int] = None) -> Path:
+        ident = str(project_id) if project_id else project
+        url = self._project_url(str(ident), "/export/download")
+        self.log(f"  GET {url}")
+        return _download(url, dest, headers=self._headers, log=self.log)
