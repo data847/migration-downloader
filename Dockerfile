@@ -17,7 +17,7 @@ RUN pip install -r requirements.txt
 # vendor/datalabs_paths.py is the workspace's single definition of the three
 # invariants; bootstrap.py prefers the real workspace copy on the host and this
 # vendored one inside the image, so the container needs no repo-root mount.
-COPY bootstrap.py migration_api.py runner.py jobstore.py app.py cli.py ./
+COPY bootstrap.py migration_api.py runner.py jobstore.py redact.py app.py cli.py ./
 COPY vendor/ ./vendor/
 COPY templates/ ./templates/
 

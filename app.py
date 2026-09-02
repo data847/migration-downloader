@@ -27,10 +27,11 @@ from flask import Flask, abort, jsonify, render_template, request, send_file
 import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # noqa: E402
-from migration_api import MigrationError, mask  # noqa: E402
+from migration_api import GitHubMigration, GitLabExport, MigrationError, mask  # noqa: E402
 from runner import COMPONENT, JobSpec, list_runs, run_job  # noqa: E402
 
 import jobstore  # noqa: E402
+import redact  # noqa: E402
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -117,6 +118,55 @@ def job_status(job_id: str):
     )
 
 
+@app.get("/api/jobs/<job_id>/log")
+def job_log(job_id: str):
+    """The run log as a downloadable text file, with secrets redacted.
+
+    Safe to attach to a bug report: tokens, auth headers and credential-bearing
+    URLs are scrubbed, the home directory is collapsed to `~`, and the log
+    itself only ever contained API URLs, states, sizes and file names — never
+    repository content.
+    """
+    job = jobstore.get(job_id)
+    if job is None:
+        abort(404)
+    spec = job.get("spec", {})
+    manifest = job.get("manifest") or {}
+    host = spec.get("api_base") or (
+        "https://api.github.com" if spec.get("provider") == "github" else "https://gitlab.com")
+    header = [
+        "# migration-downloader run log",
+        f"# run id     : {job['id']}",
+        f"# started    : {job.get('created_utc', '')}",
+        f"# finished   : {job.get('updated_utc', '')}",
+        f"# state      : {job.get('state', '')}",
+        f"# provider   : {spec.get('provider', '')}"
+        + (f" ({spec.get('scope')} scope)" if spec.get("provider") == "github" else ""),
+        f"# host       : {host}",
+        f"# targets    : {len(spec.get('targets', []))}",
+        f"# archives   : {manifest.get('ok', 0)} ok, {manifest.get('failed', 0)} failed",
+        f"# token      : {spec.get('token_hint', '')}"
+        + (" (from .env)" if spec.get("token_from_env") else ""),
+        "#",
+        "# secrets are redacted and no repository content is included.",
+        "",
+    ]
+    body = header + redact.scrub_lines(job.get("log", []))
+    if manifest.get("archives"):
+        body += ["", "# --- archives " + "-" * 46]
+        for a in manifest["archives"]:
+            state = "ok" if a.get("ok") else f"FAILED: {a.get('error', '')}"
+            body.append(f"#   {a.get('target')}  id={a.get('migration_id') or '-'}  "
+                        f"{a.get('size') or '-'}  sha256={a.get('sha256') or '-'}  {state}")
+    payload = redact.scrub("\n".join(body) + "\n")
+    return send_file(
+        io.BytesIO(payload.encode()),
+        mimetype="text/plain",
+        as_attachment=True,
+        download_name=f"migration-downloader-{job['id']}.log",
+    )
+
+
 @app.post("/api/jobs/<job_id>/cancel")
 def cancel_job(job_id: str):
     if jobstore.get(job_id) is None:
@@ -140,6 +190,38 @@ def resume_job(job_id: str):
     except MigrationError as exc:
         return jsonify(error=str(exc)), 400
     return jsonify(id=_start(spec))
+
+
+@app.post("/api/discover")
+def discover():
+    """List what the token can see: orgs/groups, or repos/projects.
+
+    POST, not GET, so the PAT never travels in a URL or a server access log.
+    `api_base` is honoured throughout, so this works against GitHub Enterprise
+    and a self-hosted GitLab exactly as it does against the public hosts.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    provider = (data.get("provider") or "github").strip().lower()
+    kind = (data.get("kind") or "repos").strip().lower()       # repos | owners
+    scope = (data.get("scope") or "user").strip().lower()
+    owner = (data.get("owner") or "").strip()                  # org / group
+    api_base = (data.get("api_base") or "").strip()
+    token = (data.get("token") or "").strip() or (
+        github_token() if provider == "github" else gitlab_token())
+    if not token:
+        return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
+    try:
+        if provider == "github":
+            client = GitHubMigration(token, scope=scope, org=owner or "x",
+                                     api_base=api_base or "https://api.github.com")
+            items = client.list_orgs() if kind == "owners" else client.list_repos(
+                org=owner if scope == "org" else "")
+        else:
+            client = GitLabExport(token, api_base=api_base or "https://gitlab.com")
+            items = client.list_groups() if kind == "owners" else client.list_projects(group=owner)
+    except MigrationError as exc:
+        return jsonify(error=str(exc).splitlines()[0]), 400
+    return jsonify(items=items, count=len(items))
 
 
 @app.get("/api/runs")

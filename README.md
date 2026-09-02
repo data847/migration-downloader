@@ -27,9 +27,49 @@ First run creates `.venv` (bundled `uv`, Python 3.12, Flask only — the API
 clients are stdlib). Inside the DataLabs workspace it is also registered in
 `.claude/launch.json` as `migration-downloader`.
 
-The page: pick GitHub/GitLab, user/org, paste repos one per line, start. The
-run log streams live (POST → state transitions → download progress), then each
-archive appears with its size and SHA-256.
+The page: pick GitHub/GitLab, pick the host, pick user/org, choose the repos,
+start. The run log streams live (POST → state transitions → download
+progress), then each archive appears with its size and SHA-256.
+
+### Host — github.com, GitLab.com, or your own
+
+The **Host** row under the provider toggle is the whole story: `github.com` /
+`gitlab.com`, or **Self-hosted**, which reveals an API base URL field.
+
+- GitHub Enterprise: the API root, usually `https://<host>/api/v3`
+- Self-hosted GitLab: the instance root, e.g. `https://gitlab.example.com` —
+  `/api/v4` is appended for you
+
+Everything honours it: discovery, initiate, poll and download. Nested subgroups
+(`group/subgroup/project`) and numeric project IDs work. Two things about a
+private instance are worth knowing: **project export must be enabled**
+server-side (*Admin → Settings → General → Import and export settings*), and a
+**private CA** needs to be trusted — `urllib` uses Python's default TLS
+context, so export the bundle before launching:
+
+```bash
+SSL_CERT_FILE=/path/to/internal-ca.pem ./run.sh
+```
+
+(For the container, mount the PEM and set `SSL_CERT_FILE` in
+`docker-compose.yml`.)
+
+### Choosing repos instead of typing them
+
+**Browse & select…** lists what the token can actually see, with a filter box,
+select-all and private/archived badges:
+
+| | GitHub | GitLab |
+|---|---|---|
+| Owners | **Browse orgs** → `/user/orgs`; picking one loads its repos | **Browse groups** → groups you hold Maintainer+ in |
+| Repos | user scope: repos you own or collaborate on; org scope: the org's repos | projects you could export, newest activity first |
+
+Selected entries are appended to the target list in the exact form the API
+wants — `owner/repo` for user scope, bare names for org scope,
+`group/subgroup/project` for GitLab. GitLab discovery filters to Maintainer
+(access level 40) or above, since that is the floor for exporting a project, so
+the list holds no rows that would 403 on initiate. Typing targets by hand still
+works; the picker only fills the box.
 
 ### Downloading
 
@@ -40,6 +80,20 @@ but the UI can hand them straight to the browser:
 - **Download all (.zip)** for a whole run — the tarballs are bundled *stored*,
   not recompressed, so it is a fast repackage rather than a second squeeze;
 - **.zip** per past run, in the Output folders table.
+
+### Downloading the log
+
+**⬇ Log** in the run-log header (and per row in the Runs table) saves the run
+as a text file — the natural thing to attach when a run fails.
+
+It is scrubbed on the way out by [`redact.py`](redact.py): GitHub and GitLab
+token shapes, `Authorization` / `PRIVATE-TOKEN` / `Bearer` values, credentials
+embedded in URLs, `token=`-style query parameters, and other common key shapes
+(AWS, Slack, JWTs, `sk-…`) are replaced with `<redacted-…>` markers, and the
+home directory collapses to `~` so the log does not name the machine's user.
+The log carries API URLs, states, sizes, checksums and file names — never
+repository content, and never a token in the clear (the runner only ever logs
+the masked form).
 
 ### Runs survive reloads and restarts
 

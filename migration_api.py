@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, List, Optional
 
 # Header versions exactly as the instruction document specifies them.
 GITHUB_API_VERSION_USER = "2022-11-28"
@@ -115,6 +115,26 @@ def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int 
         raise MigrationError(f"network error downloading archive: {exc.reason}") from None
     partial.replace(dest)
     return dest
+
+
+def paged(url: str, *, headers: dict, per_page: int = 100, cap: int = 600) -> list:
+    """Walk `?page=N` until a short page, `cap` items, or an error.
+
+    Used for discovery (listing repos/projects/orgs). Both APIs page the same
+    way, and both cap `per_page` at 100.
+    """
+    items: list = []
+    page = 1
+    while len(items) < cap:
+        sep = "&" if "?" in url else "?"
+        _status, batch = _json_request(f"{url}{sep}per_page={per_page}&page={page}", headers=headers)
+        if not isinstance(batch, list) or not batch:
+            break
+        items.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+    return items[:cap]
 
 
 def human(size: float) -> str:
@@ -233,6 +253,36 @@ class GitHubMigration:
         _status, data = _json_request(f"{self.api_base}/user", headers=self._headers)
         return data.get("login", "?")
 
+    # -- discovery ---------------------------------------------------------
+    def list_orgs(self) -> List[dict]:
+        """Orgs the token can see. Migration needs Owner or the Migrator role,
+        which cannot be read from here — so every org is listed and a 403 on
+        initiate is the real answer."""
+        orgs = paged(f"{self.api_base}/user/orgs", headers=self._headers)
+        return [{"name": o.get("login", ""), "description": o.get("description") or ""}
+                for o in orgs if o.get("login")]
+
+    def list_repos(self, org: str = "") -> List[dict]:
+        """Repos visible to the token — the whole org's when `org` is given,
+        otherwise the ones the user owns or collaborates on."""
+        if org:
+            url = f"{self.api_base}/orgs/{org.strip('/')}/repos?type=all&sort=updated"
+        else:
+            url = f"{self.api_base}/user/repos?affiliation=owner,collaborator&sort=updated"
+        return [
+            {
+                # org scope migrates bare names, user scope owner/repo
+                "target": r.get("name") if org else r.get("full_name"),
+                "label": r.get("full_name") or r.get("name"),
+                "private": bool(r.get("private")),
+                "archived": bool(r.get("archived")),
+                "size_kb": r.get("size") or 0,
+                "updated": (r.get("pushed_at") or r.get("updated_at") or "")[:10],
+            }
+            for r in paged(url, headers=self._headers)
+            if r.get("name")
+        ]
+
     # -- step 2 ------------------------------------------------------------
     def start(self, repos: Iterable[str]) -> str:
         names = [self.normalise(r) for r in repos if r.strip()]
@@ -322,6 +372,44 @@ class GitLabExport:
     def whoami(self) -> str:
         _status, data = _json_request(f"{self.api_base}/api/v4/user", headers=self._headers)
         return data.get("username", "?")
+
+    # -- discovery ---------------------------------------------------------
+    # exporting a project needs Maintainer (40) or above, so discovery filters
+    # to that level rather than listing projects that would 403 on initiate
+    MIN_ACCESS_LEVEL = 40
+
+    def list_groups(self) -> List[dict]:
+        url = f"{self.api_base}/api/v4/groups?min_access_level={self.MIN_ACCESS_LEVEL}&all_available=false"
+        return [{"name": g.get("full_path", ""), "description": g.get("description") or ""}
+                for g in paged(url, headers=self._headers) if g.get("full_path")]
+
+    def list_projects(self, group: str = "") -> List[dict]:
+        """Projects the token could export — optionally only inside one group.
+
+        Works the same against gitlab.com and a self-hosted instance; the only
+        difference is `api_base`.
+        """
+        if group:
+            ident = group if group.isdigit() else urllib.parse.quote(group.strip("/"), safe="")
+            url = (f"{self.api_base}/api/v4/groups/{ident}/projects"
+                   f"?include_subgroups=true&min_access_level={self.MIN_ACCESS_LEVEL}"
+                   f"&order_by=last_activity_at")
+        else:
+            url = (f"{self.api_base}/api/v4/projects"
+                   f"?membership=true&min_access_level={self.MIN_ACCESS_LEVEL}"
+                   f"&order_by=last_activity_at")
+        return [
+            {
+                "target": p.get("path_with_namespace", ""),
+                "label": p.get("path_with_namespace", ""),
+                "private": p.get("visibility") != "public",
+                "archived": bool(p.get("archived")),
+                "size_kb": 0,
+                "updated": (p.get("last_activity_at") or "")[:10],
+            }
+            for p in paged(url, headers=self._headers)
+            if p.get("path_with_namespace")
+        ]
 
     # -- step 2 ------------------------------------------------------------
     def start(self, project: str) -> None:
