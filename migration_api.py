@@ -49,6 +49,34 @@ def mask(token: str) -> str:
     return f"{token[:4]}…{token[-4:]} ({len(token)} chars)" if len(token) > 12 else "<short token>"
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Archive/export downloads 302 to a presigned storage URL (S3, codeload…).
+
+    urllib's default handler replays every original header on the redirect,
+    including our GitHub/GitLab `Authorization`. Presigned URLs already carry
+    their own auth in the query string, so a second `Authorization` header
+    makes the storage host reject the request (e.g. S3's "only one auth
+    mechanism allowed", surfaced here as a plain HTTP 400). Strip the
+    sensitive headers whenever the redirect target isn't the original host.
+    """
+
+    _STRIP = ("Authorization", "Accept", "X-Github-Api-Version", "Private-Token")
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        if urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
+            for header in self._STRIP:
+                # Request.remove_header() doesn't capitalize its argument the
+                # way add_header() capitalized it when storing the key.
+                new_req.remove_header(header.capitalize())
+        return new_req
+
+
+_opener = urllib.request.build_opener(_SafeRedirectHandler)
+
+
 def _request(
     url: str,
     *,
@@ -60,7 +88,7 @@ def _request(
     req = urllib.request.Request(url, data=body, method=method)
     for key, value in headers.items():
         req.add_header(key, value)
-    return urllib.request.urlopen(req, timeout=timeout)
+    return _opener.open(req, timeout=timeout)
 
 
 def _json_request(url: str, *, method: str = "GET", headers: dict, payload=None, timeout: int = 60):
