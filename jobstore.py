@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ensure_outputs, outputs_for
-from migration_api import mask, safe_name
+from migration_api import mask, normalise_gitlab_project, safe_name
 from runner import COMPONENT, JobSpec
 
 JOBS_DIR = ensure_outputs(COMPONENT, ".jobs")
@@ -153,6 +153,17 @@ def active() -> Optional[dict]:
 # ── resume ───────────────────────────────────────────────────────────────────
 
 
+def _spec_targets(job: dict) -> list:
+    """`spec.targets`, normalised the same way ArchiveResult.target is for
+    GitLab (runner.py stores `client.normalise(raw)` there), so comparisons
+    against `done`/on-disk archives match regardless of how the user typed
+    the target (full URL, `.git` suffix, ...)."""
+    targets = job.get("spec", {}).get("targets", [])
+    if job.get("spec", {}).get("provider") == "gitlab":
+        return [normalise_gitlab_project(t) for t in targets]
+    return targets
+
+
 def resume_plan(job: dict) -> Optional[dict]:
     """What is left to do for an interrupted / partial job."""
     if job["state"] not in {"interrupted", "partial", "error", "cancelled"}:
@@ -167,7 +178,7 @@ def resume_plan(job: dict) -> Optional[dict]:
         if "migration id = " in line:
             known.setdefault(job["spec"]["targets"][0] if job["spec"]["targets"] else "",
                              line.split("migration id = ")[1].split()[0])
-    outstanding = [t for t in job["spec"]["targets"] if t not in done]
+    outstanding = [t for t in _spec_targets(job) if t not in done]
     if not outstanding:
         return None
     return {"targets": outstanding, "known_ids": {k: v for k, v in known.items() if v},
@@ -191,7 +202,7 @@ def _already_on_disk(job: dict, manifest: dict) -> set:
     names = {p.name for p in run_dir.iterdir() if p.is_file() and p.stat().st_size}
     ids = {a["target"]: a.get("migration_id") for a in manifest.get("archives", [])}
     settled = set()
-    for target in job.get("spec", {}).get("targets", []):
+    for target in _spec_targets(job):
         stem = safe_name(target)
         migration_id = ids.get(target)
         candidates = {f"{stem}.tar.gz"}

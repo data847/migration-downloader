@@ -185,6 +185,22 @@ def safe_name(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in text).strip("-") or "archive"
 
 
+def normalise_gitlab_project(project: str) -> str:
+    """Strip a GitLab project reference down to its bare `group/project` path.
+
+    Pulled out to module level (from GitLabExport.normalise, which is a pure
+    function of its argument) so it can be reused wherever a GitLab target
+    needs comparing against another without a client instance — e.g. jobstore
+    matching resume targets against already-completed ones.
+    """
+    project = project.strip().strip("/")
+    if project.startswith(("http://", "https://")):
+        project = urllib.parse.urlparse(project).path.strip("/")
+    if project.endswith(".git"):
+        project = project[:-4]
+    return project
+
+
 @dataclass
 class ArchiveResult:
     target: str
@@ -386,12 +402,7 @@ class GitLabExport:
         return {"PRIVATE-TOKEN": self.token, "User-Agent": "DataLabs-migration-downloader"}
 
     def normalise(self, project: str) -> str:
-        project = project.strip().strip("/")
-        if project.startswith(("http://", "https://")):
-            project = urllib.parse.urlparse(project).path.strip("/")
-        if project.endswith(".git"):
-            project = project[:-4]
-        return project
+        return normalise_gitlab_project(project)
 
     def _project_url(self, project: str, suffix: str = "") -> str:
         ident = project if project.isdigit() else urllib.parse.quote(project, safe="")
