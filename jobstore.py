@@ -15,6 +15,7 @@ Tokens are never persisted — only the masked form, for display.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -162,11 +163,17 @@ def resume_plan(job: dict) -> Optional[dict]:
     done = {a["target"] for a in archives if a.get("ok")}
     done |= _already_on_disk(job, manifest)
     known = {a["target"]: a["migration_id"] for a in archives if a.get("migration_id")}
-    # ids also survive in the log when the crash happened before the manifest
+    # ids also survive in the log when the crash happened before the manifest.
+    # runner.py logs "[i/n] <label>" right before each target/batch's own
+    # work, so track that marker to attribute a recovered id to the right
+    # target instead of always the first one.
+    current = job["spec"]["targets"][0] if job["spec"]["targets"] else ""
     for line in job["log"]:
-        if "migration id = " in line:
-            known.setdefault(job["spec"]["targets"][0] if job["spec"]["targets"] else "",
-                             line.split("migration id = ")[1].split()[0])
+        marker = re.match(r"^\[\d+/\d+\]\s+(.+)$", line)
+        if marker:
+            current = marker.group(1)
+        elif "migration id = " in line:
+            known.setdefault(current, line.split("migration id = ")[1].split()[0])
     outstanding = [t for t in job["spec"]["targets"] if t not in done]
     if not outstanding:
         return None
