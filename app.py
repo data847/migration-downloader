@@ -101,7 +101,10 @@ def jobs():
 
 @app.get("/api/jobs/<job_id>")
 def job_status(job_id: str):
-    since = max(0, int(request.args.get("since", 0)))
+    try:
+        since = max(0, int(request.args.get("since", 0)))
+    except (TypeError, ValueError):
+        return jsonify(error="since must be an integer"), 400
     job = jobstore.get(job_id)
     if job is None:
         abort(404)
