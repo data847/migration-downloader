@@ -454,6 +454,7 @@ class GitLabExport:
     def wait(self, project: str, *, interval: int = 15, timeout: int = 3600, cancelled=None) -> dict:
         deadline = time.time() + timeout
         last = ""
+        first = True
         while True:
             if cancelled and cancelled():
                 raise MigrationError("cancelled while waiting for the export")
@@ -464,8 +465,9 @@ class GitLabExport:
                 last = state
             if state == self.TERMINAL_OK:
                 return data
-            if state in self.TERMINAL_BAD and last:
+            if state in self.TERMINAL_BAD and not first:
                 raise MigrationError(f"export of {project} ended in state '{state}'")
+            first = False
             if time.time() > deadline:
                 raise MigrationError(
                     f"timed out after {timeout}s waiting for the export of {project} (last state '{state}')"
