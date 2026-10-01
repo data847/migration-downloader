@@ -176,6 +176,24 @@ docker exec migration-downloader python cli.py github --scope org --org TEST_ORG
 
 Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
 
+## `for-check.csv` (for Garmr)
+
+Next to every archive the run also writes `<archive>.for-check.csv` (for example `acme-widgets-42.tar.gz` and
+`acme-widgets-42.for-check.csv`): facts the archive cannot tell about itself, so a checker can verify it is complete
+without a token or network. Long format, columns `repo,section,key,value`; a blank value means unknown, never a guess.
+
+| Section | Contents |
+|---|---|
+| `meta` | provider, host, scope, org, migration/export id, final state, API version, start/finish time, archive name, bytes, SHA-256, `Content-Length` the server reported, request options |
+| `requested_repo` / `export_repo` | repos asked for, and (GitHub) the repos `GET .../migrations/:id/repositories` says the export contains |
+| `counts_before` / `counts_after` | PRs/MRs, issues, labels, milestones, releases, branches, tags, commits on the default branch, issue/review/commit comments, collaborators, default branch, taken just before the export started and just after it finished (GitHub: one GraphQL call plus REST counts; GitLab: `X-Total` headers and `?statistics=true`) |
+| `ref_before` / `ref_after` | branches, tags and PR/MR head refs on the source with their shas, from `git ls-remote --refs` (the token goes in the environment, never on the command line) |
+| `file` / `file_summary` | every entry in the downloaded archive outside `<repo>.git/objects/` with its size, plus the entry count and bytes of the objects |
+| `error` | anything that could not be collected; collection failures never fail the download |
+
+Disable with `--no-for-check` (CLI) or `for_check=false` in the job spec. Counts are two snapshots because things change while
+an export runs; a checker should only fail when the archive holds fewer than the lower of the two.
+
 ## Invariants (DataLabs workspace)
 
 - **Tokens** come from `DataLabs/.env` (`GH_TOKEN`/`GITHUB_TOKEN`,
