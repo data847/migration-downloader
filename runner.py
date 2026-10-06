@@ -72,9 +72,9 @@ def _parse_owner_repo(target: str) -> str:
 
 
 def _max_items(raw) -> int:
-    """Blank -> the default 200; 0 -> no limit; anything else is the cap."""
+    """Blank -> no limit (the default); 0 -> no limit; anything else is the cap."""
     if raw in (None, ""):
-        return 200
+        return 0
     return max(0, int(raw))
 
 
@@ -103,7 +103,7 @@ class JobSpec:
     for_check: bool = True            # write <archive>.for-check.csv (source-side counts/refs/file list) for Garmr
     # supplementary collectors (see supplementary.py / bitbucket.py)
     extras: List[str] = field(default_factory=list)   # names, or all / everything
-    max_items: int = 200              # cap per unbounded listing (runs, commits, PRs…)
+    max_items: int = 0                # cap per unbounded listing (runs, commits, PRs…)
     # github migration options
     exclude: List[str] = field(default_factory=list)  # metadata, git_data, attachments, releases, owner_projects
     org_metadata_only: bool = False

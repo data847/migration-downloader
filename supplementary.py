@@ -90,7 +90,7 @@ class Ctx:
     log: Callable[[str], None]
     org: str = ""                  # github org scope: the target is a bare repo name
     scope: str = "user"
-    max_items: int = 200           # per listing (runs, pipelines, commits…); 0 = no limit
+    max_items: int = 0             # per listing (runs, pipelines, commits…); 0 = no limit
     shared: dict = field(default_factory=dict)   # once-per-run state (groups, workspaces)
     cancelled: Optional[Callable[[], bool]] = None
     truncated: list = field(default_factory=list)   # listings cut short by max_items

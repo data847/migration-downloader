@@ -687,8 +687,8 @@ $('form').onsubmit = async (ev) => {
 /* ── download options: opened by the word "download" in the header ───── */
 let EXTRAS = {};
 const optSel = {};                  // provider -> Set of ticked extras (absent = everything)
-let maxItems = 200;
-const OPT_KEY = 'md.opts.v1';
+let maxItems = 0;                 // 0 = no limit
+const OPT_KEY = 'md.opts.v2';   // v2: the item limit now defaults to 0 (none); v1 saved 200
 try {
   const saved = JSON.parse(localStorage.getItem(OPT_KEY) || '{}');
   if(Number.isInteger(saved.maxItems) && saved.maxItems >= 0) maxItems = saved.maxItems;
@@ -736,7 +736,7 @@ function setOpts(pred){ optSel[provider] = new Set(optNames().filter(pred).map(e
 function openOpts(){ renderOpts(); $('opts-backdrop').hidden = false; }
 function closeOpts(){
   const v = parseInt($('opt-max').value, 10);
-  maxItems = Number.isInteger(v) && v >= 0 ? v : 200;
+  maxItems = Number.isInteger(v) && v >= 0 ? v : 0;
   saveOpts(); $('opts-backdrop').hidden = true;
 }
 $('opts-open').onclick = openOpts;

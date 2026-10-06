@@ -639,8 +639,33 @@ class TestIssues:
         assert manifest["extras"][0]["truncated"] and manifest["failed"] == 0
         assert [i["kind"] for i in manifest["issues"]] == ["limit"]
 
+    def test_no_limit_is_the_default_everywhere(self):
+        import cli
+        import jobstore
+        assert runner.JobSpec().max_items == 0
+        assert runner.JobSpec.from_form({"provider": "github"}).max_items == 0
+        assert supplementary.Ctx(provider="github", target="o/r", token="t", api_base="https://api.github.com",
+                                 headers={}, out=Path("."), log=print).max_items == 0
+        job = {"spec": {"provider": "github", "scope": "auto", "org": "", "targets": ["o/r"], "api_base": "",
+                        "api_version": "", "lock_repositories": False, "single_archive": False,
+                        "poll_interval": 15, "timeout": 3600, "verify_checksum": True, "run_name": ""},
+               "state": "interrupted", "manifest": {}, "log": []}
+        assert jobstore.spec_for_resume(job, token="t").max_items == 0       # a job saved without the field
+        captured = {}
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(cli, "run_job", lambda spec, log=print: captured.update(spec=spec) or {"failed": 0})
+        try:
+            cli.main(["bitbucket", "ws/r", "--extras", "refs"])
+        finally:
+            monkey.undo()
+        assert captured["spec"].max_items == 0
+
+    def test_ui_defaults_to_no_limit_and_ignores_the_old_saved_200(self, client):
+        html = client.get("/").get_data(as_text=True)
+        assert "let maxItems = 0;" in html and "md.opts.v2" in html and "md.opts.v1'" not in html
+
     def test_max_items_zero_means_no_limit(self):
-        assert runner._max_items(None) == 200 and runner._max_items("") == 200
+        assert runner._max_items(None) == 0 and runner._max_items("") == 0
         assert runner._max_items("0") == 0 and runner._max_items("75") == 75
         assert runner.JobSpec.from_form({"provider": "github", "max_items": "0"}).max_items == 0
 

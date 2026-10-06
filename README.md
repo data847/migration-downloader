@@ -209,7 +209,7 @@ Names go in a comma list;
 CI logs). `--list-extras` prints the names per provider. A
 collector that fails (403, feature disabled) is recorded in `manifest.json`
 under `extras` and the rest carry on. `--max-items` is how many items each
-listing collects (default 200, `0` = no limit); a listing cut at the limit is
+listing collects (default `0` = no limit); a listing cut at a limit you set is
 reported as an issue, never silently.
 
 In the web UI, the word "download" in the page header opens a dialog where
