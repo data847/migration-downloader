@@ -29,8 +29,6 @@ import bootstrap  # noqa: F401  (sets sys.path)
 from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # noqa: E402
 from migration_api import GitHubMigration, GitLabExport, MigrationError, mask  # noqa: E402
 from runner import COMPONENT, JobSpec, list_runs, run_job  # noqa: E402
-from supplementary import HEAVY, REGISTRY  # noqa: E402
-
 import jobstore  # noqa: E402
 import redact  # noqa: E402
 
@@ -232,15 +230,6 @@ def discover():
     except MigrationError as exc:
         return jsonify(error=str(exc).splitlines()[0]), 400
     return jsonify(items=items, count=len(items))
-
-
-@app.get("/api/extras")
-def extras():
-    """Collector names per provider, for the UI's Extras picker."""
-    return jsonify(extras={
-        provider: [{"name": name, "heavy": name in HEAVY.get(provider, set())}
-                   for name in sorted(names, key=lambda n: (n in HEAVY.get(provider, set()), n))]
-        for provider, names in REGISTRY.items()})
 
 
 @app.get("/api/runs")

@@ -178,8 +178,10 @@ Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
 
 ## Extras: what the archives leave out
 
-`--extras` (UI: Advanced → Extras) runs read-only collectors after the export
-flow and writes them under `<run>/extras/<target>/`. Names go in a comma list;
+`--extras` runs read-only collectors after the export flow and writes them
+under `<run>/extras/<target>/`. **The web UI always runs every collector**
+(`everything`) when you press Start; the CLI runs only what you ask for.
+Names go in a comma list;
 `all` runs every light collector, `everything` adds the heavy ones (full
 clones, logs, binaries). `--list-extras` prints the names per provider. A
 collector that fails (403, feature disabled) is recorded in `manifest.json`
@@ -216,8 +218,8 @@ resulting `.tar` is written to the server's shared home, not downloaded here.
 In the web UI, one **Bitbucket** button covers both products, the way GitLab
 covers gitlab.com and self-hosted: host `bitbucket.org` is Cloud (extras only),
 and `Data Center (self-hosted)` takes a base URL plus an export-job selector
-(start, preview, cancel or none). Both reuse the Extras picker, and a run's
-extras and export jobs show in their own results card. The repo/org browser is GitHub and GitLab only.
+(start, preview, cancel or none). A run's extras and export jobs show in
+their own results card. The repo/org browser is GitHub and GitLab only.
 
 Additional export options:
 
