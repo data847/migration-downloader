@@ -56,6 +56,8 @@ def _public_spec(spec: JobSpec) -> dict:
         "timeout": spec.timeout,
         "verify_checksum": spec.verify_checksum,
         "run_name": spec.run_name,
+        "extras": spec.extras,
+        "max_items": spec.max_items,
         "token_hint": mask(spec.resolved_token()),
         "token_from_env": not spec.token,
     }
@@ -219,6 +221,8 @@ def spec_for_resume(job: dict, token: str = "") -> JobSpec:
         timeout=s["timeout"],
         verify_checksum=s["verify_checksum"],
         run_name=plan["run_name"] or s["run_name"],
+        extras=s.get("extras", []),
+        max_items=s.get("max_items", 200),
         known_ids=plan["known_ids"],
         skip_done=True,
     )

@@ -225,6 +225,10 @@
         <input type="checkbox" id="lock_repositories"> Lock repositories during migration</label>
       <label class="check" data-only="github">
         <input type="checkbox" id="single_archive"> One archive for all repos</label>
+      <fieldset>
+        <label for="extras">Extras (read-only collectors, comma list)</label>
+        <input type="text" id="extras" placeholder="e.g. all · releases,hooks,members · everything">
+      </fieldset>
       <label class="check">
         <input type="checkbox" id="verify_checksum" checked> Compute SHA-256 of each archive</label>
     </details>
@@ -470,6 +474,7 @@ $('form').onsubmit = async (ev) => {
     api_base: host === 'self' ? $('api_base').value.trim() : '',
     api_version: $('api_version').value,
     run_name: $('run_name').value,
+    extras: $('extras').value,
     lock_repositories: $('lock_repositories').checked,
     single_archive: $('single_archive').checked,
     verify_checksum: $('verify_checksum').checked };

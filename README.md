@@ -176,6 +176,53 @@ docker exec migration-downloader python cli.py github --scope org --org TEST_ORG
 
 Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
 
+## Extras: what the archives leave out
+
+`--extras` (UI: Advanced → Extras) runs read-only collectors after the export
+flow and writes them under `<run>/extras/<target>/`. Names go in a comma list;
+`all` runs every light collector, `everything` adds the heavy ones (full
+clones, logs, binaries). `--list-extras` prints the names per provider. A
+collector that fails (403, feature disabled) is recorded in `manifest.json`
+under `extras` and the rest carry on. `--max-items` caps each unbounded
+listing (default 200).
+
+| Provider | Light collectors | Heavy (name them or `everything`) |
+|---|---|---|
+| `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `deploy-keys` `branch-protection` `collaborators` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `mirror` `wiki` `lfs` `release-assets` `actions-logs` `actions-artifact-files` |
+| `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `variables` `hooks` `deploy-keys` `deploy-tokens` `members` `packages` `registry` | `mirror` `wiki` `lfs` `job-traces` `job-artifacts` `group-export` `relations-export` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `commit-statuses` `commit-diffstat` `pullrequests` `branch-restrictions` `branching-model` `default-reviewers` `downloads` `snippets` `hooks` `deploy-keys` `pipelines` `permissions` `workspace-members` `forks` | `mirror` `lfs` `commit-patches` `pr-diffs` `download-files` `pipeline-logs` |
+| `bitbucket-dc` | | `archive` |
+
+Not collected on purpose: issue/PR/commit comments, discussions, activity and
+tasks.
+
+Extra token needs beyond the export scopes: GitHub `read:org`,
+`admin:repo_hook` (or `read:repo_hook`), `security_events`, `read:project`,
+`read:packages`; GitLab `read_registry` plus Maintainer on the project
+(Owner for `group-export`). Bitbucket Cloud takes a user API token (an
+`email:token` pair or a bare access token, `BITBUCKET_TOKEN` in the env file)
+with `read:repository`, `read:pullrequest`, `read:pipeline`,
+`admin:repository`, `read:webhook`, `read:snippet`, `read:workspace`,
+`read:user` and `read:project`.
+
+`mirror`, `wiki` and `lfs` shell out to `git` (and `git-lfs`); the image
+installs both. Credentials are passed through git's environment config, never
+the URL or argv. Run `mirror` before `lfs` in the same run.
+
+Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo --extras all`
+is extras-only. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
+token `BITBUCKET_DC_TOKEN`) starts and monitors the server-side export job
+(`--dc-action export|preview|cancel|none`, `--dc-job-id` for cancel); the
+resulting `.tar` is written to the server's shared home, not downloaded here.
+
+Additional export options:
+
+- GitHub: `--exclude metadata,git_data,attachments,releases,owner_projects`,
+  `--org-metadata-only`; after a successful download `--unlock-repos` (with
+  `--lock-repositories`) and `--delete-archive` (irreversible, off by default).
+- GitLab: `--upload-url`/`--upload-method`/`--description` make GitLab push the
+  export to a URL itself (nothing is downloaded; only the host is logged).
+
 ## Invariants (DataLabs workspace)
 
 - **Tokens** come from `DataLabs/.env` (`GH_TOKEN`/`GITHUB_TOKEN`,

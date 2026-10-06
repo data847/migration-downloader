@@ -1,0 +1,433 @@
+"""Offline tests for the supplementary collectors and the new export options.
+
+No network: `_json_request`, `_download` and `run_git` are replaced by fakes
+that serve canned responses and record what was asked for.
+
+    python3 -m unittest discover -s tests -v
+"""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import bootstrap  # noqa: E402,F401
+import bitbucket  # noqa: E402
+import supplementary  # noqa: E402
+from migration_api import GitHubMigration, GitLabExport, MigrationError  # noqa: E402
+from runner import JobSpec, _run_extras  # noqa: E402
+
+
+class FakeHttp:
+    """Maps URL substrings to responses; records every call."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def __call__(self, url, *, method="GET", headers=None, payload=None, timeout=60):
+        self.calls.append((method, url, payload))
+        for needle, response in self.routes.items():
+            if needle in url:
+                if isinstance(response, Exception):
+                    raise response
+                return 200, response
+        raise MigrationError(f"HTTP 404 {method} {url}")
+
+
+def make_ctx(tmp, provider="github", target="acme/widgets", **kw):
+    return supplementary.Ctx(
+        provider=provider, target=target, token="secret-token-123",
+        api_base=kw.pop("api_base", "https://api.github.com"),
+        headers={"Authorization": "Bearer secret-token-123"},
+        out=Path(tmp), log=lambda _m: None, **kw)
+
+
+class ResolveNames(unittest.TestCase):
+    def test_all_skips_heavy_and_everything_includes_them(self):
+        light = supplementary.resolve_names("github", ["all"])
+        full = supplementary.resolve_names("github", ["everything"])
+        self.assertIn("releases", light)
+        self.assertNotIn("mirror", light)
+        self.assertIn("mirror", full)
+
+    def test_unknown_name_is_rejected(self):
+        with self.assertRaises(MigrationError):
+            supplementary.resolve_names("gitlab", ["not-a-thing"])
+
+    def test_duplicates_collapse(self):
+        self.assertEqual(supplementary.resolve_names("github", ["hooks", "hooks"]), ["hooks"])
+
+    def test_every_provider_has_collectors(self):
+        for provider in ("github", "gitlab", "bitbucket", "bitbucket-dc"):
+            self.assertTrue(supplementary.REGISTRY[provider], provider)
+
+
+class GitHubExportOptions(unittest.TestCase):
+    def test_exclude_flags_land_in_the_payload(self):
+        fake = FakeHttp({"/migrations": {"id": 7, "state": "pending"}})
+        with mock.patch("migration_api._json_request", fake):
+            client = GitHubMigration("t", scope="org", org="acme",
+                                     exclude=["releases", "attachments"], org_metadata_only=True)
+            self.assertEqual(client.start(["acme/widgets"]), "7")
+        payload = fake.calls[0][2]
+        self.assertEqual(payload["repositories"], ["widgets"])
+        self.assertTrue(payload["exclude_releases"] and payload["exclude_attachments"])
+        self.assertTrue(payload["org_metadata_only"])
+        self.assertNotIn("exclude_metadata", payload)
+
+    def test_bad_exclude_and_user_scope_org_metadata_only(self):
+        with self.assertRaises(MigrationError):
+            GitHubMigration("t", exclude=["bogus"])
+        with self.assertRaises(MigrationError):
+            GitHubMigration("t", scope="user", org_metadata_only=True)
+
+    def test_housekeeping_urls(self):
+        fake = FakeHttp({"/migrations": []})
+        with mock.patch("migration_api._json_request", fake):
+            client = GitHubMigration("t", scope="org", org="acme")
+            client.unlock_repo("9", "acme/widgets")
+            client.delete_archive("9")
+        self.assertEqual(fake.calls[0][:2], ("DELETE", "https://api.github.com/orgs/acme/migrations/9/repos/widgets/lock"))
+        self.assertEqual(fake.calls[1][:2], ("DELETE", "https://api.github.com/orgs/acme/migrations/9/archive"))
+
+
+class GitLabExportOptions(unittest.TestCase):
+    def test_upload_and_description_are_sent(self):
+        fake = FakeHttp({"/export": {}})
+        with mock.patch("migration_api._json_request", fake):
+            GitLabExport("t").start("g/p", upload_url="https://s3/x?sig=1", upload_method="PUT",
+                                    description="nightly")
+        self.assertEqual(fake.calls[0][2], {"description": "nightly",
+                                            "upload": {"url": "https://s3/x?sig=1", "http_method": "PUT"}})
+
+    def test_plain_start_sends_no_body(self):
+        fake = FakeHttp({"/export": {}})
+        with mock.patch("migration_api._json_request", fake):
+            GitLabExport("t").start("g/p")
+        self.assertIsNone(fake.calls[0][2])
+
+
+class GitHubCollectors(unittest.TestCase):
+    def test_org_scope_bare_name_builds_owner_repo_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, target="widgets", org="acme", scope="org")
+            fake = FakeHttp({"/repos/acme/widgets/hooks": [{"id": 1}]})
+            with mock.patch("supplementary._json_request", fake):
+                files = supplementary.REGISTRY["github"]["hooks"](ctx)
+            self.assertEqual(files, ["hooks.json"])
+            self.assertEqual(json.loads((Path(tmp) / "hooks.json").read_text()), [{"id": 1}])
+
+    def test_branch_protection_records_per_branch_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp)
+            fake = FakeHttp({
+                "branches?protected=true": [{"name": "main"}, {"name": "dev"}],
+                "/branches/main/protection": {"required_reviews": 2},
+                "/branches/dev/protection": MigrationError("HTTP 403 nope"),
+            })
+            with mock.patch("supplementary._json_request", fake):
+                supplementary.REGISTRY["github"]["branch-protection"](ctx)
+            data = json.loads((Path(tmp) / "branch-protection.json").read_text())
+            self.assertEqual(data["main"], {"required_reviews": 2})
+            self.assertIn("error", data["dev"])
+
+    def test_actions_unwraps_workflow_runs_and_respects_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, max_items=2)
+            runs = {"workflow_runs": [{"id": 1}, {"id": 2}, {"id": 3}]}
+            fake = FakeHttp({"/actions/runs?": runs, "/jobs": {"jobs": []}})
+            with mock.patch("supplementary._json_request", fake):
+                supplementary.REGISTRY["github"]["actions"](ctx)
+            saved = json.loads((Path(tmp) / "actions-runs.json").read_text())
+            self.assertEqual([r["id"] for r in saved], [1, 2])
+
+    def test_release_assets_use_octet_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp)
+            ctx.shared["gh_releases"] = {ctx.target: [
+                {"tag_name": "v1", "assets": [{"id": 5, "name": "app.zip"}]}]}
+            seen = {}
+
+            def fake_download(url, dest, *, headers, log, timeout=120):
+                seen.update(url=url, accept=headers["Accept"], dest=dest)
+                return dest
+
+            with mock.patch("supplementary._download", fake_download):
+                files = supplementary.REGISTRY["github"]["release-assets"](ctx)
+            self.assertEqual(files, ["release-assets/v1/app.zip"])
+            self.assertEqual(seen["accept"], "application/octet-stream")
+            self.assertTrue(seen["url"].endswith("/releases/assets/5"))
+
+    def test_projects_v2_runs_once_per_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp)
+            fake = FakeHttp({"/graphql": {"data": {"user": {"projectsV2": {"nodes": []}}}}})
+            with mock.patch("supplementary._json_request", fake):
+                first = supplementary.REGISTRY["github"]["projects-v2"](ctx)
+                second = supplementary.REGISTRY["github"]["projects-v2"](ctx)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(second, [])
+            self.assertEqual(len(fake.calls), 1)
+
+    def test_ghes_api_base_maps_to_web_and_graphql(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, api_base="https://ghe.example.com/api/v3")
+            self.assertEqual(supplementary.gh_web_base(ctx), "https://ghe.example.com")
+            self.assertEqual(supplementary._graphql_url(ctx), "https://ghe.example.com/api/graphql")
+            public = make_ctx(tmp)
+            self.assertEqual(supplementary.gh_web_base(public), "https://github.com")
+
+
+class GitHandling(unittest.TestCase):
+    def test_token_never_appears_in_git_argv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp)
+            calls = []
+
+            def fake_git(args, *, env, cwd=None):
+                calls.append((args, env))
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch("supplementary.run_git", fake_git):
+                supplementary.REGISTRY["github"]["mirror"](ctx)
+            args, env = calls[0]
+            self.assertNotIn("secret-token-123", " ".join(args))
+            self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.extraHeader")
+            self.assertTrue(env["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic "))
+            self.assertEqual(args[:2], ["clone", "--mirror"])
+
+    def test_missing_wiki_is_skipped_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp)
+            gone = mock.Mock(returncode=128, stderr="fatal: Repository not found.")
+            with mock.patch("supplementary.run_git", lambda *a, **k: gone):
+                self.assertEqual(supplementary.REGISTRY["github"]["wiki"](ctx), [])
+
+    def test_missing_mirror_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp)
+            gone = mock.Mock(returncode=128, stderr="fatal: Repository not found.")
+            with mock.patch("supplementary.run_git", lambda *a, **k: gone):
+                with self.assertRaises(MigrationError):
+                    supplementary.REGISTRY["github"]["mirror"](ctx)
+
+    def test_lfs_needs_a_mirror_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(MigrationError):
+                supplementary.REGISTRY["github"]["lfs"](make_ctx(tmp))
+
+    def test_existing_mirror_is_updated_not_recloned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "repo.git").mkdir()
+            (Path(tmp) / "repo.git" / "HEAD").write_text("ref: refs/heads/main")
+            calls = []
+            ok = mock.Mock(returncode=0, stderr="")
+            with mock.patch("supplementary.run_git", lambda a, **k: calls.append(a) or ok):
+                supplementary.REGISTRY["github"]["mirror"](make_ctx(tmp))
+            self.assertEqual(calls[0][0], "remote")
+
+
+class GitLabCollectors(unittest.TestCase):
+    def test_project_path_is_url_encoded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, provider="gitlab", target="grp/sub/proj", api_base="https://gitlab.com")
+            fake = FakeHttp({"/projects/grp%2Fsub%2Fproj/members/all": [{"id": 1}]})
+            with mock.patch("supplementary._json_request", fake):
+                supplementary.REGISTRY["gitlab"]["members"](ctx)
+            self.assertTrue((Path(tmp) / "members.json").is_file())
+
+    def test_job_artifact_404_is_silent_other_errors_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logged = []
+            ctx = make_ctx(tmp, provider="gitlab", target="g/p", api_base="https://gitlab.com")
+            ctx.log = logged.append
+            ctx.shared["gl_jobs"] = {"g/p": [1, 2]}
+
+            def fake_download(url, dest, *, headers, log, timeout=120):
+                raise MigrationError("HTTP 404 x" if "/jobs/1/" in url else "HTTP 500 x")
+
+            with mock.patch("supplementary._download", fake_download):
+                self.assertEqual(supplementary.REGISTRY["gitlab"]["job-artifacts"](ctx), [])
+            self.assertEqual(len(logged), 1)
+            self.assertIn("job 2", logged[0])
+
+    def test_group_export_runs_once_per_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = {}
+            calls = []
+            with mock.patch("migration_api.GitLabExport.group_export",
+                            lambda self, group, dest, **k: calls.append(group) or dest):
+                for project in ("grp/a", "grp/b"):
+                    out = Path(tmp) / project.replace("/", "_")
+                    out.mkdir()
+                    ctx = make_ctx(out, provider="gitlab", target=project,
+                                   api_base="https://gitlab.com", shared=shared)
+                    supplementary.REGISTRY["gitlab"]["group-export"](ctx)
+            self.assertEqual(calls, ["grp"])
+
+    def test_group_export_rejects_top_level_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, provider="gitlab", target="solo", api_base="https://gitlab.com")
+            with self.assertRaises(MigrationError):
+                supplementary.REGISTRY["gitlab"]["group-export"](ctx)
+
+
+class BitbucketCloud(unittest.TestCase):
+    def test_auth_header_shapes(self):
+        self.assertTrue(bitbucket.cloud_headers("tok")["Authorization"].startswith("Bearer "))
+        self.assertTrue(bitbucket.cloud_headers("me@x.com:tok")["Authorization"].startswith("Basic "))
+        self.assertEqual(bitbucket.git_secret("me@x.com:tok"), "tok")
+        self.assertEqual(bitbucket.git_secret("tok"), "tok")
+
+    def test_paging_follows_next_links_and_caps(self):
+        pages = {
+            "pagelen=100": {"values": [1, 2], "next": "https://api/page2"},
+            "page2": {"values": [3, 4], "next": "https://api/page3"},
+            "page3": {"values": [5]},
+        }
+        fake = FakeHttp(pages)
+        with mock.patch("supplementary._json_request", fake):
+            self.assertEqual(bitbucket.cloud_paged("https://api/x", {}, cap=10), [1, 2, 3, 4, 5])
+            self.assertEqual(bitbucket.cloud_paged("https://api/x", {}, cap=3), [1, 2, 3])
+
+    def test_pullrequests_query_every_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, provider="bitbucket", target="ws/repo",
+                           api_base="https://api.bitbucket.org/2.0")
+            fake = FakeHttp({"/pullrequests?": {"values": []}})
+            with mock.patch("supplementary._json_request", fake):
+                supplementary.REGISTRY["bitbucket"]["pullrequests"](ctx)
+            url = fake.calls[0][1]
+            for state in bitbucket.PR_STATES:
+                self.assertIn(f"state={state}", url)
+
+    def test_workspace_level_collectors_run_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = {}
+            fake = FakeHttp({"/workspaces/ws/members": {"values": [{"u": 1}]}})
+            with mock.patch("supplementary._json_request", fake):
+                first = supplementary.REGISTRY["bitbucket"]["workspace-members"](
+                    make_ctx(tmp, provider="bitbucket", target="ws/a", shared=shared,
+                             api_base="https://api.bitbucket.org/2.0"))
+                second = supplementary.REGISTRY["bitbucket"]["workspace-members"](
+                    make_ctx(tmp, provider="bitbucket", target="ws/b", shared=shared,
+                             api_base="https://api.bitbucket.org/2.0"))
+            self.assertTrue(first)
+            self.assertEqual(second, [])
+
+    def test_mirror_uses_api_token_username_and_token_half(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, provider="bitbucket", target="ws/repo")
+            ctx.token = "me@x.com:realtoken"
+            seen = []
+
+            def fake_git(args, *, env, cwd=None):
+                seen.append((args, env))
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch("supplementary.run_git", fake_git):
+                bitbucket.bb_mirror(ctx)
+            import base64
+            value = seen[0][1]["GIT_CONFIG_VALUE_0"].split()[-1]
+            self.assertEqual(base64.b64decode(value).decode(),
+                             "x-bitbucket-api-token-auth:realtoken")
+
+
+class BitbucketDataCenter(unittest.TestCase):
+    def test_request_body_and_validation(self):
+        body = bitbucket.BitbucketDCExport.request_body(["PROJ/repo-1"])
+        self.assertEqual(body, {"repositoriesRequest": {"includes": [{"projectKey": "PROJ", "slug": "repo-1"}]}})
+        with self.assertRaises(MigrationError):
+            bitbucket.BitbucketDCExport.request_body(["no-slash"])
+        with self.assertRaises(MigrationError):
+            bitbucket.BitbucketDCExport.request_body([])
+
+    def test_wait_stops_on_completed_and_raises_on_failed(self):
+        client = bitbucket.BitbucketDCExport("t", "https://bb.example.com")
+        with mock.patch.object(client, "status", return_value={"state": "completed"}):
+            self.assertEqual(client.wait("1")["state"], "completed")
+        with mock.patch.object(client, "status", return_value={"state": "FAILED"}):
+            with self.assertRaises(MigrationError):
+                client.wait("1")
+
+    def test_cancel_and_preview_urls(self):
+        fake = FakeHttp({"/migration/exports": {}})
+        with mock.patch("bitbucket._json_request", fake):
+            client = bitbucket.BitbucketDCExport("t", "https://bb.example.com/")
+            client.preview(["P/r"])
+            client.cancel("42")
+        self.assertEqual(fake.calls[0][1], "https://bb.example.com/rest/api/1.0/migration/exports/preview")
+        self.assertEqual(fake.calls[1][1], "https://bb.example.com/rest/api/1.0/migration/exports/42/cancel")
+
+    def test_base_url_required(self):
+        with self.assertRaises(MigrationError):
+            bitbucket.BitbucketDCExport("t", "")
+
+
+class SpecValidation(unittest.TestCase):
+    def _spec(self, **kw):
+        return JobSpec(token="t", targets=kw.pop("targets", ["a/b"]), **kw)
+
+    def test_bitbucket_cloud_requires_extras(self):
+        with self.assertRaises(MigrationError):
+            self._spec(provider="bitbucket").validate()
+        self._spec(provider="bitbucket", extras=["refs"]).validate()
+
+    def test_unknown_extra_fails_fast(self):
+        with self.assertRaises(MigrationError):
+            self._spec(provider="github", extras=["nope"]).validate()
+
+    def test_unlock_requires_lock(self):
+        with self.assertRaises(MigrationError):
+            self._spec(provider="github", unlock_repos=True).validate()
+
+    def test_upload_url_is_gitlab_only(self):
+        with self.assertRaises(MigrationError):
+            self._spec(provider="github", upload_url="https://x").validate()
+
+    def test_dc_needs_base_url_and_cancel_needs_job(self):
+        with self.assertRaises(MigrationError):
+            self._spec(provider="bitbucket-dc").validate()
+        with self.assertRaises(MigrationError):
+            self._spec(provider="bitbucket-dc", api_base="https://bb", dc_action="cancel").validate()
+        self._spec(provider="bitbucket-dc", api_base="https://bb", dc_action="cancel",
+                   dc_job_id="3", targets=[]).validate()
+
+    def test_from_form_parses_new_fields(self):
+        spec = JobSpec.from_form({"provider": "github", "targets": "a/b", "extras": "hooks, keys\nmirror",
+                                  "exclude": "releases", "delete_archive": "true", "max_items": "50"})
+        self.assertEqual(spec.extras, ["hooks", "keys", "mirror"])
+        self.assertEqual(spec.exclude, ["releases"])
+        self.assertTrue(spec.delete_archive)
+        self.assertEqual(spec.max_items, 50)
+
+
+class RunExtras(unittest.TestCase):
+    def test_one_failing_collector_does_not_stop_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = JobSpec(provider="github", token="t", targets=["acme/widgets"],
+                           extras=["hooks", "deploy-keys"])
+            fake = FakeHttp({"/hooks": MigrationError("HTTP 403 forbidden"), "/keys": [{"id": 1}]})
+            logs = []
+            with mock.patch("supplementary._json_request", fake):
+                records = _run_extras(spec, "t", Path(tmp), logs.append, None)
+            by_name = {r["extra"]: r for r in records}
+            self.assertIn("403", by_name["hooks"]["error"])
+            self.assertEqual(by_name["deploy-keys"]["error"], "")
+            self.assertEqual(by_name["deploy-keys"]["files"], ["deploy-keys.json"])
+            self.assertTrue((Path(tmp) / "extras" / "acme-widgets" / "deploy-keys.json").is_file())
+
+    def test_cancel_stops_further_collectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = JobSpec(provider="github", token="t", targets=["acme/widgets"], extras=["hooks"])
+            records = _run_extras(spec, "t", Path(tmp), lambda _m: None, lambda: True)
+            self.assertEqual(records[0]["error"], "cancelled")
+
+
+if __name__ == "__main__":
+    unittest.main()
