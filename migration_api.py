@@ -47,6 +47,28 @@ def _noop(_message: str) -> None:
     pass
 
 
+def brief_error(exc: BaseException) -> str:
+    """One line for logs and manifests: the failing request, plus the API's own
+    explanation (`— Must be an organization owner`) when it sent one."""
+    lines = str(exc).splitlines()
+    head = lines[0] if lines else str(exc)
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            data = None
+        message = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            message = str(data.get("message") or (err if isinstance(err, str) else "")
+                          or (err.get("message") if isinstance(err, dict) else "") or "")
+        return f"{head} — {(message or line)[:200]}"
+    return head
+
+
 def mask(token: str) -> str:
     if not token:
         return "<empty>"

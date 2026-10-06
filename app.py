@@ -152,7 +152,9 @@ def job_log(job_id: str):
         + (f" ({spec.get('scope')} scope)" if spec.get("provider") == "github" else ""),
         f"# host       : {host}",
         f"# targets    : {len(spec.get('targets', []))}",
-        f"# archives   : {manifest.get('ok', 0)} ok, {manifest.get('failed', 0)} failed",
+        f"# archives   : {manifest.get('ok', 0)} ok, "
+        f"{manifest.get('archives_failed', manifest.get('failed', 0))} failed",
+        f"# extras     : {manifest.get('extras_failed', 0)} collector run(s) failed",
         f"# token      : {spec.get('token_hint', '')}"
         + (" (from .env)" if spec.get("token_from_env") else ""),
         "#",

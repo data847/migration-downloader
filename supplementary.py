@@ -15,6 +15,7 @@ collector, so one forbidden endpoint never aborts the rest.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import os
 import subprocess
@@ -27,6 +28,7 @@ from migration_api import (
     MigrationError,
     _download,
     _json_request,
+    brief_error,
     safe_name,
 )
 
@@ -132,7 +134,29 @@ def try_json(ctx: Ctx, url: str):
     try:
         return get_json(url, ctx.headers)
     except MigrationError as exc:
-        return {"error": str(exc).splitlines()[0]}
+        return {"error": brief_error(exc)}
+
+
+def feature_off(exc: MigrationError) -> bool:
+    """403/404 whose message says the feature is simply off for this repo
+    (Dependabot, code or secret scanning), as opposed to a missing permission."""
+    text = brief_error(exc).lower()
+    return (("http 403" in text or "http 404" in text)
+            and any(w in text for w in ("disabled", "must be enabled", "not enabled",
+                                        "advanced security", "no analysis found")))
+
+
+def skip_when_off(fn: Collector) -> Collector:
+    @functools.wraps(fn)
+    def wrapper(ctx):
+        try:
+            return fn(ctx)
+        except MigrationError as exc:
+            if feature_off(exc):
+                ctx.log("    not enabled for this repo — skipped")
+                return []
+            raise
+    return wrapper
 
 
 def git_env(username: str, token: str) -> dict:
@@ -239,7 +263,7 @@ def gh_actions_logs(ctx):
             written.append(fetch_file(ctx, gh_url(ctx, f"/actions/runs/{run_id}/logs"),
                                       f"actions-logs/run-{run_id}.zip"))
         except MigrationError as exc:   # logs expire after 90 days -> 410
-            ctx.log(f"    run {run_id}: {str(exc).splitlines()[0]}")
+            ctx.log(f"    run {run_id}: {brief_error(exc)}")
     return written
 
 
@@ -265,6 +289,7 @@ def gh_branch_protection(ctx):
 
 
 @collector("github", "dependabot-alerts")
+@skip_when_off
 def gh_dependabot(ctx):
     return [ctx.save_json("dependabot-alerts", paged_all(
         gh_url(ctx, "/dependabot/alerts?state=open,fixed,dismissed,auto_dismissed"),
@@ -272,6 +297,7 @@ def gh_dependabot(ctx):
 
 
 @collector("github", "code-scanning")
+@skip_when_off
 def gh_code_scanning(ctx):
     return [
         ctx.save_json("code-scanning-alerts", paged_all(
@@ -282,6 +308,7 @@ def gh_code_scanning(ctx):
 
 
 @collector("github", "secret-scanning")
+@skip_when_off
 def gh_secret_scanning(ctx):
     # Alert records name the secret type and location; the secret value is
     # masked by the API unless explicitly requested, which we never do.
@@ -401,7 +428,7 @@ def gl_job_traces(ctx):
         try:
             written.append(fetch_file(ctx, gl_url(ctx, f"/jobs/{job_id}/trace"), f"job-traces/{job_id}.log"))
         except MigrationError as exc:
-            ctx.log(f"    job {job_id}: {str(exc).splitlines()[0]}")
+            ctx.log(f"    job {job_id}: {brief_error(exc)}")
     return written
 
 
@@ -415,7 +442,7 @@ def gl_job_artifacts(ctx):
                                       f"job-artifacts/{job_id}.zip"))
         except MigrationError as exc:
             if "HTTP 404" not in str(exc):
-                ctx.log(f"    job {job_id}: {str(exc).splitlines()[0]}")
+                ctx.log(f"    job {job_id}: {brief_error(exc)}")
     return written
 
 

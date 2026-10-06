@@ -20,7 +20,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Callable, Iterable, List
 
-from migration_api import MigrationError, _download, _json_request, safe_name
+from migration_api import MigrationError, _download, _json_request, brief_error, safe_name
 from supplementary import (
     Ctx,
     collector,
@@ -115,7 +115,7 @@ def bb_commit_patches(ctx):
         try:
             written.append(fetch_file(ctx, bb_url(ctx, f"/patch/{sha}"), f"commit-patches/{sha}.patch"))
         except MigrationError as exc:
-            ctx.log(f"    {sha[:10]}: {str(exc).splitlines()[0]}")
+            ctx.log(f"    {sha[:10]}: {brief_error(exc)}")
     return written
 
 
@@ -155,7 +155,7 @@ def bb_pr_diffs(ctx):
                 written.append(fetch_file(ctx, bb_url(ctx, f"/pullrequests/{pid}/{kind}"),
                                           f"pr-diffs/{pid}.{kind}"))
             except MigrationError as exc:
-                ctx.log(f"    PR {pid} {kind}: {str(exc).splitlines()[0]}")
+                ctx.log(f"    PR {pid} {kind}: {brief_error(exc)}")
         written.append(ctx.save_json(f"pr-diffs/{pid}-diffstat",
                                      try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}/diffstat?pagelen=100"))))
     return written
@@ -196,7 +196,7 @@ def bb_snippets(ctx):
                     ctx, f"{base}/{sid}/files/{urllib.parse.quote(fname, safe='')}",
                     f"snippets-{safe_name(ws)}/{sid}/{safe_name(fname)}")
             except MigrationError as exc:
-                files[fname] = {"error": str(exc).splitlines()[0]}
+                files[fname] = {"error": brief_error(exc)}
         detail[sid] = {"commits": try_json(ctx, f"{base}/{sid}/commits"), "files": files}
     done.add(ws)
     return [ctx.save_json(f"snippets-{safe_name(ws)}", snippets),
@@ -244,7 +244,7 @@ def bb_pipeline_logs(ctx):
                     ctx, bb_url(ctx, f"/pipelines/{pipe_uuid}/steps/{step['uuid']}/log"),
                     f"pipeline-logs/{safe_name(pipe_uuid)}-{safe_name(step['uuid'])}.log"))
             except MigrationError as exc:
-                ctx.log(f"    step {step['uuid']}: {str(exc).splitlines()[0]}")
+                ctx.log(f"    step {step['uuid']}: {brief_error(exc)}")
     return written
 
 

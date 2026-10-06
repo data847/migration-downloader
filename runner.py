@@ -32,6 +32,7 @@ from migration_api import (  # noqa: E402
     GitHubMigration,
     GitLabExport,
     MigrationError,
+    brief_error,
     human,
     mask,
     safe_name,
@@ -250,14 +251,15 @@ def run_job(
         "export_jobs": export_jobs,
         "extras": extras,
         "ok": sum(1 for r in results if r.as_dict()["ok"]),
-        "failed": sum(1 for r in results if r.error)
-        + sum(1 for e in extras if e["error"])
-        + sum(1 for j in export_jobs if j.get("error")),
+        "archives_failed": sum(1 for r in results if r.error),
+        "extras_failed": sum(1 for e in extras if e["error"]),
+        "jobs_failed": sum(1 for j in export_jobs if j.get("error")),
     }
+    manifest["failed"] = manifest["archives_failed"] + manifest["extras_failed"] + manifest["jobs_failed"]
     (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     log("")
-    log(f"done: {manifest['ok']} archive(s) downloaded, {manifest['failed']} failed")
+    log(f"done: {manifest['ok']} archive(s) downloaded, {manifest['archives_failed']} failed")
     for r in results:
         if r.path:
             log(f"  ✓ {r.path.name}  {human(r.bytes)}")
@@ -305,7 +307,8 @@ def _github_groups(spec, token, log) -> list:
             by_org.setdefault(owner, []).append(target)
     groups = [("user", "", personal)] if personal else []
     groups += [("org", owner, targets) for owner, targets in by_org.items()]
-    log(f"owners     : {login} (personal)" + "".join(f", {o} (org)" for o in by_org))
+    log("owners     : " + ", ".join(
+        ([f"{login} (personal)"] if personal else []) + [f"{o} (org)" for o in by_org]))
     return groups
 
 
@@ -315,7 +318,7 @@ def _github_login(spec, token, log) -> str:
     except MigrationError as exc:
         raise MigrationError(
             "cannot tell personal repos from org repos: token check failed "
-            f"({str(exc).splitlines()[0]})") from None
+            f"({brief_error(exc)})") from None
 
 
 def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
@@ -331,7 +334,7 @@ def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResu
     try:
         log(f"authenticated as {client.whoami()}")
     except MigrationError as exc:
-        log(f"warning: token check failed ({exc.args[0].splitlines()[0]})")
+        log(f"warning: token check failed ({brief_error(exc)})")
 
     batches = [spec.targets] if spec.single_archive else [[t] for t in spec.targets]
     results: List[ArchiveResult] = []
@@ -369,7 +372,7 @@ def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResu
             log(f"  saved {dest.name} ({human(result.bytes)})")
             _github_cleanup(spec, client, migration_id, batch, log)
         except MigrationError as exc:
-            result.error = str(exc).splitlines()[0]
+            result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
         results.append(result)
     return results
@@ -382,12 +385,12 @@ def _github_cleanup(spec, client, migration_id, batch, log) -> None:
             try:
                 client.unlock_repo(migration_id, repo)
             except MigrationError as exc:
-                log(f"  warning: unlock {repo} failed ({str(exc).splitlines()[0]})")
+                log(f"  warning: unlock {repo} failed ({brief_error(exc)})")
     if spec.delete_archive:
         try:
             client.delete_archive(migration_id)
         except MigrationError as exc:
-            log(f"  warning: delete archive failed ({str(exc).splitlines()[0]})")
+            log(f"  warning: delete archive failed ({brief_error(exc)})")
 
 
 def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
@@ -395,7 +398,7 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
     try:
         log(f"authenticated as {client.whoami()}")
     except MigrationError as exc:
-        log(f"warning: token check failed ({exc.args[0].splitlines()[0]})")
+        log(f"warning: token check failed ({brief_error(exc)})")
 
     results: List[ArchiveResult] = []
     for index, raw in enumerate(spec.targets, 1):
@@ -440,7 +443,7 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
             result.bytes = dest.stat().st_size
             log(f"  saved {dest.name} ({human(result.bytes)})")
         except MigrationError as exc:
-            result.error = str(exc).splitlines()[0]
+            result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
         results.append(result)
     return results
@@ -473,7 +476,7 @@ def _run_bitbucket_dc(spec, token, dest_dir, log, cancelled) -> List[dict]:
             log(f"  tar is on the server: $BITBUCKET_SHARED_HOME/data/migration/export/"
                 f"Bitbucket_export_{job_id}.tar")
     except MigrationError as exc:
-        job["error"] = str(exc).splitlines()[0]
+        job["error"] = brief_error(exc)
         log(f"  ERROR {job['error']}")
     return [job]
 
@@ -539,7 +542,7 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
                     raise MigrationError("cancelled")
                 record["files"] = REGISTRY[spec.provider][name](ctx)
             except MigrationError as exc:
-                record["error"] = str(exc).splitlines()[0]
+                record["error"] = brief_error(exc)
                 log(f"    ERROR {record['error']}")
             records.append(record)
     return records

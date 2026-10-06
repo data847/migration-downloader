@@ -409,6 +409,58 @@ class RunExtras(unittest.TestCase):
         self.assertEqual(_extras_org(org_spec, "b", ""), "acme")
 
 
+class ErrorReporting(unittest.TestCase):
+    def test_brief_error_adds_the_apis_own_message(self):
+        from migration_api import brief_error
+        exc = MigrationError('HTTP 403 POST https://api.github.com/orgs/x/migrations\n'
+                             '{"message": "Must be an owner of the org", "documentation_url": "u"}')
+        self.assertEqual(brief_error(exc),
+                         "HTTP 403 POST https://api.github.com/orgs/x/migrations — Must be an owner of the org")
+
+    def test_brief_error_copes_with_plain_and_truncated_bodies(self):
+        from migration_api import brief_error
+        self.assertEqual(brief_error(MigrationError("network error GET u: boom")), "network error GET u: boom")
+        self.assertEqual(brief_error(MigrationError("HTTP 500 GET u\n<html>oops")), "HTTP 500 GET u — <html>oops")
+        self.assertEqual(brief_error(MigrationError('HTTP 400 GET u\n{"messa')), 'HTTP 400 GET u — {"messa')
+
+    def test_features_that_are_off_are_skipped_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            off = FakeHttp({"/dependabot/alerts": MigrationError(
+                'HTTP 403 GET u\n{"message": "Dependabot alerts are disabled for this repository."}')})
+            logged = []
+            ctx = make_ctx(tmp)
+            ctx.log = logged.append
+            with mock.patch("supplementary._json_request", off):
+                self.assertEqual(supplementary.REGISTRY["github"]["dependabot-alerts"](ctx), [])
+            self.assertTrue(any("skipped" in line for line in logged))
+
+    def test_permission_errors_on_alerts_still_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            denied = FakeHttp({"/secret-scanning/alerts": MigrationError(
+                'HTTP 403 GET u\n{"message": "Resource not accessible by personal access token"}')})
+            with mock.patch("supplementary._json_request", denied):
+                with self.assertRaises(MigrationError):
+                    supplementary.REGISTRY["github"]["secret-scanning"](make_ctx(tmp))
+
+    def test_owners_line_omits_the_personal_account_when_unused(self):
+        from runner import _github_groups
+        logs = []
+        spec = JobSpec(provider="github", token="t", targets=["acme/a", "other/b"])
+        with mock.patch("runner._github_login", return_value="me"):
+            _github_groups(spec, "t", logs.append)
+        self.assertEqual(logs, ["owners     : acme (org), other (org)"])
+
+    def test_manifest_separates_archive_and_extras_failures(self):
+        import runner
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = JobSpec(provider="bitbucket", token="t", targets=["ws/r"], extras=["refs"])
+            fake = FakeHttp({"/refs": MigrationError("HTTP 403 x")})
+            with mock.patch("supplementary._json_request", fake), \
+                    mock.patch("runner.run_dir", return_value=Path(tmp)):
+                manifest = runner.run_job(spec, log=lambda _m: None)
+        self.assertEqual((manifest["archives_failed"], manifest["extras_failed"], manifest["failed"]), (0, 1, 1))
+
+
 class GitHubAutoScope(unittest.TestCase):
     def _spec(self, **kw):
         return JobSpec(provider="github", token="t", **kw)
