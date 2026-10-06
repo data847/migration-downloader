@@ -29,7 +29,6 @@ import bootstrap  # noqa: F401  (sets sys.path)
 from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # noqa: E402
 from migration_api import GitHubMigration, GitLabExport, MigrationError, mask  # noqa: E402
 from runner import COMPONENT, JobSpec, list_runs, run_job  # noqa: E402
-
 import jobstore  # noqa: E402
 import redact  # noqa: E402
 
@@ -73,6 +72,11 @@ def _run_root(run: str) -> Path:
 # ── routes ───────────────────────────────────────────────────────────────────
 
 
+def _env_hint(provider: str) -> str:
+    token = JobSpec(provider=provider).resolved_token()
+    return mask(token) if token else ""
+
+
 @app.get("/")
 def index():
     return render_template(
@@ -81,6 +85,8 @@ def index():
         outputs_dir=str(outputs_for(COMPONENT)),
         github_env=mask(github_token()) if github_token() else "",
         gitlab_env=mask(gitlab_token()) if gitlab_token() else "",
+        bitbucket_env=_env_hint("bitbucket"),
+        bitbucket_dc_env=_env_hint("bitbucket-dc"),
     )
 
 
@@ -132,8 +138,10 @@ def job_log(job_id: str):
         abort(404)
     spec = job.get("spec", {})
     manifest = job.get("manifest") or {}
-    host = spec.get("api_base") or (
-        "https://api.github.com" if spec.get("provider") == "github" else "https://gitlab.com")
+    host = spec.get("api_base") or {
+        "github": "https://api.github.com",
+        "bitbucket": "https://api.bitbucket.org/2.0",
+    }.get(spec.get("provider"), "https://gitlab.com")
     header = [
         "# migration-downloader run log",
         f"# run id     : {job['id']}",
@@ -144,7 +152,9 @@ def job_log(job_id: str):
         + (f" ({spec.get('scope')} scope)" if spec.get("provider") == "github" else ""),
         f"# host       : {host}",
         f"# targets    : {len(spec.get('targets', []))}",
-        f"# archives   : {manifest.get('ok', 0)} ok, {manifest.get('failed', 0)} failed",
+        f"# archives   : {manifest.get('ok', 0)} ok, "
+        f"{manifest.get('archives_failed', manifest.get('failed', 0))} failed",
+        f"# extras     : {manifest.get('extras_failed', 0)} collector run(s) failed",
         f"# token      : {spec.get('token_hint', '')}"
         + (" (from .env)" if spec.get("token_from_env") else ""),
         "#",
@@ -203,7 +213,7 @@ def discover():
     data = request.get_json(force=True, silent=True) or {}
     provider = (data.get("provider") or "github").strip().lower()
     kind = (data.get("kind") or "repos").strip().lower()       # repos | owners
-    scope = (data.get("scope") or "user").strip().lower()
+    scope = (data.get("scope") or "auto").strip().lower()
     owner = (data.get("owner") or "").strip()                  # org / group
     api_base = (data.get("api_base") or "").strip()
     token = (data.get("token") or "").strip() or (
@@ -212,10 +222,15 @@ def discover():
         return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
     try:
         if provider == "github":
-            client = GitHubMigration(token, scope=scope, org=owner or "x",
+            client = GitHubMigration(token, scope="org" if scope == "org" else "user",
+                                     org=owner or "x",
                                      api_base=api_base or "https://api.github.com")
-            items = client.list_orgs() if kind == "owners" else client.list_repos(
-                org=owner if scope == "org" else "")
+            if kind == "owners":
+                items = client.list_orgs()
+            elif scope == "auto":
+                items = client.list_all_repos()
+            else:
+                items = client.list_repos(org=owner if scope == "org" else "")
         else:
             client = GitLabExport(token, api_base=api_base or "https://gitlab.com")
             items = client.list_groups() if kind == "owners" else client.list_projects(group=owner)

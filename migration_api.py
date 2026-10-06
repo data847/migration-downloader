@@ -28,6 +28,10 @@ from typing import Callable, Iterable, List, Optional
 GITHUB_API_VERSION_USER = "2022-11-28"
 GITHUB_API_VERSION_ORG = "2026-03-10"
 GITHUB_API_BASE = "https://api.github.com"
+# `exclude_<name>` booleans accepted by POST .../migrations
+GITHUB_EXCLUDE_OPTIONS = frozenset(
+    {"metadata", "git_data", "attachments", "releases", "owner_projects"}
+)
 GITLAB_API_BASE = "https://gitlab.com"
 
 DOWNLOAD_CHUNK = 1024 * 1024
@@ -41,6 +45,28 @@ class MigrationError(RuntimeError):
 
 def _noop(_message: str) -> None:
     pass
+
+
+def brief_error(exc: BaseException) -> str:
+    """One line for logs and manifests: the failing request, plus the API's own
+    explanation (`— Must be an organization owner`) when it sent one."""
+    lines = str(exc).splitlines()
+    head = lines[0] if lines else str(exc)
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            data = None
+        message = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            message = str(data.get("message") or (err if isinstance(err, str) else "")
+                          or (err.get("message") if isinstance(err, dict) else "") or "")
+        return f"{head} — {(message or line)[:200]}"
+    return head
 
 
 def mask(token: str) -> str:
@@ -211,7 +237,7 @@ class ArchiveResult:
             "state": self.state,
             "error": self.error,
             "skipped": self.skipped,
-            "ok": bool(self.path) and not self.error,
+            "ok": (bool(self.path) or bool(self.meta.get("uploaded_to"))) and not self.error,
         }
 
 
@@ -233,6 +259,8 @@ class GitHubMigration:
         api_base: str = GITHUB_API_BASE,
         api_version: str = "",
         lock_repositories: bool = False,
+        exclude: Iterable[str] = (),
+        org_metadata_only: bool = False,
         log: Logger = _noop,
     ):
         if scope not in {"user", "org"}:
@@ -249,6 +277,15 @@ class GitHubMigration:
             GITHUB_API_VERSION_USER if scope == "user" else GITHUB_API_VERSION_ORG
         )
         self.lock_repositories = lock_repositories
+        bad = set(exclude) - GITHUB_EXCLUDE_OPTIONS
+        if bad:
+            raise MigrationError(
+                f"unknown exclude option(s) {sorted(bad)}; choose from {sorted(GITHUB_EXCLUDE_OPTIONS)}"
+            )
+        if org_metadata_only and scope != "org":
+            raise MigrationError("org_metadata_only is only valid for org scope")
+        self.exclude = sorted(set(exclude))
+        self.org_metadata_only = org_metadata_only
         self.log = log
         self.download_info: dict = {}
 
@@ -315,12 +352,36 @@ class GitHubMigration:
             if r.get("name")
         ]
 
+    def list_all_repos(self, cap: int = 2000) -> List[dict]:
+        """Personal repos plus every org repo the token can reach, as owner/repo.
+
+        One call covers both because `organization_member` adds the orgs'
+        repos to what the user owns or collaborates on.
+        """
+        url = (f"{self.api_base}/user/repos"
+               "?affiliation=owner,collaborator,organization_member&sort=updated")
+        return [
+            {
+                "target": r.get("full_name"),
+                "label": r.get("full_name"),
+                "private": bool(r.get("private")),
+                "archived": bool(r.get("archived")),
+                "size_kb": r.get("size") or 0,
+                "updated": (r.get("pushed_at") or r.get("updated_at") or "")[:10],
+            }
+            for r in paged(url, headers=self._headers, cap=cap)
+            if r.get("full_name")
+        ]
+
     # -- step 2 ------------------------------------------------------------
     def start(self, repos: Iterable[str]) -> str:
         names = [self.normalise(r) for r in repos if r.strip()]
         if not names:
             raise MigrationError("no repositories given")
         payload = {"lock_repositories": self.lock_repositories, "repositories": names}
+        payload.update({f"exclude_{name}": True for name in self.exclude})
+        if self.org_metadata_only:
+            payload["org_metadata_only"] = True
         self.log(f"  POST {self._root}  repositories={names}")
         _status, data = _json_request(self._root, method="POST", headers=self._headers, payload=payload)
         migration_id = data.get("id")
@@ -372,6 +433,26 @@ class GitHubMigration:
         """Repos the source says this migration contains (`owner/name` when given)."""
         _status, data = _json_request(f"{self._root}/{migration_id}/repositories", headers=self._headers)
         return [r.get("full_name") or r.get("name") for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+
+    # -- housekeeping (read-only listings, plus two opt-in mutations) ------
+    def list_migrations(self) -> list:
+        return paged(self._root, headers=self._headers)
+
+    def migration_repositories(self, migration_id: str) -> list:
+        return paged(f"{self._root}/{migration_id}/repositories", headers=self._headers)
+
+    def delete_archive(self, migration_id: str) -> None:
+        """Removes the archive from GitHub. Irreversible, so callers must opt in."""
+        url = f"{self._root}/{migration_id}/archive"
+        self.log(f"  DELETE {url}")
+        _json_request(url, method="DELETE", headers=self._headers)
+
+    def unlock_repo(self, migration_id: str, repo_name: str) -> None:
+        """Releases the lock that `lock_repositories` placed on a repo."""
+        name = repo_name.strip("/").split("/")[-1]
+        url = f"{self._root}/{migration_id}/repos/{urllib.parse.quote(name, safe='')}/lock"
+        self.log(f"  DELETE {url}")
+        _json_request(url, method="DELETE", headers=self._headers)
 
 
 # ── GitLab ───────────────────────────────────────────────────────────────────
@@ -450,10 +531,25 @@ class GitLabExport:
         ]
 
     # -- step 2 ------------------------------------------------------------
-    def start(self, project: str) -> None:
+    def start(
+        self,
+        project: str,
+        *,
+        upload_url: str = "",
+        upload_method: str = "",
+        description: str = "",
+    ) -> None:
+        """`upload_url` makes GitLab push the finished archive there itself."""
         url = self._project_url(project, "/export")
-        self.log(f"  POST {url}")
-        status, _data = _json_request(url, method="POST", headers=self._headers)
+        payload: dict = {}
+        if description:
+            payload["description"] = description
+        if upload_url:
+            payload["upload"] = {"url": upload_url, "http_method": upload_method or "PUT"}
+        self.log(f"  POST {url}" + ("  (GitLab will upload the archive itself)" if upload_url else ""))
+        status, _data = _json_request(
+            url, method="POST", headers=self._headers, payload=payload or None
+        )
         self.log(f"  HTTP {status} — export scheduled" if status in (200, 202) else f"  HTTP {status}")
 
     # -- step 3 ------------------------------------------------------------
@@ -488,3 +584,34 @@ class GitLabExport:
         url = self._project_url(str(ident), "/export/download")
         self.log(f"  GET {url}")
         return _download(url, dest, headers=self._headers, log=self.log, info=self.download_info)
+
+    # -- relations export (direct-transfer format, one file per relation) ---
+    RELATION_DONE, RELATION_FAILED = 2, 3
+
+    def relations_export(self, project: str, dest_dir: Path, *, interval: int = 15,
+                         timeout: int = 3600, cancelled=None) -> List[Path]:
+        url = self._project_url(project, "/export_relations")
+        self.log(f"  POST {url}")
+        _json_request(url, method="POST", headers=self._headers)
+        deadline = time.time() + timeout
+        while True:
+            if cancelled and cancelled():
+                raise MigrationError("cancelled while waiting for the relations export")
+            _status, rows = _json_request(f"{url}/status", headers=self._headers)
+            rows = rows if isinstance(rows, list) else []
+            failed = [r.get("relation") for r in rows if r.get("status") == self.RELATION_FAILED]
+            if failed:
+                raise MigrationError(f"relations export failed for {failed}")
+            if rows and all(r.get("status") == self.RELATION_DONE for r in rows):
+                break
+            if time.time() > deadline:
+                raise MigrationError(f"timed out waiting for the relations export of {project}")
+            GitHubMigration._sleep(interval, cancelled)
+        saved = []
+        for row in rows:
+            name = row.get("relation", "")
+            dest = dest_dir / f"{safe_name(name)}.ndjson.gz"
+            saved.append(_download(
+                f"{url}/download?relation={urllib.parse.quote(name, safe='')}",
+                dest, headers=self._headers, log=self.log))
+        return saved

@@ -84,12 +84,18 @@ select-all and private/archived badges:
 
 | | GitHub | GitLab |
 |---|---|---|
-| Owners | **Browse orgs** → `/user/orgs`; picking one loads its repos | **Browse groups** → groups you hold Maintainer+ in |
-| Repos | user scope: repos you own or collaborate on; org scope: the org's repos | projects you could export, newest activity first |
+| Owners | — (one list covers them) | **Browse groups** → groups you hold Maintainer+ in |
+| Repos | one list: repos you own or collaborate on plus every org repo you can reach (`/user/repos?affiliation=owner,collaborator,organization_member`) | projects you could export, newest activity first |
 
-Selected entries are appended to the target list in the exact form the API
-wants — `owner/repo` for user scope, bare names for org scope,
-`group/subgroup/project` for GitLab. GitLab discovery filters to Maintainer
+GitHub has no user/org switch any more: targets are always `owner/repo`, and
+the default `--scope auto` decides per repo. Repos owned by the token's own
+login go through `/user/migrations`; every other owner's go through that org's
+`/orgs/{org}/migrations`, one group per owner (so `--single-archive` bundles
+within an owner, never across). `--scope user` / `--scope org --org X` still
+force the old behaviour, and org scope still takes bare names.
+
+Selected entries are appended to the target list as `owner/repo`
+(GitHub) or `group/subgroup/project` (GitLab). GitLab discovery filters to Maintainer
 (access level 40) or above, since that is the floor for exporting a project, so
 the list holds no rows that would 403 on initiate. Typing targets by hand still
 works; the picker only fills the box.
@@ -193,6 +199,58 @@ without a token or network. Long format, columns `repo,section,key,value`; a bla
 
 Disable with `--no-for-check` (CLI) or `for_check=false` in the job spec. Counts are two snapshots because things change while
 an export runs; a checker should only fail when the archive holds fewer than the lower of the two.
+## Extras: what the archives leave out
+
+`--extras` runs read-only collectors after the export flow and writes them
+under `<run>/extras/<target>/`. **The web UI always runs every collector**
+(`everything`) when you press Start; the CLI runs only what you ask for.
+Names go in a comma list;
+`all` runs every light collector, `everything` adds the heavy ones (full
+clones, logs, binaries). `--list-extras` prints the names per provider. A
+collector that fails (403, feature disabled) is recorded in `manifest.json`
+under `extras` and the rest carry on. `--max-items` caps each unbounded
+listing (default 200).
+
+| Provider | Light collectors | Heavy (name them or `everything`) |
+|---|---|---|
+| `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `branch-protection` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `wiki` `actions-logs` |
+| `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `hooks` | `wiki` `job-traces` `job-artifacts` `relations-export` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `commit-statuses` `commit-diffstat` `pullrequests` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `forks` | `commit-patches` `pr-diffs` `pipeline-logs` |
+| `bitbucket-dc` | | `archive` |
+
+Not collected on purpose: issue/PR/commit comments, discussions, activity and
+tasks.
+
+Extra token needs beyond the export scopes: GitHub `admin:repo_hook` (or
+`read:repo_hook`), `security_events`, `read:project`, `read:packages`; GitLab
+Maintainer on the project (for `hooks`). Bitbucket Cloud takes a user API token
+(an `email:token` pair or a bare access token, `BITBUCKET_TOKEN` in the env
+file) with `read:repository`, `read:pullrequest`, `read:pipeline`,
+`admin:repository` (branch restrictions, pipelines config), `read:webhook` and
+`read:snippet`.
+
+`wiki` shells out to `git` (the image installs it). Credentials are passed
+through git's environment config, never the URL or argv.
+
+Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo --extras all`
+is extras-only. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
+token `BITBUCKET_DC_TOKEN`) starts and monitors the server-side export job
+(`--dc-action export|preview|cancel|none`, `--dc-job-id` for cancel); the
+resulting `.tar` is written to the server's shared home, not downloaded here.
+
+In the web UI, one **Bitbucket** button covers both products, the way GitLab
+covers gitlab.com and self-hosted: host `bitbucket.org` is Cloud (extras only),
+and `Data Center (self-hosted)` takes a base URL plus an export-job selector
+(start, preview, cancel or none). A run's extras and export jobs show in
+their own results card. The repo/org browser is GitHub and GitLab only.
+
+Additional export options:
+
+- GitHub: `--exclude metadata,git_data,attachments,releases,owner_projects`,
+  `--org-metadata-only`; after a successful download `--unlock-repos` (with
+  `--lock-repositories`) and `--delete-archive` (irreversible, off by default).
+- GitLab: `--upload-url`/`--upload-method`/`--description` make GitLab push the
+  export to a URL itself (nothing is downloaded; only the host is logged).
 
 ## Invariants (DataLabs workspace)
 

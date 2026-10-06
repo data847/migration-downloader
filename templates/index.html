@@ -68,7 +68,7 @@
   fieldset{border:0;padding:0;margin:0 0 16px;min-width:0}
   label{display:block;font-family:var(--mono);font-size:10.5px;color:var(--muted);
     margin:0 0 6px;text-transform:uppercase;letter-spacing:.14em}
-  input[type=text],input[type=password],input[type=number],textarea{
+  input[type=text],input[type=password],input[type=number],textarea,select{
     width:100%;background:transparent;color:var(--fg);border:1px solid var(--line);
     border-radius:var(--r-input);padding:10px 12px;font:inherit;font-size:16px;min-height:44px;
     transition:border-color .2s}
@@ -156,6 +156,13 @@
   .picker .item input{width:17px;height:17px;flex:none;accent-color:var(--btn);min-height:0}
   .picker .item .name{font-family:var(--mono);font-size:12.5px;word-break:break-all;flex:1}
   .picker .item .meta{color:var(--muted);font-size:11.5px;white-space:nowrap}
+  .picker .grp-head{background:var(--panel-2);position:sticky;top:0;z-index:1;font-weight:600}
+  .picker .grp-head .name{font-weight:600}
+  .picker .tog{background:transparent;border:0;color:var(--muted);cursor:pointer;font:inherit;
+    font-size:13px;width:22px;height:22px;padding:0;flex:none;border-radius:5px;transition:transform .12s}
+  .picker .tog:hover{color:var(--accent)}
+  .picker .tog[aria-expanded=true]{transform:rotate(90deg)}
+  .picker .grp-body .item{padding-left:52px}
   .picker footer{padding:12px 18px;border-top:1px solid var(--line);display:flex;
     justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
   .picker .note{color:var(--muted);font-size:12.5px;padding:14px 18px}
@@ -175,11 +182,12 @@
     <div class="seg" role="group" aria-label="Provider">
       <button type="button" data-provider="github" aria-pressed="true">GitHub</button>
       <button type="button" data-provider="gitlab" aria-pressed="false">GitLab</button>
+      <button type="button" data-provider="bitbucket" aria-pressed="false">Bitbucket</button>
     </div>
 
     <fieldset style="margin-top:14px">
-      <label>Host</label>
-      <div class="seg" role="group" aria-label="Host">
+      <label id="host-label">Host</label>
+      <div class="seg" role="group" aria-label="Host" id="host-seg">
         <button type="button" data-host="cloud" aria-pressed="true" id="host-cloud">github.com</button>
         <button type="button" data-host="self" aria-pressed="false" id="host-self">Self-hosted</button>
       </div>
@@ -190,28 +198,10 @@
     </fieldset>
 
     <fieldset>
-      <label for="token">Personal access token</label>
+      <label for="token" id="token-label">Personal access token</label>
       <input type="password" id="token" placeholder="paste PAT, or leave blank to use .env">
       <div class="hint" id="token-hint"></div>
     </fieldset>
-
-    <div data-only="github">
-      <fieldset>
-        <label>Repository owner type</label>
-        <div class="seg" role="group" aria-label="Scope">
-          <button type="button" data-scope="user" aria-pressed="true">User repos</button>
-          <button type="button" data-scope="org" aria-pressed="false">Org repos</button>
-        </div>
-        <div class="hint" id="scope-hint"></div>
-      </fieldset>
-      <fieldset data-only="org" hidden>
-        <label for="org">Organization</label>
-        <input type="text" id="org" placeholder="TEST_ORG">
-        <div class="inline-act">
-          <button class="ghost" type="button" id="pick-owner">Browse orgs the token can see</button>
-        </div>
-      </fieldset>
-    </div>
 
     <fieldset>
       <label for="targets" id="targets-label">Repositories (one per line)</label>
@@ -221,6 +211,19 @@
         <button class="ghost" type="button" id="clear-targets">Clear</button>
       </div>
       <div class="hint" id="targets-hint"></div>
+    </fieldset>
+
+    <fieldset data-only="bitbucket-dc">
+      <label for="dc_action">Export job</label>
+      <select id="dc_action">
+        <option value="export">Start export and monitor it</option>
+        <option value="preview">Preview only (nothing is exported)</option>
+        <option value="cancel">Cancel a running job…</option>
+        <option value="none">No export job (extras only)</option>
+      </select>
+      <input type="text" id="dc_job_id" placeholder="job id to cancel" hidden style="margin-top:8px">
+      <div class="hint">The export <code>.tar</code> is written on the Bitbucket server
+        (<code>$BITBUCKET_SHARED_HOME/data/migration/export/</code>); it cannot be downloaded here.</div>
     </fieldset>
 
     <fieldset data-only="gitlab">
@@ -260,7 +263,9 @@
 
     <button class="primary" id="go" type="submit">Start migration &amp; download</button>
     <div class="hint" style="margin-top:12px">
-      Archives are written to<br><span class="paths">{{ outputs_dir }}</span>
+      Each run also collects everything the archive omits (wikis, CI history,
+      hooks, alerts, packages and so on) under <code>extras/</code>.
+      Output is written to<br><span class="paths">{{ outputs_dir }}</span>
     </div>
   </form>
 
@@ -294,6 +299,16 @@ state is exported / finished, then download the tarball.
 
 Runs survive a page reload and a server restart — this page re-attaches
 to whatever is in flight.</pre>
+    </div>
+
+    <div class="card" id="extras-card" hidden>
+      <h2>Extras &amp; export jobs</h2>
+      <div class="hint" style="margin:0 0 8px">Files are on the server at
+        <span class="paths" id="extras-where"></span></div>
+      <div class="scroll">
+        <table><thead><tr><th>Target / collector</th><th>Result</th><th>Status</th></tr></thead>
+        <tbody id="extras-results"></tbody></table>
+      </div>
     </div>
 
     <div class="card" id="results-card" hidden>
@@ -349,39 +364,54 @@ to whatever is in flight.</pre>
 </div>
 
 <script>
-const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }} };
+const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }},
+  bitbucket: {{ bitbucket_env|tojson }}, 'bitbucket-dc': {{ bitbucket_dc_env|tojson }} };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const KEY = 'md.jobId';
-let provider = 'github', scope = 'user', host = 'cloud';
+let provider = 'github', host = 'cloud';
 let jobId = null, since = 0, timer = null;
 let pickerMode = 'repos', pickerItems = [];
+let pickerSel = new Set(), pickerOpen = new Set();   // ticked repos / expanded owners
 
 /* ── form wiring ─────────────────────────────────────────────────────── */
 function syncVisibility(){
   document.querySelectorAll('[data-only]').forEach(el => {
     const key = el.dataset.only;
-    el.hidden = !(key === provider || (key === 'org' && provider === 'github' && scope === 'org'));
+    el.hidden = key !== provider;
   });
   const gh = provider === 'github';
-  $('targets-label').textContent = gh
-    ? (scope === 'org' ? 'Repositories (bare names, one per line)' : 'Repositories (owner/repo, one per line)')
+  const bb = provider === 'bitbucket', dc = provider === 'bitbucket-dc';
+  const bbAny = bb || dc;
+  $('targets-label').textContent = dc ? 'Repositories (PROJECT_KEY/repo-slug, one per line)'
+    : bb ? 'Repositories (workspace/repo, one per line)'
+    : gh ? 'Repositories (owner/repo, one per line — personal and org repos can be mixed)'
     : 'Projects (namespace/project, one per line)';
-  $('targets').placeholder = gh ? (scope === 'org' ? 'guava' : 'google/guava') : 'group/subgroup/project';
+  $('targets').placeholder = dc ? 'PROJ/my-repo' : bb ? 'my-workspace/my-repo'
+    : gh ? 'google/guava' : 'group/subgroup/project';
   $('api_base').placeholder = gh ? 'https://api.github.com' : 'https://gitlab.com';
-  $('scope-hint').innerHTML = scope === 'org'
-    ? 'PAT needs <code>repo</code> + <code>admin:org</code>; you must be an Owner or hold the Migrator role.'
-    : 'PAT needs <code>repo</code> + <code>user</code>.';
-  $('targets-hint').innerHTML = gh
-    ? 'Full URLs and <code>.git</code> suffixes are accepted.'
+  // Bitbucket has no repo/owner browser here
+  $('pick-repos').hidden = bbAny;
+  $('token-label').textContent = bbAny ? 'API / access token' : 'Personal access token';
+  $('go').textContent = bb ? 'Collect repo data' : dc ? 'Run export & download' : 'Start migration & download';
+  $('dc_job_id').hidden = $('dc_action').value !== 'cancel';
+  $('targets-hint').innerHTML = dc
+    ? 'Needs a system-admin token. Starts the server-side export job and also saves a per-repo zip.'
+    : bb
+    ? 'Bitbucket Cloud has no export archive, so this collects repo data over the API instead. Use a user API token (<code>email:token</code> or a bare access token) with the scopes listed in the README.'
+    : gh
+    ? 'Your own repos and any org\'s repos in one list; the owner decides which migration API is used. PAT needs <code>repo</code> + <code>user</code>, plus <code>admin:org</code> and an Owner or Migrator role for org repos. Full URLs and <code>.git</code> suffixes are accepted.'
     : 'PAT needs <code>api</code> + <code>write_repository</code>. Numeric project IDs and nested subgroups work.';
   const gh2 = provider === 'github';
-  $('host-cloud').textContent = gh2 ? 'github.com' : 'gitlab.com';
-  $('host-self').textContent = gh2 ? 'GitHub Enterprise' : 'Self-hosted GitLab';
+  $('host-cloud').textContent = gh2 ? 'github.com' : bbAny ? 'bitbucket.org' : 'gitlab.com';
+  $('host-self').textContent = gh2 ? 'GitHub Enterprise' : bbAny ? 'Data Center (self-hosted)' : 'Self-hosted GitLab';
   $('host-wrap').hidden = host !== 'self';
-  $('api_base').placeholder = gh2 ? 'https://github.example.com/api/v3' : 'https://gitlab.example.com';
-  $('host-hint').innerHTML = gh2
+  $('api_base').placeholder = dc ? 'https://bitbucket.example.com'
+    : gh2 ? 'https://github.example.com/api/v3' : 'https://gitlab.example.com';
+  $('host-hint').innerHTML = dc
+    ? 'Server root, no <code>/rest/api</code> — that is appended for you.'
+    : gh2
     ? 'Enterprise API root — usually <code>https://&lt;host&gt;/api/v3</code>.'
     : 'Instance root, no <code>/api/v4</code> — that is appended for you.';
   $('pick-repos').textContent = gh2 ? 'Browse & select repos…' : 'Browse & select projects…';
@@ -390,20 +420,21 @@ function syncVisibility(){
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
     : `No ${provider} token found in <code>{{ env_file }}</code>; paste one above.`;
 }
+$('dc_action').onchange = syncVisibility;
+
+/* Bitbucket is one button; the host picks the backend provider, like github.com vs
+   Enterprise: bitbucket.org -> Cloud ('bitbucket'), self-hosted -> 'bitbucket-dc'. */
+const bitbucketProvider = () => host === 'self' ? 'bitbucket-dc' : 'bitbucket';
 document.querySelectorAll('[data-provider]').forEach(b => b.onclick = () => {
-  provider = b.dataset.provider;
+  provider = b.dataset.provider === 'bitbucket' ? bitbucketProvider() : b.dataset.provider;
   document.querySelectorAll('[data-provider]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   syncVisibility();
 });
 document.querySelectorAll('[data-host]').forEach(b => b.onclick = () => {
   host = b.dataset.host;
+  if(provider.startsWith('bitbucket')) provider = bitbucketProvider();
   document.querySelectorAll('[data-host]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   if(host === 'cloud') $('api_base').value = '';
-  syncVisibility();
-});
-document.querySelectorAll('[data-scope]').forEach(b => b.onclick = () => {
-  scope = b.dataset.scope;
-  document.querySelectorAll('[data-scope]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   syncVisibility();
 });
 
@@ -418,7 +449,26 @@ function append(lines){
   log.textContent += lines.join('\n') + '\n';
   if(stick) log.scrollTop = log.scrollHeight;
 }
+function renderExtrasResults(manifest){
+  const card = $('extras-card');
+  const extras = (manifest && manifest.extras) || [], jobs = (manifest && manifest.export_jobs) || [];
+  if(!extras.length && !jobs.length){ card.hidden = true; return; }
+  card.hidden = false;
+  const jobRows = jobs.map(j => `<tr><td class="mono">export job ${esc(j.job_id || j.action)}
+      <div style="color:var(--muted)">${esc((j.targets || []).join(', '))}</div></td>
+    <td>${esc(j.action)}${j.state ? ' · ' + esc(j.state) : ''}</td>
+    <td>${j.error ? `<span class="pill bad">${esc(j.error.slice(0, 90))}</span>`
+      : `<span class="pill ok">ok</span>`}</td></tr>`);
+  const rows = extras.map(e => `<tr><td class="mono">${esc(e.target)}
+      <div style="color:var(--muted)">${esc(e.extra)}</div></td>
+    <td>${e.files.length} file${e.files.length === 1 ? '' : 's'}</td>
+    <td>${e.error ? `<span class="pill bad">${esc(e.error.slice(0, 90))}</span>`
+      : `<span class="pill ok">ok</span>`}</td></tr>`);
+  $('extras-results').innerHTML = jobRows.concat(rows).join('');
+  $('extras-where').textContent = (manifest.output_dir || '') + '/extras/';
+}
 function renderResults(manifest){
+  renderExtrasResults(manifest);
   const card = $('results-card');
   if(!manifest || !manifest.archives || !manifest.archives.length){ card.hidden = true; return; }
   const run = (manifest.output_dir || '').split('/').pop();
@@ -493,17 +543,19 @@ $('refresh').onclick = () => { loadJobs(); loadRuns(); };
 
 $('form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const payload = { provider, scope,
-    org: $('org').value, token: $('token').value, targets: $('targets').value,
+  const payload = { provider, scope: 'auto',
+    token: $('token').value, targets: $('targets').value,
     poll_interval: $('poll').value, timeout: $('timeout').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
+    dc_action: $('dc_action').value, dc_job_id: $('dc_job_id').value.trim(),
     api_version: $('api_version').value,
     run_name: $('run_name').value,
+    extras: 'everything',   // every collector for this provider, on every run
     lock_repositories: $('lock_repositories').checked,
     single_archive: $('single_archive').checked,
     verify_checksum: $('verify_checksum').checked };
   $('go').disabled = true; $('banner').hidden = true;
-  $('log').textContent = ''; $('results-card').hidden = true; since = 0;
+  $('log').textContent = ''; $('results-card').hidden = true; $('extras-card').hidden = true; since = 0;
   setState('starting', 'run');
   const res = await fetch('/api/jobs', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
@@ -514,29 +566,26 @@ $('form').onsubmit = async (ev) => {
 
 /* ── browse / select repos, orgs and groups ──────────────────────────── */
 function discoverBody(kind){
-  return { provider, scope, kind,
+  return { provider, scope: 'auto', kind,
     token: $('token').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
-    owner: provider === 'github' ? $('org').value.trim() : $('group').value.trim() };
+    owner: provider === 'github' ? '' : $('group').value.trim() };
 }
 async function openPicker(mode){
   pickerMode = mode;
   const isOwners = mode === 'owners';
   const noun = provider === 'github'
-    ? (isOwners ? 'organizations' : (scope === 'org' ? `repositories in ${$('org').value.trim() || 'the org'}` : 'your repositories'))
+    ? (isOwners ? 'organizations' : 'repositories (yours and your orgs\')')
     : (isOwners ? 'groups' : ($('group').value.trim() ? `projects in ${$('group').value.trim()}` : 'your projects'));
   $('picker-title').textContent = `Select ${noun}`;
   $('picker-add').hidden = isOwners;
   $('picker-all').hidden = isOwners;
   $('picker-none').hidden = isOwners;
   $('picker-search').value = '';
+  pickerSel = new Set(); pickerOpen = new Set();
   $('picker-list').innerHTML = '<div class="note">loading…</div>';
   $('picker-note').textContent = '';
   $('backdrop').hidden = false;
-  if(provider === 'github' && scope === 'org' && !isOwners && !$('org').value.trim()){
-    $('picker-list').innerHTML = '<div class="note">Pick an organization first, or browse orgs.</div>';
-    return;
-  }
   const res = await fetch('/api/discover', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(discoverBody(mode))});
   const data = await res.json();
@@ -559,52 +608,98 @@ function renderPicker(){
   const isOwners = pickerMode === 'owners';
   const shown = pickerItems.filter(i =>
     !q || (i.label || i.name || '').toLowerCase().includes(q));
-  $('picker-list').innerHTML = shown.length ? shown.map((i, n) => {
-    const key = isOwners ? i.name : i.target;
+  if(!shown.length){
+    $('picker-list').innerHTML = '<div class="note">nothing matches that filter</div>';
+    updateCount();
+    return;
+  }
+  if(isOwners){
+    $('picker-list').innerHTML = shown.map(i => `<label class="item">
+      <span class="name">${esc(i.label || i.name)}</span>${esc(i.description || '').slice(0,60)}</label>`).join('');
+    $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
+      $('group').value = shown[n].name;
+      closePicker();
+      openPicker('repos');
+    });
+    updateCount();
+    return;
+  }
+  // repos: one collapsible row per owner (org, user or top-level group)
+  const groups = new Map();
+  shown.forEach(i => {
+    const owner = i.target.split('/')[0];
+    if(!groups.has(owner)) groups.set(owner, []);
+    groups.get(owner).push(i);
+  });
+  const repoRow = i => {
     const badges = [
       i.private ? '<span class="pill">private</span>' : '',
       i.archived ? '<span class="pill warn">archived</span>' : '',
     ].join(' ');
-    const meta = isOwners ? esc(i.description || '').slice(0,60)
-      : `${badges} <span class="meta">${esc(i.updated || '')}</span>`;
     return `<label class="item">
-      ${isOwners ? '' : `<input type="checkbox" value="${esc(key)}" data-i="${n}">`}
-      <span class="name">${esc(i.label || i.name)}</span>${meta}</label>`;
-  }).join('') : '<div class="note">nothing matches that filter</div>';
-  if(isOwners){
-    $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
-      const name = shown[n].name;
-      if(provider === 'github'){ $('org').value = name; } else { $('group').value = name; }
-      closePicker();
-      openPicker('repos');
+      <input type="checkbox" class="repo-cb" value="${esc(i.target)}"${pickerSel.has(i.target) ? ' checked' : ''}>
+      <span class="name">${esc(i.target.slice(i.target.indexOf('/') + 1))}</span>
+      ${badges} <span class="meta">${esc(i.updated || '')}</span></label>`;
+  };
+  $('picker-list').innerHTML = [...groups].map(([owner, items]) => {
+    const open = q ? true : pickerOpen.has(owner);       // a filter reveals its matches
+    return `<div class="grp" data-owner="${esc(owner)}">
+      <label class="item grp-head">
+        <input type="checkbox" class="grp-cb" aria-label="select all of ${esc(owner)}">
+        <button type="button" class="tog" aria-expanded="${open}" aria-label="show repos of ${esc(owner)}">▸</button>
+        <span class="name">${esc(owner)}</span>
+        <span class="meta">${items.length} repo${items.length === 1 ? '' : 's'}</span></label>
+      <div class="grp-body"${open ? '' : ' hidden'}>${items.map(repoRow).join('')}</div></div>`;
+  }).join('');
+  $('picker-list').querySelectorAll('.grp').forEach(grp => {
+    const head = grp.querySelector('.grp-cb'), boxes = [...grp.querySelectorAll('.repo-cb')];
+    const refresh = () => {
+      const n = boxes.filter(b => b.checked).length;
+      head.checked = n === boxes.length; head.indeterminate = n > 0 && n < boxes.length;
+    };
+    head.onchange = () => {
+      boxes.forEach(b => { b.checked = head.checked; head.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value); });
+      refresh(); updateCount();
+    };
+    boxes.forEach(b => b.onchange = () => {
+      b.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value);
+      refresh(); updateCount();
     });
-  } else {
-    $('picker-list').querySelectorAll('input').forEach(cb =>
-      cb.onchange = () => updateCount());
-  }
+    grp.querySelector('.tog').onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();           // the row is a <label>: don't toggle the box
+      const body = grp.querySelector('.grp-body'), owner = grp.dataset.owner;
+      body.hidden = !body.hidden;
+      e.currentTarget.setAttribute('aria-expanded', String(!body.hidden));
+      body.hidden ? pickerOpen.delete(owner) : pickerOpen.add(owner);
+    };
+    // clicking the owner name expands it too, rather than ticking everything
+    grp.querySelector('.grp-head .name').onclick = (e) => {
+      e.preventDefault(); grp.querySelector('.tog').click();
+    };
+    refresh();
+  });
   updateCount();
 }
 function updateCount(){
-  const n = $('picker-list').querySelectorAll('input:checked').length;
-  $('picker-count').textContent = pickerMode === 'owners' ? '' : `${n} selected`;
+  $('picker-count').textContent = pickerMode === 'owners' ? '' : `${pickerSel.size} selected`;
 }
+function shownRepoBoxes(){ return [...$('picker-list').querySelectorAll('.repo-cb')]; }
 function closePicker(){ $('backdrop').hidden = true; }
 $('picker-close').onclick = closePicker;
 $('backdrop').onclick = (e) => { if(e.target === $('backdrop')) closePicker(); };
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closePicker(); });
 $('picker-search').oninput = renderPicker;
 $('picker-all').onclick = () => {
-  $('picker-list').querySelectorAll('input').forEach(cb => cb.checked = true); updateCount(); };
+  shownRepoBoxes().forEach(cb => pickerSel.add(cb.value)); renderPicker(); };
 $('picker-none').onclick = () => {
-  $('picker-list').querySelectorAll('input').forEach(cb => cb.checked = false); updateCount(); };
+  shownRepoBoxes().forEach(cb => pickerSel.delete(cb.value)); renderPicker(); };
 $('picker-add').onclick = () => {
-  const picked = [...$('picker-list').querySelectorAll('input:checked')].map(cb => cb.value);
+  const picked = [...pickerSel];
   const existing = $('targets').value.split('\n').map(t => t.trim()).filter(Boolean);
   $('targets').value = [...new Set([...existing, ...picked])].join('\n') + (picked.length ? '\n' : '');
   closePicker();
 };
 $('pick-repos').onclick = () => openPicker('repos');
-$('pick-owner').onclick = () => openPicker('owners');
 $('pick-group').onclick = () => openPicker('owners');
 $('clear-targets').onclick = () => { $('targets').value = ''; };
 
