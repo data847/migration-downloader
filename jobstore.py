@@ -26,7 +26,7 @@ import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ensure_outputs, outputs_for
 from migration_api import mask, safe_name
-from runner import COMPONENT, JobSpec, issues_from_manifest
+from runner import COMPONENT, JobSpec
 
 JOBS_DIR = ensure_outputs(COMPONENT, ".jobs")
 FLUSH_SECONDS = 1.0
@@ -130,6 +130,7 @@ def request_cancel(job_id: str) -> bool:
 
 
 def _issue_count(job: dict) -> int:
+    from runner import issues_from_manifest      # local: keeps the import block untouched for other branches
     manifest = job.get("manifest") or {}
     issues = manifest.get("issues")
     return len(issues if issues is not None else issues_from_manifest(manifest)) if manifest else 0
