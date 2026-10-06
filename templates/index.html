@@ -126,10 +126,18 @@
   .picker .list{overflow-y:auto;flex:1;min-height:120px}
   .picker .item{display:flex;gap:10px;align-items:center;padding:9px 16px;
     border-bottom:1px solid var(--line);cursor:pointer;font-size:13.5px}
+  .picker .item{text-transform:none;letter-spacing:0;color:var(--fg)}   /* names are case-sensitive */
   .picker .item:hover{background:var(--panel-2)}
   .picker .item input{width:17px;height:17px;flex:none;accent-color:var(--accent);min-height:0}
   .picker .item .name{font-family:var(--mono);font-size:12.5px;word-break:break-all;flex:1}
   .picker .item .meta{color:var(--muted);font-size:11.5px;white-space:nowrap}
+  .picker .grp-head{background:var(--panel-2);position:sticky;top:0;z-index:1;font-weight:600}
+  .picker .grp-head .name{font-weight:600}
+  .picker .tog{background:transparent;border:0;color:var(--muted);cursor:pointer;font:inherit;
+    font-size:13px;width:22px;height:22px;padding:0;flex:none;border-radius:5px;transition:transform .12s}
+  .picker .tog:hover{color:var(--accent)}
+  .picker .tog[aria-expanded=true]{transform:rotate(90deg)}
+  .picker .grp-body .item{padding-left:52px}
   .picker footer{padding:11px 16px;border-top:1px solid var(--line);display:flex;
     justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
   .picker .note{color:var(--muted);font-size:12.5px;padding:14px 16px}
@@ -339,6 +347,7 @@ const KEY = 'md.jobId';
 let provider = 'github', host = 'cloud';
 let jobId = null, since = 0, timer = null;
 let pickerMode = 'repos', pickerItems = [];
+let pickerSel = new Set(), pickerOpen = new Set();   // ticked repos / expanded owners
 
 /* ── form wiring ─────────────────────────────────────────────────────── */
 function syncVisibility(){
@@ -547,6 +556,7 @@ async function openPicker(mode){
   $('picker-all').hidden = isOwners;
   $('picker-none').hidden = isOwners;
   $('picker-search').value = '';
+  pickerSel = new Set(); pickerOpen = new Set();
   $('picker-list').innerHTML = '<div class="note">loading…</div>';
   $('picker-note').textContent = '';
   $('backdrop').hidden = false;
@@ -572,46 +582,93 @@ function renderPicker(){
   const isOwners = pickerMode === 'owners';
   const shown = pickerItems.filter(i =>
     !q || (i.label || i.name || '').toLowerCase().includes(q));
-  $('picker-list').innerHTML = shown.length ? shown.map((i, n) => {
-    const key = isOwners ? i.name : i.target;
+  if(!shown.length){
+    $('picker-list').innerHTML = '<div class="note">nothing matches that filter</div>';
+    updateCount();
+    return;
+  }
+  if(isOwners){
+    $('picker-list').innerHTML = shown.map(i => `<label class="item">
+      <span class="name">${esc(i.label || i.name)}</span>${esc(i.description || '').slice(0,60)}</label>`).join('');
+    $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
+      $('group').value = shown[n].name;
+      closePicker();
+      openPicker('repos');
+    });
+    updateCount();
+    return;
+  }
+  // repos: one collapsible row per owner (org, user or top-level group)
+  const groups = new Map();
+  shown.forEach(i => {
+    const owner = i.target.split('/')[0];
+    if(!groups.has(owner)) groups.set(owner, []);
+    groups.get(owner).push(i);
+  });
+  const repoRow = i => {
     const badges = [
       i.private ? '<span class="pill">private</span>' : '',
       i.archived ? '<span class="pill warn">archived</span>' : '',
     ].join(' ');
-    const meta = isOwners ? esc(i.description || '').slice(0,60)
-      : `${badges} <span class="meta">${esc(i.updated || '')}</span>`;
     return `<label class="item">
-      ${isOwners ? '' : `<input type="checkbox" value="${esc(key)}" data-i="${n}">`}
-      <span class="name">${esc(i.label || i.name)}</span>${meta}</label>`;
-  }).join('') : '<div class="note">nothing matches that filter</div>';
-  if(isOwners){
-    $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
-      const name = shown[n].name;
-      $('group').value = name;
-      closePicker();
-      openPicker('repos');
+      <input type="checkbox" class="repo-cb" value="${esc(i.target)}"${pickerSel.has(i.target) ? ' checked' : ''}>
+      <span class="name">${esc(i.target.slice(i.target.indexOf('/') + 1))}</span>
+      ${badges} <span class="meta">${esc(i.updated || '')}</span></label>`;
+  };
+  $('picker-list').innerHTML = [...groups].map(([owner, items]) => {
+    const open = q ? true : pickerOpen.has(owner);       // a filter reveals its matches
+    return `<div class="grp" data-owner="${esc(owner)}">
+      <label class="item grp-head">
+        <input type="checkbox" class="grp-cb" aria-label="select all of ${esc(owner)}">
+        <button type="button" class="tog" aria-expanded="${open}" aria-label="show repos of ${esc(owner)}">▸</button>
+        <span class="name">${esc(owner)}</span>
+        <span class="meta">${items.length} repo${items.length === 1 ? '' : 's'}</span></label>
+      <div class="grp-body"${open ? '' : ' hidden'}>${items.map(repoRow).join('')}</div></div>`;
+  }).join('');
+  $('picker-list').querySelectorAll('.grp').forEach(grp => {
+    const head = grp.querySelector('.grp-cb'), boxes = [...grp.querySelectorAll('.repo-cb')];
+    const refresh = () => {
+      const n = boxes.filter(b => b.checked).length;
+      head.checked = n === boxes.length; head.indeterminate = n > 0 && n < boxes.length;
+    };
+    head.onchange = () => {
+      boxes.forEach(b => { b.checked = head.checked; head.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value); });
+      refresh(); updateCount();
+    };
+    boxes.forEach(b => b.onchange = () => {
+      b.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value);
+      refresh(); updateCount();
     });
-  } else {
-    $('picker-list').querySelectorAll('input').forEach(cb =>
-      cb.onchange = () => updateCount());
-  }
+    grp.querySelector('.tog').onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();           // the row is a <label>: don't toggle the box
+      const body = grp.querySelector('.grp-body'), owner = grp.dataset.owner;
+      body.hidden = !body.hidden;
+      e.currentTarget.setAttribute('aria-expanded', String(!body.hidden));
+      body.hidden ? pickerOpen.delete(owner) : pickerOpen.add(owner);
+    };
+    // clicking the owner name expands it too, rather than ticking everything
+    grp.querySelector('.grp-head .name').onclick = (e) => {
+      e.preventDefault(); grp.querySelector('.tog').click();
+    };
+    refresh();
+  });
   updateCount();
 }
 function updateCount(){
-  const n = $('picker-list').querySelectorAll('input:checked').length;
-  $('picker-count').textContent = pickerMode === 'owners' ? '' : `${n} selected`;
+  $('picker-count').textContent = pickerMode === 'owners' ? '' : `${pickerSel.size} selected`;
 }
+function shownRepoBoxes(){ return [...$('picker-list').querySelectorAll('.repo-cb')]; }
 function closePicker(){ $('backdrop').hidden = true; }
 $('picker-close').onclick = closePicker;
 $('backdrop').onclick = (e) => { if(e.target === $('backdrop')) closePicker(); };
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closePicker(); });
 $('picker-search').oninput = renderPicker;
 $('picker-all').onclick = () => {
-  $('picker-list').querySelectorAll('input').forEach(cb => cb.checked = true); updateCount(); };
+  shownRepoBoxes().forEach(cb => pickerSel.add(cb.value)); renderPicker(); };
 $('picker-none').onclick = () => {
-  $('picker-list').querySelectorAll('input').forEach(cb => cb.checked = false); updateCount(); };
+  shownRepoBoxes().forEach(cb => pickerSel.delete(cb.value)); renderPicker(); };
 $('picker-add').onclick = () => {
-  const picked = [...$('picker-list').querySelectorAll('input:checked')].map(cb => cb.value);
+  const picked = [...pickerSel];
   const existing = $('targets').value.split('\n').map(t => t.trim()).filter(Boolean);
   $('targets').value = [...new Set([...existing, ...picked])].join('\n') + (picked.length ? '\n' : '');
   closePicker();
