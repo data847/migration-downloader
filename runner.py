@@ -146,7 +146,7 @@ class JobSpec:
         if self.provider == "github" and self.scope == "org" and not self.org:
             raise MigrationError("an organization name is required for org scope")
         if self.provider == "bitbucket" and not self.extras:
-            raise MigrationError("Bitbucket Cloud has no export archive; pass extras (e.g. all, mirror)")
+            raise MigrationError("Bitbucket Cloud has no export archive; pass extras (e.g. all, pullrequests)")
         if self.provider == "bitbucket-dc":
             if not self.api_base:
                 raise MigrationError("Bitbucket Data Center needs --api-base (its base URL)")

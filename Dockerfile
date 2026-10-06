@@ -11,9 +11,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# git + git-lfs back the `mirror`, `wiki` and `lfs` extras
+# git backs the `wiki` extras
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git git-lfs \
+ && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

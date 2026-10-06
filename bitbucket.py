@@ -1,9 +1,8 @@
 """Bitbucket support: Cloud collectors and the Data Center export job.
 
 Bitbucket Cloud has no export archive at all (no export/import/archive path in
-its OpenAPI), so everything here is a collector: a full history via
-`git clone --mirror` plus REST calls for what a clone lacks. Pull-request refs
-are not in a Cloud mirror, so PR data comes from REST.
+its OpenAPI), so everything here is a collector made of REST calls. (Pull-request
+refs are not in a Cloud mirror, so PR data has to come from REST anyway.)
 
 Bitbucket Data Center does have an export job, but it writes a `.tar` into the
 server's shared home directory, so this tool can start and monitor it but not
@@ -27,14 +26,10 @@ from supplementary import (
     collector,
     fetch_file,
     get_json,
-    lfs_fetch,
-    mirror,
     try_json,
 )
 
 BITBUCKET_CLOUD_BASE = "https://api.bitbucket.org/2.0"
-# username Bitbucket expects for API tokens over git
-GIT_USERNAME = "x-bitbucket-api-token-auth"
 PR_STATES = ("OPEN", "MERGED", "DECLINED", "SUPERSEDED")
 
 
@@ -47,11 +42,6 @@ def cloud_headers(token: str) -> dict:
         auth = f"Bearer {token}"
     return {"Authorization": auth, "Accept": "application/json",
             "User-Agent": "DataLabs-migration-downloader"}
-
-
-def git_secret(token: str) -> str:
-    """git wants only the token half of an `email:token` pair."""
-    return token.split(":", 1)[1] if ":" in token else token
 
 
 def cloud_paged(url: str, headers: dict, *, cap: int = 200, pagelen: int = 100) -> list:
@@ -75,25 +65,9 @@ def bb_workspace(ctx: Ctx) -> str:
     return ctx.target.split("/", 1)[0]
 
 
-def _mirror_ctx(ctx: Ctx) -> Ctx:
-    ctx_token = git_secret(ctx.token)
-    return Ctx(**{**ctx.__dict__, "token": ctx_token})
-
-
 @collector("bitbucket", "repo-metadata")
 def bb_repo_metadata(ctx):
     return [ctx.save_json("repo-metadata", get_json(bb_url(ctx), ctx.headers))]
-
-
-@collector("bitbucket", "mirror", heavy=True)
-def bb_mirror(ctx):
-    return mirror(_mirror_ctx(ctx), f"https://bitbucket.org/{ctx.target}.git", "repo.git",
-                  username=GIT_USERNAME)
-
-
-@collector("bitbucket", "lfs", heavy=True)
-def bb_lfs(ctx):
-    return lfs_fetch(_mirror_ctx(ctx), "repo.git", username=GIT_USERNAME)
 
 
 @collector("bitbucket", "refs")
@@ -198,32 +172,9 @@ def bb_branching_model(ctx):
     return [ctx.save_json("branching-model", get_json(bb_url(ctx, "/branching-model"), ctx.headers))]
 
 
-@collector("bitbucket", "default-reviewers")
-def bb_default_reviewers(ctx):
-    return [ctx.save_json("default-reviewers", cloud_paged(
-        bb_url(ctx, "/default-reviewers"), ctx.headers, cap=ctx.max_items))]
-
-
 @collector("bitbucket", "downloads")
 def bb_downloads(ctx):
-    listing = cloud_paged(bb_url(ctx, "/downloads"), ctx.headers, cap=ctx.max_items)
-    ctx.shared.setdefault("bb_downloads", {})[ctx.target] = listing
-    return [ctx.save_json("downloads", listing)]
-
-
-@collector("bitbucket", "download-files", heavy=True)
-def bb_download_files(ctx):
-    listing = ctx.shared.get("bb_downloads", {}).get(ctx.target)
-    if listing is None:
-        listing = cloud_paged(bb_url(ctx, "/downloads"), ctx.headers, cap=ctx.max_items)
-    written = []
-    for item in listing:
-        ctx.check_cancelled()
-        name = item.get("name", "")
-        written.append(fetch_file(
-            ctx, bb_url(ctx, f"/downloads/{urllib.parse.quote(name, safe='')}"),
-            f"download-files/{safe_name(name)}"))
-    return written
+    return [ctx.save_json("downloads", cloud_paged(bb_url(ctx, "/downloads"), ctx.headers, cap=ctx.max_items))]
 
 
 @collector("bitbucket", "snippets")
@@ -264,11 +215,6 @@ def bb_hooks(ctx):
     return written
 
 
-@collector("bitbucket", "deploy-keys")
-def bb_deploy_keys(ctx):
-    return [ctx.save_json("deploy-keys", cloud_paged(bb_url(ctx, "/deploy-keys"), ctx.headers, cap=ctx.max_items))]
-
-
 @collector("bitbucket", "pipelines")
 def bb_pipelines(ctx):
     pipelines = cloud_paged(bb_url(ctx, "/pipelines/?sort=-created_on"), ctx.headers, cap=ctx.max_items)
@@ -300,23 +246,6 @@ def bb_pipeline_logs(ctx):
             except MigrationError as exc:
                 ctx.log(f"    step {step['uuid']}: {str(exc).splitlines()[0]}")
     return written
-
-
-@collector("bitbucket", "permissions")
-def bb_permissions(ctx):
-    return [ctx.save_json("permissions-users", cloud_paged(
-        bb_url(ctx, "/permissions-config/users"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("bitbucket", "workspace-members")
-def bb_workspace_members(ctx):
-    ws = bb_workspace(ctx)
-    done = ctx.shared.setdefault("bb_members", set())
-    if ws in done:
-        return []
-    members = cloud_paged(f"{ctx.api_base}/workspaces/{ws}/members", ctx.headers, cap=ctx.max_items)
-    done.add(ws)
-    return [ctx.save_json(f"workspace-members-{safe_name(ws)}", members)]
 
 
 @collector("bitbucket", "forks")

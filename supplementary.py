@@ -178,17 +178,6 @@ def mirror(ctx: Ctx, clone_url: str, rel: str, *, username: str, optional: bool 
     return [rel]
 
 
-def lfs_fetch(ctx: Ctx, rel: str, *, username: str) -> List[str]:
-    repo = ctx.out / rel
-    if not (repo / "HEAD").is_file():
-        raise MigrationError("no mirror to fetch LFS objects for; run the `mirror` extra first")
-    proc = run_git(["lfs", "fetch", "--all"], env=git_env(username, ctx.token), cwd=repo)
-    if proc.returncode != 0:
-        err = (proc.stderr or "").strip()
-        raise MigrationError(f"git lfs failed: {err.splitlines()[-1] if err else proc.returncode}")
-    return [f"{rel}/lfs"]
-
-
 # ── GitHub ───────────────────────────────────────────────────────────────────
 
 GITHUB_PACKAGE_TYPES = ("npm", "maven", "rubygems", "docker", "nuget", "container")
@@ -216,43 +205,15 @@ def gh_repo_metadata(ctx):
     return [ctx.save_json("repo-metadata", get_json(gh_url(ctx), ctx.headers))]
 
 
-@collector("github", "mirror", heavy=True)
-def gh_mirror(ctx):
-    return mirror(ctx, f"{gh_web_base(ctx)}/{gh_repo(ctx)}.git", "repo.git", username="x-access-token")
-
-
 @collector("github", "wiki", heavy=True)
 def gh_wiki(ctx):
     return mirror(ctx, f"{gh_web_base(ctx)}/{gh_repo(ctx)}.wiki.git", "wiki.git",
                   username="x-access-token", optional=True)
 
 
-@collector("github", "lfs", heavy=True)
-def gh_lfs(ctx):
-    return lfs_fetch(ctx, "repo.git", username="x-access-token")
-
-
 @collector("github", "releases")
 def gh_releases(ctx):
-    releases = paged_all(gh_url(ctx, "/releases"), ctx.headers, cap=ctx.max_items)
-    ctx.shared.setdefault("gh_releases", {})[ctx.target] = releases
-    return [ctx.save_json("releases", releases)]
-
-
-@collector("github", "release-assets", heavy=True)
-def gh_release_assets(ctx):
-    releases = ctx.shared.get("gh_releases", {}).get(ctx.target)
-    if releases is None:
-        releases = paged_all(gh_url(ctx, "/releases"), ctx.headers, cap=ctx.max_items)
-    binary = {**ctx.headers, "Accept": "application/octet-stream"}
-    written = []
-    for release in releases:
-        tag = safe_name(release.get("tag_name") or str(release.get("id")))
-        for asset in release.get("assets", []):
-            ctx.check_cancelled()
-            rel = f"release-assets/{tag}/{safe_name(asset.get('name', str(asset['id'])))}"
-            written.append(fetch_file(ctx, gh_url(ctx, f"/releases/assets/{asset['id']}"), rel, headers=binary))
-    return written
+    return [ctx.save_json("releases", paged_all(gh_url(ctx, "/releases"), ctx.headers, cap=ctx.max_items))]
 
 
 @collector("github", "actions")
@@ -288,30 +249,9 @@ def gh_actions_artifacts(ctx):
     return [ctx.save_json("actions-artifacts", artifacts)]
 
 
-@collector("github", "actions-artifact-files", heavy=True)
-def gh_actions_artifact_files(ctx):
-    artifacts = paged_all(gh_url(ctx, "/actions/artifacts"), ctx.headers, key="artifacts", cap=ctx.max_items)
-    written = []
-    for art in artifacts:
-        ctx.check_cancelled()
-        if art.get("expired"):
-            continue
-        try:
-            written.append(fetch_file(ctx, gh_url(ctx, f"/actions/artifacts/{art['id']}/zip"),
-                                      f"actions-artifacts/{art['id']}-{safe_name(art.get('name', ''))}.zip"))
-        except MigrationError as exc:
-            ctx.log(f"    artifact {art['id']}: {str(exc).splitlines()[0]}")
-    return written
-
-
 @collector("github", "hooks")
 def gh_hooks(ctx):
     return [ctx.save_json("hooks", paged_all(gh_url(ctx, "/hooks"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("github", "deploy-keys")
-def gh_deploy_keys(ctx):
-    return [ctx.save_json("deploy-keys", paged_all(gh_url(ctx, "/keys"), ctx.headers, cap=ctx.max_items))]
 
 
 @collector("github", "branch-protection")
@@ -322,12 +262,6 @@ def gh_branch_protection(ctx):
         name = branch["name"]
         out[name] = try_json(ctx, gh_url(ctx, f"/branches/{urllib.parse.quote(name, safe='')}/protection"))
     return [ctx.save_json("branch-protection", out)]
-
-
-@collector("github", "collaborators")
-def gh_collaborators(ctx):
-    return [ctx.save_json("collaborators", paged_all(
-        gh_url(ctx, "/collaborators?affiliation=all"), ctx.headers, cap=ctx.max_items))]
 
 
 @collector("github", "dependabot-alerts")
@@ -425,11 +359,6 @@ def gl_repo_archive(ctx):
     return [fetch_file(ctx, gl_url(ctx, "/repository/archive.tar.gz"), "repository-snapshot.tar.gz")]
 
 
-@collector("gitlab", "mirror", heavy=True)
-def gl_mirror(ctx):
-    return mirror(ctx, gl_clone_url(ctx), "repo.git", username="oauth2")
-
-
 @collector("gitlab", "wiki", heavy=True)
 def gl_wiki(ctx):
     return mirror(ctx, gl_clone_url(ctx, ".wiki.git"), "wiki.git", username="oauth2", optional=True)
@@ -438,11 +367,6 @@ def gl_wiki(ctx):
 @collector("gitlab", "wiki-pages")
 def gl_wiki_pages(ctx):
     return [ctx.save_json("wiki-pages", get_json(gl_url(ctx, "/wikis?with_content=1"), ctx.headers))]
-
-
-@collector("gitlab", "lfs", heavy=True)
-def gl_lfs(ctx):
-    return lfs_fetch(ctx, "repo.git", username="oauth2")
 
 
 @collector("gitlab", "releases")
@@ -495,59 +419,9 @@ def gl_job_artifacts(ctx):
     return written
 
 
-@collector("gitlab", "variables")
-def gl_variables(ctx):
-    return [ctx.save_json("ci-variables", paged_all(gl_url(ctx, "/variables"), ctx.headers, cap=ctx.max_items))]
-
-
 @collector("gitlab", "hooks")
 def gl_hooks(ctx):
     return [ctx.save_json("hooks", paged_all(gl_url(ctx, "/hooks"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("gitlab", "deploy-keys")
-def gl_deploy_keys(ctx):
-    return [ctx.save_json("deploy-keys", paged_all(gl_url(ctx, "/deploy_keys"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("gitlab", "deploy-tokens")
-def gl_deploy_tokens(ctx):
-    # The API never returns token values, only metadata.
-    return [ctx.save_json("deploy-tokens", paged_all(gl_url(ctx, "/deploy_tokens"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("gitlab", "members")
-def gl_members(ctx):
-    return [ctx.save_json("members", paged_all(gl_url(ctx, "/members/all"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("gitlab", "packages")
-def gl_packages(ctx):
-    return [ctx.save_json("packages", paged_all(gl_url(ctx, "/packages"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("gitlab", "registry")
-def gl_registry(ctx):
-    return [ctx.save_json("registry-repositories", paged_all(
-        gl_url(ctx, "/registry/repositories?tags=true&tags_count=true"), ctx.headers, cap=ctx.max_items))]
-
-
-@collector("gitlab", "group-export", heavy=True)
-def gl_group_export(ctx):
-    """Exports the project's parent group (structure/settings only). Once per
-    group per run, however many of its projects are targets."""
-    from migration_api import GitLabExport
-    group = ctx.target.rsplit("/", 1)[0] if "/" in ctx.target else ""
-    if not group:
-        raise MigrationError("project is not inside a group")
-    done = ctx.shared.setdefault("gl_groups", set())
-    if group in done:
-        return []
-    client = GitLabExport(ctx.token, api_base=ctx.api_base, log=ctx.log)
-    dest = ctx.out.parent / f"group-{safe_name(group)}.tar.gz"
-    client.group_export(group, dest, cancelled=ctx.cancelled)
-    done.add(group)
-    return [str(dest.relative_to(ctx.out.parent))]
 
 
 @collector("gitlab", "relations-export", heavy=True)

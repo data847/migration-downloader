@@ -6,7 +6,7 @@
   ./.venv/bin/python cli.py gitlab google/guava --poll-interval 20
   ./.venv/bin/python cli.py github --file github_repos.txt
   ./.venv/bin/python cli.py github org/repo --extras all            # + wikis, CI, alerts, hooks…
-  ./.venv/bin/python cli.py bitbucket ws/repo --extras all,mirror   # Cloud: extras only
+  ./.venv/bin/python cli.py bitbucket ws/repo --extras all          # Cloud: extras only
   ./.venv/bin/python cli.py bitbucket-dc PROJ/repo --api-base https://bb.example.com
 """
 

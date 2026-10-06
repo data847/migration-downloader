@@ -188,26 +188,24 @@ listing (default 200).
 
 | Provider | Light collectors | Heavy (name them or `everything`) |
 |---|---|---|
-| `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `deploy-keys` `branch-protection` `collaborators` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `mirror` `wiki` `lfs` `release-assets` `actions-logs` `actions-artifact-files` |
-| `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `variables` `hooks` `deploy-keys` `deploy-tokens` `members` `packages` `registry` | `mirror` `wiki` `lfs` `job-traces` `job-artifacts` `group-export` `relations-export` |
-| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `commit-statuses` `commit-diffstat` `pullrequests` `branch-restrictions` `branching-model` `default-reviewers` `downloads` `snippets` `hooks` `deploy-keys` `pipelines` `permissions` `workspace-members` `forks` | `mirror` `lfs` `commit-patches` `pr-diffs` `download-files` `pipeline-logs` |
+| `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `branch-protection` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `wiki` `actions-logs` |
+| `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `hooks` | `wiki` `job-traces` `job-artifacts` `relations-export` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `commit-statuses` `commit-diffstat` `pullrequests` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `forks` | `commit-patches` `pr-diffs` `pipeline-logs` |
 | `bitbucket-dc` | | `archive` |
 
 Not collected on purpose: issue/PR/commit comments, discussions, activity and
 tasks.
 
-Extra token needs beyond the export scopes: GitHub `read:org`,
-`admin:repo_hook` (or `read:repo_hook`), `security_events`, `read:project`,
-`read:packages`; GitLab `read_registry` plus Maintainer on the project
-(Owner for `group-export`). Bitbucket Cloud takes a user API token (an
-`email:token` pair or a bare access token, `BITBUCKET_TOKEN` in the env file)
-with `read:repository`, `read:pullrequest`, `read:pipeline`,
-`admin:repository`, `read:webhook`, `read:snippet`, `read:workspace`,
-`read:user` and `read:project`.
+Extra token needs beyond the export scopes: GitHub `admin:repo_hook` (or
+`read:repo_hook`), `security_events`, `read:project`, `read:packages`; GitLab
+Maintainer on the project (for `hooks`). Bitbucket Cloud takes a user API token
+(an `email:token` pair or a bare access token, `BITBUCKET_TOKEN` in the env
+file) with `read:repository`, `read:pullrequest`, `read:pipeline`,
+`admin:repository` (branch restrictions, pipelines config), `read:webhook` and
+`read:snippet`.
 
-`mirror`, `wiki` and `lfs` shell out to `git` (and `git-lfs`); the image
-installs both. Credentials are passed through git's environment config, never
-the URL or argv. Run `mirror` before `lfs` in the same run.
+`wiki` shells out to `git` (the image installs it). Credentials are passed
+through git's environment config, never the URL or argv.
 
 Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo --extras all`
 is extras-only. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,

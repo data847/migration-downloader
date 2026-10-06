@@ -532,29 +532,6 @@ class GitLabExport:
         self.log(f"  GET {url}")
         return _download(url, dest, headers=self._headers, log=self.log)
 
-    # -- group export (structure and settings, not project contents) --------
-    def _group_url(self, group: str, suffix: str = "") -> str:
-        ident = group if group.isdigit() else urllib.parse.quote(group.strip("/"), safe="")
-        return f"{self.api_base}/api/v4/groups/{ident}{suffix}"
-
-    def group_export(self, group: str, dest: Path, *, interval: int = 15, timeout: int = 3600,
-                     cancelled=None) -> Path:
-        """No status endpoint exists, so poll the download until it stops 404ing."""
-        url = self._group_url(group, "/export")
-        self.log(f"  POST {url}")
-        _json_request(url, method="POST", headers=self._headers)
-        deadline = time.time() + timeout
-        while True:
-            if cancelled and cancelled():
-                raise MigrationError("cancelled while waiting for the group export")
-            try:
-                return _download(self._group_url(group, "/export/download"), dest,
-                                 headers=self._headers, log=self.log)
-            except MigrationError as exc:
-                if "HTTP 404" not in str(exc) or time.time() > deadline:
-                    raise
-            GitHubMigration._sleep(interval, cancelled)
-
     # -- relations export (direct-transfer format, one file per relation) ---
     RELATION_DONE, RELATION_FAILED = 2, 3
 
