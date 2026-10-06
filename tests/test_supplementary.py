@@ -454,7 +454,7 @@ class BitbucketUi(unittest.TestCase):
     def test_page_offers_both_bitbucket_providers_and_dc_controls(self):
         import app
         html = app.app.test_client().get("/").get_data(as_text=True)
-        for needle in ('data-provider="bitbucket"', 'data-provider="bitbucket-dc"',
+        for needle in ('data-provider="bitbucket"', 'Data Center (self-hosted)',
                        'id="dc_action"', 'id="extras-card"'):
             self.assertIn(needle, html)
 
