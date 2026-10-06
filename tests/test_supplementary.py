@@ -429,5 +429,26 @@ class RunExtras(unittest.TestCase):
             self.assertEqual(records[0]["error"], "cancelled")
 
 
+class ExtrasEndpoint(unittest.TestCase):
+    def test_api_lists_collectors_light_first_with_heavy_flag(self):
+        import app
+        data = app.app.test_client().get("/api/extras").get_json()["extras"]
+        github = data["github"]
+        names = [e["name"] for e in github]
+        self.assertEqual(set(names), set(supplementary.REGISTRY["github"]))
+        flags = [e["heavy"] for e in github]
+        self.assertEqual(flags, sorted(flags))          # light block precedes heavy block
+        self.assertTrue(next(e for e in github if e["name"] == "mirror")["heavy"])
+        self.assertFalse(next(e for e in github if e["name"] == "hooks")["heavy"])
+
+    def test_every_listed_name_is_accepted_by_the_spec(self):
+        import app
+        data = app.app.test_client().get("/api/extras").get_json()["extras"]
+        for provider in ("github", "gitlab"):
+            spec = JobSpec(provider=provider, token="t", targets=["a/b"],
+                           extras=[e["name"] for e in data[provider]])
+            spec.validate()
+
+
 if __name__ == "__main__":
     unittest.main()

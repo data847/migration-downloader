@@ -67,6 +67,10 @@
     font-size:14px;text-transform:none;letter-spacing:0;min-height:34px}
   .check input{width:auto;min-height:0;accent-color:var(--accent);
     width:17px;height:17px;flex:none}
+  #extras-list h4{margin:10px 0 2px;font-size:11.5px;font-weight:600;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.05em}
+  #extras-list .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));column-gap:10px}
+  #extras-list .check{margin:2px 0;font-family:var(--mono);font-size:12.5px}
   .hint{color:var(--muted);font-size:12.5px;margin-top:6px}
   .hint code{background:var(--panel-2);padding:1px 4px;border-radius:4px;font-size:11.5px}
   button.primary{width:100%;background:var(--accent);color:var(--accent-fg);border:0;
@@ -225,12 +229,24 @@
         <input type="checkbox" id="lock_repositories"> Lock repositories during migration</label>
       <label class="check" data-only="github">
         <input type="checkbox" id="single_archive"> One archive for all repos</label>
-      <fieldset>
-        <label for="extras">Extras (read-only collectors, comma list)</label>
-        <input type="text" id="extras" placeholder="e.g. all · releases,hooks,members · everything">
-      </fieldset>
       <label class="check">
         <input type="checkbox" id="verify_checksum" checked> Compute SHA-256 of each archive</label>
+    </details>
+
+    <details id="extras-box">
+      <summary>Extras <span id="extras-count" class="hint"></span></summary>
+      <div class="hint" style="margin:0 0 8px">
+        Read-only collectors for what the archive omits. Saved under
+        <code>extras/&lt;target&gt;/</code> in the run folder.
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <button class="ghost" type="button" id="extras-light">All light</button>
+        <button class="ghost" type="button" id="extras-everything">Everything</button>
+        <button class="ghost" type="button" id="extras-none">None</button>
+      </div>
+      <div id="extras-list"></div>
+      <div class="hint">Heavy ones pull full clones, logs or binaries and can be large.
+        <code>lfs</code> needs <code>mirror</code> in the same run.</div>
     </details>
 
     <button class="primary" id="go" type="submit">Start migration &amp; download</button>
@@ -360,11 +376,41 @@ function syncVisibility(){
     ? 'Enterprise API root — usually <code>https://&lt;host&gt;/api/v3</code>.'
     : 'Instance root, no <code>/api/v4</code> — that is appended for you.';
   $('pick-repos').textContent = gh2 ? 'Browse & select repos…' : 'Browse & select projects…';
+  renderExtras();
   const env = ENV[provider];
   $('token-hint').innerHTML = env
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
     : `No ${provider} token found in <code>{{ env_file }}</code>; paste one above.`;
 }
+/* ── extras picker ───────────────────────────────────────────────────── */
+let EXTRAS = {};
+const extrasChecked = {};          // provider -> Set of names, so switching tabs keeps picks
+function renderExtras(){
+  const names = EXTRAS[provider] || [];
+  const picked = extrasChecked[provider] = extrasChecked[provider] || new Set();
+  const group = (title, items) => items.length ? `<h4>${title}</h4><div class="grid">${
+    items.map(e => `<label class="check"><input type="checkbox" value="${esc(e.name)}"${
+      picked.has(e.name) ? ' checked' : ''}> ${esc(e.name)}</label>`).join('')}</div>` : '';
+  $('extras-list').innerHTML = group('Light', names.filter(e => !e.heavy))
+    + group('Heavy', names.filter(e => e.heavy));
+  $('extras-list').querySelectorAll('input').forEach(cb => cb.onchange = () => {
+    cb.checked ? picked.add(cb.value) : picked.delete(cb.value); updateExtrasCount(); });
+  updateExtrasCount();
+}
+function setExtras(pred){
+  const picked = extrasChecked[provider] = new Set((EXTRAS[provider] || []).filter(pred).map(e => e.name));
+  renderExtras();
+}
+function updateExtrasCount(){
+  const n = (extrasChecked[provider] || new Set()).size;
+  $('extras-count').textContent = n ? `(${n} selected)` : '';
+}
+$('extras-light').onclick = () => setExtras(e => !e.heavy);
+$('extras-everything').onclick = () => setExtras(() => true);
+$('extras-none').onclick = () => setExtras(() => false);
+fetch('/api/extras').then(r => r.json()).then(d => { EXTRAS = d.extras || {}; renderExtras(); })
+  .catch(() => { $('extras-box').hidden = true; });
+
 document.querySelectorAll('[data-provider]').forEach(b => b.onclick = () => {
   provider = b.dataset.provider;
   document.querySelectorAll('[data-provider]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
@@ -474,7 +520,7 @@ $('form').onsubmit = async (ev) => {
     api_base: host === 'self' ? $('api_base').value.trim() : '',
     api_version: $('api_version').value,
     run_name: $('run_name').value,
-    extras: $('extras').value,
+    extras: [...document.querySelectorAll('#extras-list input:checked')].map(cb => cb.value).join(','),
     lock_repositories: $('lock_repositories').checked,
     single_archive: $('single_archive').checked,
     verify_checksum: $('verify_checksum').checked };
