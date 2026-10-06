@@ -26,7 +26,7 @@ import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ensure_outputs, outputs_for
 from migration_api import mask, safe_name
-from runner import COMPONENT, JobSpec
+from runner import COMPONENT, JobSpec, issues_from_manifest
 
 JOBS_DIR = ensure_outputs(COMPONENT, ".jobs")
 FLUSH_SECONDS = 1.0
@@ -129,6 +129,12 @@ def request_cancel(job_id: str) -> bool:
         return True
 
 
+def _issue_count(job: dict) -> int:
+    manifest = job.get("manifest") or {}
+    issues = manifest.get("issues")
+    return len(issues if issues is not None else issues_from_manifest(manifest)) if manifest else 0
+
+
 def listing(limit: int = 25) -> List[dict]:
     """Newest first, log bodies stripped — for the sidebar / history table."""
     with _lock:
@@ -144,6 +150,7 @@ def listing(limit: int = 25) -> List[dict]:
                 "run_name": (j.get("manifest") or {}).get("output_dir", "").split("/")[-1],
                 "lines": len(j["log"]),
                 "resumable": bool(resume_plan(j)),
+                "issues": _issue_count(j),
             }
             for j in jobs
         ]

@@ -202,14 +202,19 @@ an export runs; a checker should only fail when the archive holds fewer than the
 ## Extras: what the archives leave out
 
 `--extras` runs read-only collectors after the export flow and writes them
-under `<run>/extras/<target>/`. **The web UI always runs every collector**
+under `<run>/extras/<target>/`. **The web UI runs every collector by default**
 (`everything`) when you press Start; the CLI runs only what you ask for.
 Names go in a comma list;
-`all` runs every light collector, `everything` adds the heavy ones (full
-clones, logs, binaries). `--list-extras` prints the names per provider. A
+`all` runs every light collector, `everything` adds the heavy ones (wikis,
+CI logs). `--list-extras` prints the names per provider. A
 collector that fails (403, feature disabled) is recorded in `manifest.json`
-under `extras` and the rest carry on. `--max-items` caps each unbounded
-listing (default 200).
+under `extras` and the rest carry on. `--max-items` is how many items each
+listing collects (default 200, `0` = no limit); a listing cut at the limit is
+reported as an issue, never silently.
+
+In the web UI, the word "download" in the page header opens a dialog where
+extras can be unticked for the next runs (the choice and the item limit are
+remembered in the browser). Leaving everything ticked is the default.
 
 | Provider | Light collectors | Heavy (name them or `everything`) |
 |---|---|---|
@@ -252,6 +257,75 @@ Additional export options:
 - GitLab: `--upload-url`/`--upload-method`/`--description` make GitLab push the
   export to a URL itself (nothing is downloaded; only the host is logged).
 
+## Downloading a run
+
+**Download everything (.zip)** returns a zip of zips: one `<target>.zip` per
+target holding its archive, its `.for-check.csv` and its `extras/` files, plus
+`run-files.zip` (manifest and anything else at the top of the run). Runs with
+only extras (Bitbucket Cloud) download the same way. The zip is built in a
+temp file one target at a time, so it needs roughly the run's size in free
+temp space; the request fails with a clear message if that is missing, and the
+temp file is removed once the download ends or the browser disconnects.
+
+## Issues
+
+A run that did not go cleanly no longer says "partial". It shows **N issues**
+as a button (in the run header and the run list); clicking it lists each thing
+that went wrong: the target, the step, the host's own message, and in plain
+words what usually causes it (missing org Owner role, SSO not authorized, a
+feature switched off, a rate limit...). The same list is in `manifest.json`
+under `issues`, also for runs recorded before this existed. A listing cut off
+by the item limit shows up here too.
+
+## Rate limits and retries
+
+Every API call goes through one place that waits instead of failing: a `429`
+waits `Retry-After`; a `403` that says the hourly budget or a secondary limit
+is spent waits for the reset; `5xx` and dropped connections back off and retry
+a few times. When a response says the budget is almost used, the next call to
+that host pauses first. Waits are logged in the run and can be cancelled. A
+`POST` (starting a migration) is never repeated after a `5xx` or a dropped
+connection, because that could start a second one; it is only retried when the
+host clearly did nothing (`429`, rate-limit `403`). A genuine permission `403`
+is reported straight away.
+
+## Paging
+
+Listings follow the `Link: rel="next"` header the host sends, not a guessed
+`?page=N` (Dependabot and secret-scanning alerts only take cursors, so
+`page=2` would repeat page 1). The repo picker loads one page at a time as you
+scroll, so there is no cap on how many repos it can list, and keeps loading
+while a filter is active so a match on a later page is not missed. Counts show
+a `+` until everything is loaded. Organizations that enforce SAML SSO only
+appear once the token is authorized for them; when GitHub says results are
+hidden for that reason, the picker says so.
+
+## Secrets in collected data
+
+Extras are scrubbed before they are written: JSON fields named like secrets
+(`secret`, `token`, `password`, `api_key`, ...) are blanked, which includes the
+leaked value in a secret-scanning alert, and strings go through the same
+patterns as the run log (tokens, `Authorization` headers, URLs with
+credentials, Slack/Discord/Teams webhook URLs, private-key blocks). CI logs
+(Actions log zips, GitLab job traces, Bitbucket pipeline logs) are scrubbed
+after download. Source diffs, patches and build artifacts are repository
+content and are left as they are.
+
+## Safety checks
+
+- Repository names are validated before anything runs (letters, digits and
+  `. _ - ~` separated by `/`; no `..`, spaces, `;` or `?`).
+- A pagination link is only followed on the host the listing started from, so
+  the token cannot be sent elsewhere; only `http(s)` URLs are ever opened.
+- A file name that comes from an API response cannot write outside its target
+  folder (symlinks included).
+- A run refuses to start with under 512 MB free; the download zip checks its
+  own space first; scrubbing a zip is skipped past 256 MB uncompressed.
+- `--delete-archive` only deletes from GitHub after the downloaded file is
+  exactly the size GitHub announced and opens as a tarball; otherwise it keeps
+  the remote copy and says why.
+- The run zip leaves out symlinks and unfinished `.part` files.
+
 ## Invariants (DataLabs workspace)
 
 - **Tokens** come from `DataLabs/.env` (`GH_TOKEN`/`GITHUB_TOKEN`,
@@ -277,3 +351,14 @@ Additional export options:
 - `--api-base` targets GitHub Enterprise or a self-hosted GitLab.
 - Downloads stream to `<name>.tar.gz.part` and are renamed on completion, so a
   killed run never leaves a truncated file that looks finished.
+
+## Tests
+
+```bash
+python3 -m pytest tests          # offline: any real network call fails the test
+```
+
+`tests/conftest.py` blocks the network and replaces sleeping with a no-op.
+`tests/test_packaging.py` fails if a module is missing from the Dockerfile
+`COPY` line, which would otherwise only show up as an ImportError in the
+container.

@@ -24,13 +24,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+import redact
 from migration_api import (
     MigrationError,
     _download,
+    _json_page,
     _json_request,
     brief_error,
     safe_name,
 )
+from safety import require_same_origin, safe_join
 
 Collector = Callable[["Ctx"], List[str]]
 
@@ -87,15 +90,23 @@ class Ctx:
     log: Callable[[str], None]
     org: str = ""                  # github org scope: the target is a bare repo name
     scope: str = "user"
-    max_items: int = 200           # cap for unbounded listings (runs, pipelines, commits…)
+    max_items: int = 200           # per listing (runs, pipelines, commits…); 0 = no limit
     shared: dict = field(default_factory=dict)   # once-per-run state (groups, workspaces)
     cancelled: Optional[Callable[[], bool]] = None
+    truncated: list = field(default_factory=list)   # listings cut short by max_items
+
+    def truncate(self, what: str) -> None:
+        note = f"{what.split('?')[0].rsplit('/', 1)[-1] or what} limited to {self.max_items} items"
+        if note not in self.truncated:
+            self.truncated.append(note)
+            self.log(f"    {note} (raise --max-items, or 0 for no limit)")
 
     def save_json(self, name: str, data) -> str:
-        path = self.out / f"{name}.json"
+        """Secrets are scrubbed before anything touches disk."""
+        path = safe_join(self.out, f"{name}.json")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, default=str))
-        return str(path.relative_to(self.out))
+        path.write_text(json.dumps(redact.scrub_obj(data), indent=2, default=str))
+        return str(path.relative_to(self.out.resolve()))
 
     def check_cancelled(self) -> None:
         if self.cancelled and self.cancelled():
@@ -106,26 +117,42 @@ def get_json(url: str, headers: dict):
     return _json_request(url, headers=headers)[1]
 
 
-def paged_all(url: str, headers: dict, *, key: str = "", cap: int = 200, per_page: int = 100) -> list:
-    """`?page=N` paging. `key` unwraps endpoints that answer {key: [...]}."""
+def paged_all(ctx: Ctx, url: str, *, key: str = "", per_page: int = 100) -> list:
+    """Every item of a listing, following the server's own `Link: rel=next`.
+
+    Page numbers are wrong for some endpoints (Dependabot and secret scanning
+    only take cursors; `page=2` would hand back page 1 again), so the link the
+    server sends is the only thing trusted, and only on the origin we started
+    from. `key` unwraps endpoints that answer {key: [...]}.
+    """
     items: list = []
-    page = 1
-    while len(items) < cap:
-        sep = "&" if "?" in url else "?"
-        data = get_json(f"{url}{sep}per_page={per_page}&page={page}", headers)
+    sep = "&" if "?" in url else "?"
+    nxt = f"{url}{sep}per_page={per_page}"
+    while nxt:
+        ctx.check_cancelled()
+        data, link, _hdrs = _json_page(nxt, headers=ctx.headers)
         batch = data.get(key, []) if key and isinstance(data, dict) else data
-        if not isinstance(batch, list) or not batch:
+        if not isinstance(batch, list):
             break
         items.extend(batch)
-        if len(batch) < per_page:
-            break
-        page += 1
-    return items[:cap]
+        if ctx.max_items and len(items) >= ctx.max_items:
+            if link or len(items) > ctx.max_items:
+                ctx.truncate(url)
+            return items[:ctx.max_items]
+        nxt = require_same_origin(url, link) if link else None
+    return items
 
 
-def fetch_file(ctx: Ctx, url: str, rel: str, *, headers: Optional[dict] = None) -> str:
-    dest = ctx.out / rel
+def fetch_file(ctx: Ctx, url: str, rel: str, *, headers: Optional[dict] = None,
+               scrub: Optional[str] = None) -> str:
+    """Download into the target's folder. `scrub` = "text" or "zip" redacts secrets
+    from logs after the download (source diffs and binaries are left alone)."""
+    dest = safe_join(ctx.out, rel)
     _download(url, dest, headers=headers or ctx.headers, log=lambda _m: None)
+    if scrub == "text":
+        redact.scrub_text_file(dest)
+    elif scrub == "zip":
+        redact.scrub_zip(dest)
     return rel
 
 
@@ -237,12 +264,12 @@ def gh_wiki(ctx):
 
 @collector("github", "releases")
 def gh_releases(ctx):
-    return [ctx.save_json("releases", paged_all(gh_url(ctx, "/releases"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("releases", paged_all(ctx, gh_url(ctx, "/releases")))]
 
 
 @collector("github", "actions")
 def gh_actions(ctx):
-    runs = paged_all(gh_url(ctx, "/actions/runs"), ctx.headers, key="workflow_runs", cap=ctx.max_items)
+    runs = paged_all(ctx, gh_url(ctx, "/actions/runs"), key="workflow_runs")
     ctx.shared.setdefault("gh_runs", {})[ctx.target] = [r["id"] for r in runs]
     jobs = {}
     for run in runs:
@@ -255,13 +282,12 @@ def gh_actions(ctx):
 def gh_actions_logs(ctx):
     written = []
     for run_id in ctx.shared.get("gh_runs", {}).get(ctx.target) or [
-        r["id"] for r in paged_all(gh_url(ctx, "/actions/runs"), ctx.headers,
-                                   key="workflow_runs", cap=ctx.max_items)
+        r["id"] for r in paged_all(ctx, gh_url(ctx, "/actions/runs"), key="workflow_runs")
     ]:
         ctx.check_cancelled()
         try:
             written.append(fetch_file(ctx, gh_url(ctx, f"/actions/runs/{run_id}/logs"),
-                                      f"actions-logs/run-{run_id}.zip"))
+                                      f"actions-logs/run-{run_id}.zip", scrub="zip"))
         except MigrationError as exc:   # logs expire after 90 days -> 410
             ctx.log(f"    run {run_id}: {brief_error(exc)}")
     return written
@@ -269,18 +295,18 @@ def gh_actions_logs(ctx):
 
 @collector("github", "actions-artifacts")
 def gh_actions_artifacts(ctx):
-    artifacts = paged_all(gh_url(ctx, "/actions/artifacts"), ctx.headers, key="artifacts", cap=ctx.max_items)
+    artifacts = paged_all(ctx, gh_url(ctx, "/actions/artifacts"), key="artifacts")
     return [ctx.save_json("actions-artifacts", artifacts)]
 
 
 @collector("github", "hooks")
 def gh_hooks(ctx):
-    return [ctx.save_json("hooks", paged_all(gh_url(ctx, "/hooks"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("hooks", paged_all(ctx, gh_url(ctx, "/hooks")))]
 
 
 @collector("github", "branch-protection")
 def gh_branch_protection(ctx):
-    branches = paged_all(gh_url(ctx, "/branches?protected=true"), ctx.headers, cap=ctx.max_items)
+    branches = paged_all(ctx, gh_url(ctx, "/branches?protected=true"))
     out = {}
     for branch in branches:
         name = branch["name"]
@@ -291,19 +317,18 @@ def gh_branch_protection(ctx):
 @collector("github", "dependabot-alerts")
 @skip_when_off
 def gh_dependabot(ctx):
-    return [ctx.save_json("dependabot-alerts", paged_all(
-        gh_url(ctx, "/dependabot/alerts?state=open,fixed,dismissed,auto_dismissed"),
-        ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("dependabot-alerts", paged_all(ctx, 
+        gh_url(ctx, "/dependabot/alerts?state=open,fixed,dismissed,auto_dismissed")))]
 
 
 @collector("github", "code-scanning")
 @skip_when_off
 def gh_code_scanning(ctx):
     return [
-        ctx.save_json("code-scanning-alerts", paged_all(
-            gh_url(ctx, "/code-scanning/alerts"), ctx.headers, cap=ctx.max_items)),
-        ctx.save_json("code-scanning-analyses", paged_all(
-            gh_url(ctx, "/code-scanning/analyses"), ctx.headers, cap=ctx.max_items)),
+        ctx.save_json("code-scanning-alerts", paged_all(ctx, 
+            gh_url(ctx, "/code-scanning/alerts"))),
+        ctx.save_json("code-scanning-analyses", paged_all(ctx, 
+            gh_url(ctx, "/code-scanning/analyses"))),
     ]
 
 
@@ -312,8 +337,8 @@ def gh_code_scanning(ctx):
 def gh_secret_scanning(ctx):
     # Alert records name the secret type and location; the secret value is
     # masked by the API unless explicitly requested, which we never do.
-    return [ctx.save_json("secret-scanning-alerts", paged_all(
-        gh_url(ctx, "/secret-scanning/alerts"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("secret-scanning-alerts", paged_all(ctx, 
+        gh_url(ctx, "/secret-scanning/alerts")))]
 
 
 def _graphql_url(ctx: Ctx) -> str:
@@ -398,12 +423,12 @@ def gl_wiki_pages(ctx):
 
 @collector("gitlab", "releases")
 def gl_releases(ctx):
-    return [ctx.save_json("releases", paged_all(gl_url(ctx, "/releases"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("releases", paged_all(ctx, gl_url(ctx, "/releases")))]
 
 
 @collector("gitlab", "pipelines")
 def gl_pipelines(ctx):
-    pipelines = paged_all(gl_url(ctx, "/pipelines"), ctx.headers, cap=ctx.max_items)
+    pipelines = paged_all(ctx, gl_url(ctx, "/pipelines"))
     jobs = {}
     for pipe in pipelines:
         ctx.check_cancelled()
@@ -417,7 +442,7 @@ def _gl_job_ids(ctx: Ctx) -> list:
     ids = ctx.shared.get("gl_jobs", {}).get(ctx.target)
     if ids is not None:
         return ids
-    return [j["id"] for j in paged_all(gl_url(ctx, "/jobs"), ctx.headers, cap=ctx.max_items)]
+    return [j["id"] for j in paged_all(ctx, gl_url(ctx, "/jobs"))]
 
 
 @collector("gitlab", "job-traces", heavy=True)
@@ -426,7 +451,8 @@ def gl_job_traces(ctx):
     for job_id in _gl_job_ids(ctx):
         ctx.check_cancelled()
         try:
-            written.append(fetch_file(ctx, gl_url(ctx, f"/jobs/{job_id}/trace"), f"job-traces/{job_id}.log"))
+            written.append(fetch_file(ctx, gl_url(ctx, f"/jobs/{job_id}/trace"), f"job-traces/{job_id}.log",
+                                      scrub="text"))
         except MigrationError as exc:
             ctx.log(f"    job {job_id}: {brief_error(exc)}")
     return written
@@ -448,7 +474,7 @@ def gl_job_artifacts(ctx):
 
 @collector("gitlab", "hooks")
 def gl_hooks(ctx):
-    return [ctx.save_json("hooks", paged_all(gl_url(ctx, "/hooks"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("hooks", paged_all(ctx, gl_url(ctx, "/hooks")))]
 
 
 @collector("gitlab", "relations-export", heavy=True)

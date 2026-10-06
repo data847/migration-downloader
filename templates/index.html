@@ -167,6 +167,27 @@
     justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
   .picker .note{color:var(--muted);font-size:12.5px;padding:14px 18px}
   @media (max-width:520px){ .picker{max-height:92vh} .picker .item .meta{display:none} }
+  /* the word "download" in the header opens the options dialog; nothing hints at it */
+  button.secret{all:unset;cursor:text;color:inherit}
+  button.secret:focus-visible{outline:1px dashed var(--muted);outline-offset:3px;cursor:pointer}
+  .pill-btn{background:transparent;cursor:pointer;font:inherit;font-family:var(--mono);font-size:10.5px;
+    letter-spacing:.08em;text-transform:uppercase;padding:2px 10px;border-radius:100px;
+    border:1px solid var(--warn);color:var(--warn)}
+  .pill-btn:hover,.pill-btn:focus-visible{background:var(--warn);color:var(--accent-fg)}
+  .dlg .body{overflow-y:auto;flex:1;min-height:120px;padding:6px 18px 14px}
+  .dlg h4{margin:14px 0 4px;font-family:var(--mono);font-size:10.5px;font-weight:500;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.14em}
+  .dlg .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));column-gap:12px}
+  .dlg .grid .check{margin:3px 0;font-family:var(--mono);font-size:12.5px}
+  .dlg .row-opt{display:flex;gap:12px;align-items:center;margin:16px 0 4px}
+  .dlg .row-opt input{width:110px;min-height:38px}
+  .issue{border:1px solid var(--line);border-radius:var(--r-panel);padding:11px 14px;margin:10px 0}
+  .issue .where{font-family:var(--mono);font-size:12px;color:var(--fg);word-break:break-all}
+  .issue .what{font-family:var(--mono);font-size:12px;color:var(--bad);margin-top:5px;word-break:break-word}
+  .issue.limit .what{color:var(--warn)}
+  .issue .why{color:var(--muted);font-size:13px;margin-top:6px}
+  .picker .more{color:var(--muted);font-size:12.5px;padding:12px 18px;text-align:center}
+  .picker .sso{padding:8px 18px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
   [hidden]{display:none!important}
 </style>
 </head>
@@ -174,7 +195,7 @@
 <header>
   <span class="brand">LH2 AI Labs</span>
   <h1>Migration <em>Downloader</em></h1>
-  <span class="sub">GitHub Migration API &amp; GitLab Export API · initiate · poll · download</span>
+  <span class="sub">GitHub Migration API &amp; GitLab Export API · initiate · poll · <button type="button" class="secret" id="opts-open" aria-haspopup="dialog">download</button></span>
 </header>
 
 <main>
@@ -263,8 +284,8 @@
 
     <button class="primary" id="go" type="submit">Start migration &amp; download</button>
     <div class="hint" style="margin-top:12px">
-      Each run also collects everything the archive omits (wikis, CI history,
-      hooks, alerts, packages and so on) under <code>extras/</code>.
+      <span id="extras-note">Each run also collects everything the archive omits (wikis, CI history,
+      hooks, alerts, packages and so on) under</span> <code>extras/</code>.
       Output is written to<br><span class="paths">{{ outputs_dir }}</span>
     </div>
   </form>
@@ -302,7 +323,11 @@ to whatever is in flight.</pre>
     </div>
 
     <div class="card" id="extras-card" hidden>
-      <h2>Extras &amp; export jobs</h2>
+      <h2>Extras &amp; export jobs
+        <span class="acts">
+          <a class="ghost hot" id="zip2" href="#" hidden>⬇ Download everything (.zip)</a>
+        </span>
+      </h2>
       <div class="hint" style="margin:0 0 8px">Files are on the server at
         <span class="paths" id="extras-where"></span></div>
       <div class="scroll">
@@ -314,7 +339,7 @@ to whatever is in flight.</pre>
     <div class="card" id="results-card" hidden>
       <h2>Archives
         <span class="acts">
-          <a class="ghost hot" id="zip" href="#" hidden>⬇ Download all (.zip)</a>
+          <a class="ghost hot" id="zip" href="#" hidden>⬇ Download everything (.zip)</a>
         </span>
       </h2>
       <div class="scroll">
@@ -355,10 +380,54 @@ to whatever is in flight.</pre>
       <span class="pill" id="picker-count">0</span>
     </div>
     <div class="list" id="picker-list"></div>
+    <div class="sso" id="picker-sso" hidden>Organizations that enforce SAML SSO only appear once this token
+      is authorized for them (GitHub → Settings → Developer settings → Tokens → Configure SSO).</div>
     <footer>
       <span class="hint" id="picker-note" style="margin:0"></span>
       <button class="primary" type="button" id="picker-add"
         style="width:auto;padding:9px 16px">Add selected</button>
+    </footer>
+  </div>
+</div>
+
+<div class="backdrop" id="opts-backdrop" hidden>
+  <div class="picker dlg" role="dialog" aria-modal="true" aria-labelledby="opts-title">
+    <header>
+      <strong id="opts-title">Download options</strong>
+      <button class="ghost" type="button" id="opts-close">Done</button>
+    </header>
+    <div class="tools">
+      <button class="ghost" type="button" id="opts-all">Everything</button>
+      <button class="ghost" type="button" id="opts-light">Light only</button>
+      <button class="ghost" type="button" id="opts-none">None</button>
+      <span class="pill" id="opts-count">0</span>
+    </div>
+    <div class="body">
+      <div class="hint" style="margin:8px 0 0">Besides the archive, each run collects these read-only extras
+        and saves them under <code>extras/</code>. Untick what you do not want.</div>
+      <div id="opts-list"></div>
+      <div class="row-opt">
+        <label for="opt-max" style="margin:0">Max items per listing</label>
+        <input type="number" id="opt-max" min="0" step="50">
+        <span class="hint" style="margin:0">0 = no limit</span>
+      </div>
+    </div>
+    <footer>
+      <span class="hint" id="opts-note" style="margin:0">Heavy ones pull wikis and CI logs and can be large.</span>
+    </footer>
+  </div>
+</div>
+
+<div class="backdrop" id="issues-backdrop" hidden>
+  <div class="picker dlg" role="dialog" aria-modal="true" aria-labelledby="issues-title">
+    <header>
+      <strong id="issues-title">Issues</strong>
+      <button class="ghost" type="button" id="issues-close">Close</button>
+    </header>
+    <div class="body" id="issues-body"></div>
+    <footer>
+      <span class="hint" id="issues-sub" style="margin:0"></span>
+      <button class="ghost" type="button" id="issues-copy">Copy summary</button>
     </footer>
   </div>
 </div>
@@ -374,6 +443,8 @@ let provider = 'github', host = 'cloud';
 let jobId = null, since = 0, timer = null;
 let pickerMode = 'repos', pickerItems = [];
 let pickerSel = new Set(), pickerOpen = new Set();   // ticked repos / expanded owners
+let pickerPage = 0, pickerMore = false, pickerLoading = false, pickerGen = 0, pickerError = '';
+let pickerNotes = new Set();
 
 /* ── form wiring ─────────────────────────────────────────────────────── */
 function syncVisibility(){
@@ -419,6 +490,7 @@ function syncVisibility(){
   $('token-hint').innerHTML = env
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
     : `No ${provider} token found in <code>{{ env_file }}</code>; paste one above.`;
+  updateExtrasNote();
 }
 $('dc_action').onchange = syncVisibility;
 
@@ -439,7 +511,23 @@ document.querySelectorAll('[data-host]').forEach(b => b.onclick = () => {
 });
 
 /* ── log + results ───────────────────────────────────────────────────── */
-function setState(text, cls){ const el = $('state'); el.textContent = text; el.className = 'pill ' + (cls || ''); }
+function setState(text, cls, onClick){
+  const el = $('state');
+  el.textContent = text;
+  el.className = 'pill ' + (cls || '');
+  el.onclick = onClick || null;
+  if(onClick){ el.className = 'pill-btn'; el.setAttribute('role', 'button'); el.tabIndex = 0;
+    el.onkeydown = (e) => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); onClick(); } }; }
+  else { el.removeAttribute('role'); el.removeAttribute('tabindex'); el.onkeydown = null; }
+}
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+function stateFor(job){
+  const issues = (job.issues || []).length;
+  if(job.state !== 'running' && issues && (job.state === 'partial' || job.state === 'done'))
+    setState(plural(issues, 'issue'), 'warn', () => openIssues(job.id));
+  else if(job.state === 'partial') setState('issues', 'warn', () => openIssues(job.id));
+  else setState(job.state, STATE_CLS[job.state] || '');
+}
 const STATE_CLS = {running:'run', done:'ok', partial:'warn', error:'bad', cancelled:'warn', interrupted:'warn'};
 
 function append(lines){
@@ -465,6 +553,9 @@ function renderExtrasResults(manifest){
     <td>${e.error ? `<span class="pill bad">${esc(e.error.slice(0, 90))}</span>`
       : `<span class="pill ok">ok</span>`}</td></tr>`);
   $('extras-results').innerHTML = jobRows.concat(rows).join('');
+  const run = (manifest.output_dir || '').split('/').pop();
+  $('zip2').hidden = !rows.length && !(manifest.archives || []).some(a => a.ok);
+  $('zip2').href = `/api/archive-zip/${encodeURIComponent(run)}`;
   $('extras-where').textContent = (manifest.output_dir || '') + '/extras/';
 }
 function renderResults(manifest){
@@ -507,7 +598,7 @@ async function poll(){
   append(job.lines); since = job.total_lines;
   const running = job.state === 'running';
   $('log-title').textContent = `Run log · ${job.created_utc.replace('T',' ').slice(0,19)}Z`;
-  setState(job.state, STATE_CLS[job.state] || '');
+  stateFor(job);
   $('cancel').hidden = !running;
   $('dl-log').hidden = false;
   $('dl-log').href = `/api/jobs/${job.id}/log`;
@@ -524,7 +615,7 @@ function banner(job){
     $('banner').hidden = false;
     $('banner-text').textContent = job.state === 'interrupted'
       ? 'This run was cut off by a server restart — its archive is still building remotely.'
-      : `${job.state}: some targets did not finish.`;
+      : `${plural((job.issues || []).length || 1, 'issue')}: some targets did not finish.`;
     $('resume').dataset.job = job.id;
   } else $('banner').hidden = true;
 }
@@ -550,7 +641,7 @@ $('form').onsubmit = async (ev) => {
     dc_action: $('dc_action').value, dc_job_id: $('dc_job_id').value.trim(),
     api_version: $('api_version').value,
     run_name: $('run_name').value,
-    extras: 'everything',   // every collector for this provider, on every run
+    extras: selectedExtras(), max_items: maxItems,
     lock_repositories: $('lock_repositories').checked,
     single_archive: $('single_archive').checked,
     verify_checksum: $('verify_checksum').checked };
@@ -563,6 +654,102 @@ $('form').onsubmit = async (ev) => {
   if(!res.ok){ setState('error','bad'); append(['ERROR ' + data.error]); $('go').disabled = false; return; }
   attach(data.id);
 };
+
+/* ── download options: opened by the word "download" in the header ───── */
+let EXTRAS = {};
+const optSel = {};                  // provider -> Set of ticked extras (absent = everything)
+let maxItems = 200;
+const OPT_KEY = 'md.opts.v1';
+try {
+  const saved = JSON.parse(localStorage.getItem(OPT_KEY) || '{}');
+  if(Number.isInteger(saved.maxItems) && saved.maxItems >= 0) maxItems = saved.maxItems;
+  Object.entries(saved.sel || {}).forEach(([p, names]) => { optSel[p] = new Set(names); });
+} catch(e){ /* storage blocked or corrupt: fall back to the defaults */ }
+function saveOpts(){
+  try { localStorage.setItem(OPT_KEY, JSON.stringify({maxItems,
+    sel: Object.fromEntries(Object.entries(optSel).map(([p, set]) => [p, [...set]]))})); } catch(e){}
+}
+function optNames(){ return EXTRAS[provider] || []; }
+function selectedExtras(){
+  const names = optNames().map(e => e.name), set = optSel[provider];
+  if(!set) return 'everything';
+  const picked = names.filter(n => set.has(n));
+  return picked.length === names.length ? 'everything' : picked.join(',');
+}
+function updateExtrasNote(){
+  const names = optNames(), set = optSel[provider];
+  const n = set ? names.filter(e => set.has(e.name)).length : names.length;
+  $('extras-note').textContent = !names.length || n === names.length
+    ? 'Each run also collects everything the archive omits (wikis, CI history, hooks, alerts, packages and so on) under'
+    : `Each run also collects ${n} of ${names.length} extras (wikis, CI history, hooks, alerts and so on) under`;
+}
+function renderOpts(){
+  const names = optNames();
+  if(!optSel[provider]) optSel[provider] = new Set(names.map(e => e.name));
+  const set = optSel[provider];
+  const group = (title, items) => items.length ? `<h4>${title}</h4><div class="grid">${
+    items.map(e => `<label class="check"><input type="checkbox" value="${esc(e.name)}"${
+      set.has(e.name) ? ' checked' : ''}> ${esc(e.name)}</label>`).join('')}</div>` : '';
+  $('opts-list').innerHTML = names.length
+    ? group('Light', names.filter(e => !e.heavy)) + group('Heavy', names.filter(e => e.heavy))
+    : '<div class="note">Options are not available right now.</div>';
+  $('opts-list').querySelectorAll('input').forEach(cb => cb.onchange = () => {
+    cb.checked ? set.add(cb.value) : set.delete(cb.value); optCount(); });
+  $('opt-max').value = maxItems;
+  optCount();
+}
+function optCount(){
+  const names = optNames(), set = optSel[provider] || new Set();
+  $('opts-count').textContent = `${names.filter(e => set.has(e.name)).length} / ${names.length}`;
+  saveOpts(); updateExtrasNote();
+}
+function setOpts(pred){ optSel[provider] = new Set(optNames().filter(pred).map(e => e.name)); renderOpts(); }
+function openOpts(){ renderOpts(); $('opts-backdrop').hidden = false; }
+function closeOpts(){
+  const v = parseInt($('opt-max').value, 10);
+  maxItems = Number.isInteger(v) && v >= 0 ? v : 200;
+  saveOpts(); $('opts-backdrop').hidden = true;
+}
+$('opts-open').onclick = openOpts;
+$('opts-close').onclick = closeOpts;
+$('opts-backdrop').onclick = (e) => { if(e.target === $('opts-backdrop')) closeOpts(); };
+$('opts-all').onclick = () => setOpts(() => true);
+$('opts-light').onclick = () => setOpts(e => !e.heavy);
+$('opts-none').onclick = () => setOpts(() => false);
+fetch('/api/extras').then(r => r.json()).then(d => { EXTRAS = d.extras || {}; updateExtrasNote(); })
+  .catch(() => {});
+
+/* ── issues: what went wrong in a run ─────────────────────────────────── */
+const ISSUE_KIND = {archive: 'Export', extra: 'Extra', 'export-job': 'Export job', limit: 'Limit reached'};
+let issueText = '';
+async function openIssues(id){
+  $('issues-body').innerHTML = '<div class="note">loading…</div>';
+  $('issues-backdrop').hidden = false;
+  let job;
+  try { job = await (await fetch(`/api/jobs/${encodeURIComponent(id)}`)).json(); }
+  catch(e){ $('issues-body').innerHTML = `<div class="note">${esc(String(e))}</div>`; return; }
+  const list = job.issues || [];
+  $('issues-title').textContent = list.length ? plural(list.length, 'issue') : 'No issues';
+  const counts = {};
+  list.forEach(i => { counts[i.kind] = (counts[i.kind] || 0) + 1; });
+  $('issues-sub').textContent = Object.entries(counts)
+    .map(([k, n]) => `${n} ${(ISSUE_KIND[k] || k).toLowerCase()}`).join(' · ');
+  $('issues-body').innerHTML = list.length ? list.map(i => `<div class="issue ${esc(i.kind)}">
+      <div class="where">${esc(i.target || (ISSUE_KIND[i.kind] || i.kind))} · ${esc(i.step)}</div>
+      <div class="what">${esc(i.message)}</div>
+      ${i.hint ? `<div class="why">${esc(i.hint)}</div>` : ''}</div>`).join('')
+    : '<div class="note">Nothing went wrong in this run.</div>';
+  issueText = list.map(i => `- ${i.target || i.kind} · ${i.step}: ${i.message}${i.hint ? `\n    ${i.hint}` : ''}`).join('\n');
+}
+function closeIssues(){ $('issues-backdrop').hidden = true; }
+$('issues-close').onclick = closeIssues;
+$('issues-backdrop').onclick = (e) => { if(e.target === $('issues-backdrop')) closeIssues(); };
+$('issues-copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(issueText); $('issues-copy').textContent = 'Copied'; }
+  catch(e){ $('issues-copy').textContent = 'Copy failed'; }
+  setTimeout(() => { $('issues-copy').textContent = 'Copy summary'; }, 1500);
+};
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeIssues(); if(!$('opts-backdrop').hidden) closeOpts(); } });
 
 /* ── browse / select repos, orgs and groups ──────────────────────────── */
 function discoverBody(kind){
@@ -581,29 +768,69 @@ async function openPicker(mode){
   $('picker-add').hidden = isOwners;
   $('picker-all').hidden = isOwners;
   $('picker-none').hidden = isOwners;
+  $('picker-sso').hidden = provider !== 'github';
   $('picker-search').value = '';
   pickerSel = new Set(); pickerOpen = new Set();
+  pickerItems = []; pickerPage = 0; pickerMore = true; pickerLoading = false;
+  pickerNotes = new Set(); pickerError = '';
+  pickerGen += 1;
   $('picker-list').innerHTML = '<div class="note">loading…</div>';
   $('picker-note').textContent = '';
   $('backdrop').hidden = false;
-  const res = await fetch('/api/discover', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(discoverBody(mode))});
-  const data = await res.json();
-  if(!res.ok){
-    $('picker-list').innerHTML = `<div class="note">${esc(data.error)}</div>`;
-    return;
+  await loadPickerPage();
+}
+async function loadPickerPage(){
+  if(pickerLoading || !pickerMore) return;
+  pickerLoading = true;
+  const gen = pickerGen;
+  let data = null, failed = '';
+  try {
+    const res = await fetch('/api/discover', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({...discoverBody(pickerMode), page: pickerPage + 1})});
+    data = await res.json();
+    if(!res.ok) failed = data.error || 'request failed';
+  } catch(e){ failed = String(e); }
+  if(gen !== pickerGen) return;                 // closed or reopened while waiting
+  pickerLoading = false;
+  if(failed){
+    pickerMore = false; pickerError = failed;
+    if(!pickerItems.length){ $('picker-list').innerHTML = `<div class="note">${esc(failed)}</div>`; return; }
+  } else {
+    pickerPage += 1;
+    pickerMore = !!data.has_more;
+    pickerItems.push(...data.items);
+    (data.notes || []).forEach(n => pickerNotes.add(n));
+    if(!pickerItems.length){ $('picker-list').innerHTML = '<div class="note">nothing visible to this token</div>'; pickerNote(); return; }
   }
-  pickerItems = data.items;
-  if(!pickerItems.length){
-    $('picker-list').innerHTML = '<div class="note">nothing visible to this token</div>';
-    return;
-  }
-  $('picker-note').textContent = provider === 'gitlab' && !isOwners
-    ? `${pickerItems.length} project(s) at Maintainer level or above`
-    : `${pickerItems.length} found`;
   renderPicker();
+  maybeLoadMore();
+}
+/* load more when the list is scrolled near its end, when it does not fill the box yet,
+   or while a filter is active (so a match on a later page is not hidden) */
+function maybeLoadMore(){
+  if(!pickerMore || pickerLoading || $('backdrop').hidden) return;
+  const list = $('picker-list');
+  const filtering = $('picker-search').value.trim() !== '';
+  if(filtering || list.scrollHeight - list.scrollTop - list.clientHeight < 240 || list.scrollHeight <= list.clientHeight)
+    loadPickerPage();
+}
+function pickerNote(){
+  const parts = [`${pickerItems.length} loaded`, pickerMore ? 'scroll for more' : 'all loaded'];
+  if(pickerError) parts.push(pickerError);
+  $('picker-note').textContent = parts.join(' · ');
+  const warn = [...pickerNotes];
+  if(warn.length){ $('picker-sso').hidden = false; $('picker-sso').textContent = warn.join(' '); }
 }
 function renderPicker(){
+  const keep = $('picker-list').scrollTop;
+  renderPickerRows();
+  $('picker-list').scrollTop = keep;            // new pages arrive without jumping to the top
+  if(pickerMore || pickerLoading)
+    $('picker-list').insertAdjacentHTML('beforeend', '<div class="more">loading more…</div>');
+  pickerNote();
+}
+function renderPickerRows(){
   const q = $('picker-search').value.trim().toLowerCase();
   const isOwners = pickerMode === 'owners';
   const shown = pickerItems.filter(i =>
@@ -648,7 +875,7 @@ function renderPicker(){
         <input type="checkbox" class="grp-cb" aria-label="select all of ${esc(owner)}">
         <button type="button" class="tog" aria-expanded="${open}" aria-label="show repos of ${esc(owner)}">▸</button>
         <span class="name">${esc(owner)}</span>
-        <span class="meta">${items.length} repo${items.length === 1 ? '' : 's'}</span></label>
+        <span class="meta">${items.length}${pickerMore ? '+' : ''} repo${items.length === 1 && !pickerMore ? '' : 's'}</span></label>
       <div class="grp-body"${open ? '' : ' hidden'}>${items.map(repoRow).join('')}</div></div>`;
   }).join('');
   $('picker-list').querySelectorAll('.grp').forEach(grp => {
@@ -684,11 +911,12 @@ function updateCount(){
   $('picker-count').textContent = pickerMode === 'owners' ? '' : `${pickerSel.size} selected`;
 }
 function shownRepoBoxes(){ return [...$('picker-list').querySelectorAll('.repo-cb')]; }
-function closePicker(){ $('backdrop').hidden = true; }
+function closePicker(){ $('backdrop').hidden = true; pickerGen += 1; pickerLoading = false; }
 $('picker-close').onclick = closePicker;
 $('backdrop').onclick = (e) => { if(e.target === $('backdrop')) closePicker(); };
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closePicker(); });
-$('picker-search').oninput = renderPicker;
+$('picker-search').oninput = () => { renderPicker(); maybeLoadMore(); };
+$('picker-list').addEventListener('scroll', maybeLoadMore);
 $('picker-all').onclick = () => {
   shownRepoBoxes().forEach(cb => pickerSel.add(cb.value)); renderPicker(); };
 $('picker-none').onclick = () => {
@@ -710,13 +938,17 @@ async function loadJobs(){
       <td class="mono">${esc(j.created_utc.replace('T',' ').slice(0,19))}</td>
       <td>${esc(j.provider)}</td>
       <td class="mono">${esc(j.targets.slice(0,2).join(', '))}${j.targets.length>2 ? ` +${j.targets.length-2}` : ''}</td>
-      <td><span class="pill ${STATE_CLS[j.state]||''}">${esc(j.state)}</span></td>
+      <td>${(j.state === 'partial' || (j.state === 'done' && j.issues))
+        ? `<button type="button" class="pill-btn" data-issues="${esc(j.id)}">${esc(plural(j.issues || 1, 'issue'))}</button>`
+        : `<span class="pill ${STATE_CLS[j.state]||''}">${esc(j.state)}</span>`}</td>
       <td style="text-align:right;white-space:nowrap">
         <button class="ghost" data-view="${esc(j.id)}">View</button>
         <a class="ghost" href="/api/jobs/${encodeURIComponent(j.id)}/log" title="secrets redacted">⬇ log</a></td>
     </tr>`).join('') : '<tr><td colspan="5" style="color:var(--muted)">no runs yet</td></tr>';
   $('jobs').querySelectorAll('[data-view]').forEach(b =>
     b.onclick = () => attach(b.dataset.view));
+  $('jobs').querySelectorAll('[data-issues]').forEach(b =>
+    b.onclick = () => openIssues(b.dataset.issues));
 }
 async function loadRuns(){
   const {runs} = await (await fetch('/api/runs')).json();

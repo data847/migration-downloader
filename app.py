@@ -14,21 +14,21 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import io
 import os
 import sys
 import threading
 import traceback
-import zipfile
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 
 import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # noqa: E402
-from migration_api import GitHubMigration, GitLabExport, MigrationError, mask  # noqa: E402
-from runner import COMPONENT, JobSpec, list_runs, run_job  # noqa: E402
+from migration_api import GitHubMigration, GitLabExport, MigrationError, brief_error, mask  # noqa: E402
+from runner import COMPONENT, JobSpec, issues_from_manifest, list_runs, run_job  # noqa: E402
+from supplementary import HEAVY, REGISTRY  # noqa: E402
+import bundle  # noqa: E402
 import jobstore  # noqa: E402
 import redact  # noqa: E402
 
@@ -111,11 +111,18 @@ def job_status(job_id: str):
     job = jobstore.get(job_id)
     if job is None:
         abort(404)
+    manifest = job["manifest"]
+    issues = []
+    if manifest:
+        issues = manifest.get("issues")
+        if issues is None:
+            issues = issues_from_manifest(manifest)
     return jsonify(
         id=job["id"],
         state=job["state"],
         error=job["error"],
-        manifest=job["manifest"],
+        issues=issues,
+        manifest=manifest,
         spec=job["spec"],
         created_utc=job["created_utc"],
         lines=job["log"][since:],
@@ -204,7 +211,11 @@ def resume_job(job_id: str):
 
 @app.post("/api/discover")
 def discover():
-    """List what the token can see: orgs/groups, or repos/projects.
+    """One page of what the token can see: orgs/groups, or repos/projects.
+
+    The picker asks for page 1, 2, 3... as the user scrolls, so there is no
+    ceiling on how many repos can be listed. The page number is an integer the
+    server turns into a URL itself; the browser never supplies one.
 
     POST, not GET, so the PAT never travels in a URL or a server access log.
     `api_base` is honoured throughout, so this works against GitHub Enterprise
@@ -216,6 +227,10 @@ def discover():
     scope = (data.get("scope") or "auto").strip().lower()
     owner = (data.get("owner") or "").strip()                  # org / group
     api_base = (data.get("api_base") or "").strip()
+    try:
+        page = max(1, int(data.get("page") or 1))
+    except (TypeError, ValueError):
+        return jsonify(error="page must be a number"), 400
     token = (data.get("token") or "").strip() or (
         github_token() if provider == "github" else gitlab_token())
     if not token:
@@ -226,17 +241,27 @@ def discover():
                                      org=owner or "x",
                                      api_base=api_base or "https://api.github.com")
             if kind == "owners":
-                items = client.list_orgs()
-            elif scope == "auto":
-                items = client.list_all_repos()
+                result = client.orgs_page(page)
             else:
-                items = client.list_repos(org=owner if scope == "org" else "")
+                result = client.repos_page(page, org=owner if scope == "org" else "",
+                                           everything=scope == "auto")
         else:
             client = GitLabExport(token, api_base=api_base or "https://gitlab.com")
-            items = client.list_groups() if kind == "owners" else client.list_projects(group=owner)
+            result = (client.groups_page(page) if kind == "owners"
+                      else client.projects_page(page, group=owner))
     except MigrationError as exc:
-        return jsonify(error=str(exc).splitlines()[0]), 400
-    return jsonify(items=items, count=len(items))
+        return jsonify(error=brief_error(exc).splitlines()[0]), 400
+    return jsonify(items=result["items"], count=len(result["items"]), page=page,
+                   has_more=result["has_more"], notes=result["notes"])
+
+
+@app.get("/api/extras")
+def extras():
+    """Collector names per provider (light first), for the Download options dialog."""
+    return jsonify(extras={
+        provider: [{"name": name, "heavy": name in HEAVY.get(provider, set())}
+                   for name in sorted(names, key=lambda n: (n in HEAVY.get(provider, set()), n))]
+        for provider, names in REGISTRY.items()})
 
 
 @app.get("/api/runs")
@@ -254,18 +279,31 @@ def archive(run: str, name: str):
 
 @app.get("/api/archive-zip/<run>")
 def archive_zip(run: str):
-    """Every archive in a run as one .zip (stored, not re-compressed)."""
+    """The whole run as a zip of zips: one zip per target (archive, for-check CSV
+    and extras) plus run-files.zip. Built in a temp file, removed once sent."""
     path = _run_root(run)
-    members = sorted(p for p in path.iterdir() if p.is_file() and not p.name.endswith(".part"))
-    if not members:
-        abort(404)
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as zf:
-        for member in members:
-            zf.write(member, arcname=member.name)
-    buffer.seek(0)
-    return send_file(buffer, mimetype="application/zip", as_attachment=True,
-                     download_name=f"{run}.zip")
+    try:
+        built = bundle.build(path)
+    except MigrationError as exc:
+        status = 404 if "nothing to download" in str(exc) else 507
+        return jsonify(error=brief_error(exc)), status
+    size = built.stat().st_size
+
+    def stream():
+        # a generator's `finally` runs when it is exhausted *and* when the client
+        # disconnects (the server closes it); `send_file`'s close hook does not
+        # fire for direct-passthrough responses, which would leak the temp file
+        try:
+            with built.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    yield chunk
+        finally:
+            built.unlink(missing_ok=True)
+
+    response = Response(stream(), mimetype="application/zip")
+    response.headers.set("Content-Disposition", "attachment", filename=f"{run}.zip")
+    response.headers["Content-Length"] = str(size)
+    return response
 
 
 def main() -> int:

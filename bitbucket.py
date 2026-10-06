@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List
 
 from migration_api import MigrationError, _download, _json_request, brief_error, safe_name
+from safety import require_same_origin
 from supplementary import (
     Ctx,
     collector,
@@ -28,6 +29,7 @@ from supplementary import (
     get_json,
     try_json,
 )
+import supplementary
 
 BITBUCKET_CLOUD_BASE = "https://api.bitbucket.org/2.0"
 PR_STATES = ("OPEN", "MERGED", "DECLINED", "SUPERSEDED")
@@ -44,16 +46,27 @@ def cloud_headers(token: str) -> dict:
             "User-Agent": "DataLabs-migration-downloader"}
 
 
-def cloud_paged(url: str, headers: dict, *, cap: int = 200, pagelen: int = 100) -> list:
-    """Bitbucket pages with `next` links in the body, not page numbers."""
+def cloud_paged(ctx, url: str, *, pagelen: int = 100) -> list:
+    """Bitbucket pages with `next` links in the body, not page numbers.
+
+    The link comes from the response, so it is only followed on the origin the
+    listing started from; otherwise the token would go wherever it pointed.
+    """
     items: list = []
     sep = "&" if "?" in url else "?"
     nxt = f"{url}{sep}pagelen={pagelen}"
-    while nxt and len(items) < cap:
-        data = get_json(nxt, headers)
-        items.extend(data.get("values", []) if isinstance(data, dict) else [])
-        nxt = data.get("next") if isinstance(data, dict) else None
-    return items[:cap]
+    while nxt:
+        ctx.check_cancelled()
+        data, _link, _hdrs = supplementary._json_page(nxt, headers=ctx.headers)
+        values = data.get("values", []) if isinstance(data, dict) else []
+        items.extend(values)
+        follow = data.get("next") if isinstance(data, dict) else None
+        if ctx.max_items and len(items) >= ctx.max_items:
+            if follow or len(items) > ctx.max_items:
+                ctx.truncate(url)
+            return items[:ctx.max_items]
+        nxt = require_same_origin(url, follow) if follow else None
+    return items
 
 
 def bb_url(ctx: Ctx, suffix: str = "") -> str:
@@ -72,12 +85,12 @@ def bb_repo_metadata(ctx):
 
 @collector("bitbucket", "refs")
 def bb_refs(ctx):
-    return [ctx.save_json("refs", cloud_paged(bb_url(ctx, "/refs"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("refs", cloud_paged(ctx, bb_url(ctx, "/refs")))]
 
 
 @collector("bitbucket", "commits")
 def bb_commits(ctx):
-    commits = cloud_paged(bb_url(ctx, "/commits"), ctx.headers, cap=ctx.max_items)
+    commits = cloud_paged(ctx, bb_url(ctx, "/commits"))
     ctx.shared.setdefault("bb_commits", {})[ctx.target] = [c["hash"] for c in commits]
     return [ctx.save_json("commits", commits)]
 
@@ -86,7 +99,7 @@ def _commit_hashes(ctx: Ctx) -> list:
     known = ctx.shared.get("bb_commits", {}).get(ctx.target)
     if known is not None:
         return known
-    return [c["hash"] for c in cloud_paged(bb_url(ctx, "/commits"), ctx.headers, cap=ctx.max_items)]
+    return [c["hash"] for c in cloud_paged(ctx, bb_url(ctx, "/commits"))]
 
 
 @collector("bitbucket", "commit-statuses")
@@ -123,8 +136,7 @@ def _prs(ctx: Ctx) -> list:
     cached = ctx.shared.setdefault("bb_prs", {})
     if ctx.target not in cached:
         states = "&".join(f"state={s}" for s in PR_STATES)
-        cached[ctx.target] = cloud_paged(bb_url(ctx, f"/pullrequests?{states}"), ctx.headers,
-                                         cap=ctx.max_items)
+        cached[ctx.target] = cloud_paged(ctx, bb_url(ctx, f"/pullrequests?{states}"))
     return cached[ctx.target]
 
 
@@ -163,8 +175,8 @@ def bb_pr_diffs(ctx):
 
 @collector("bitbucket", "branch-restrictions")
 def bb_branch_restrictions(ctx):
-    return [ctx.save_json("branch-restrictions", cloud_paged(
-        bb_url(ctx, "/branch-restrictions"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("branch-restrictions", cloud_paged(ctx, 
+        bb_url(ctx, "/branch-restrictions")))]
 
 
 @collector("bitbucket", "branching-model")
@@ -174,7 +186,7 @@ def bb_branching_model(ctx):
 
 @collector("bitbucket", "downloads")
 def bb_downloads(ctx):
-    return [ctx.save_json("downloads", cloud_paged(bb_url(ctx, "/downloads"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("downloads", cloud_paged(ctx, bb_url(ctx, "/downloads")))]
 
 
 @collector("bitbucket", "snippets")
@@ -185,7 +197,7 @@ def bb_snippets(ctx):
     if ws in done:
         return []
     base = f"{ctx.api_base}/snippets/{ws}"
-    snippets = cloud_paged(base, ctx.headers, cap=ctx.max_items)
+    snippets = cloud_paged(ctx, base)
     detail = {}
     for snip in snippets:
         sid = snip["id"]
@@ -205,19 +217,19 @@ def bb_snippets(ctx):
 
 @collector("bitbucket", "hooks")
 def bb_hooks(ctx):
-    written = [ctx.save_json("hooks", cloud_paged(bb_url(ctx, "/hooks"), ctx.headers, cap=ctx.max_items))]
+    written = [ctx.save_json("hooks", cloud_paged(ctx, bb_url(ctx, "/hooks")))]
     ws = bb_workspace(ctx)
     done = ctx.shared.setdefault("bb_ws_hooks", set())
     if ws not in done:
-        written.append(ctx.save_json(f"workspace-hooks-{safe_name(ws)}", cloud_paged(
-            f"{ctx.api_base}/workspaces/{ws}/hooks", ctx.headers, cap=ctx.max_items)))
+        written.append(ctx.save_json(f"workspace-hooks-{safe_name(ws)}", cloud_paged(ctx, 
+            f"{ctx.api_base}/workspaces/{ws}/hooks")))
         done.add(ws)
     return written
 
 
 @collector("bitbucket", "pipelines")
 def bb_pipelines(ctx):
-    pipelines = cloud_paged(bb_url(ctx, "/pipelines/?sort=-created_on"), ctx.headers, cap=ctx.max_items)
+    pipelines = cloud_paged(ctx, bb_url(ctx, "/pipelines/?sort=-created_on"))
     steps = {}
     for pipe in pipelines:
         ctx.check_cancelled()
@@ -242,7 +254,8 @@ def bb_pipeline_logs(ctx):
             try:
                 written.append(fetch_file(
                     ctx, bb_url(ctx, f"/pipelines/{pipe_uuid}/steps/{step['uuid']}/log"),
-                    f"pipeline-logs/{safe_name(pipe_uuid)}-{safe_name(step['uuid'])}.log"))
+                    f"pipeline-logs/{safe_name(pipe_uuid)}-{safe_name(step['uuid'])}.log",
+                    scrub="text"))
             except MigrationError as exc:
                 ctx.log(f"    step {step['uuid']}: {brief_error(exc)}")
     return written
@@ -250,7 +263,7 @@ def bb_pipeline_logs(ctx):
 
 @collector("bitbucket", "forks")
 def bb_forks(ctx):
-    return [ctx.save_json("forks", cloud_paged(bb_url(ctx, "/forks"), ctx.headers, cap=ctx.max_items))]
+    return [ctx.save_json("forks", cloud_paged(ctx, bb_url(ctx, "/forks")))]
 
 
 # ── Bitbucket Data Center ────────────────────────────────────────────────────

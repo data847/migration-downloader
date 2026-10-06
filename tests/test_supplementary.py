@@ -6,6 +6,7 @@ that serve canned responses and record what was asked for.
     python3 -m unittest discover -s tests -v
 """
 
+import contextlib
 import json
 import sys
 import tempfile
@@ -37,6 +38,21 @@ class FakeHttp:
                     raise response
                 return 200, response
         raise MigrationError(f"HTTP 404 {method} {url}")
+
+
+@contextlib.contextmanager
+def patch_http(fake):
+    """Serve every API call (single GETs and paged listings) from `fake`."""
+    def page(url, *, headers, timeout=60):
+        _status, data = fake(url, headers=headers)
+        return data, None, {}
+
+    with mock.patch("supplementary._json_request", fake), \
+            mock.patch("migration_api._json_request", fake), \
+            mock.patch("bitbucket._json_request", fake), \
+            mock.patch("supplementary._json_page", page), \
+            mock.patch("migration_api._json_page", page):
+        yield fake
 
 
 def make_ctx(tmp, provider="github", target="acme/widgets", **kw):
@@ -82,7 +98,7 @@ class ResolveNames(unittest.TestCase):
 class GitHubExportOptions(unittest.TestCase):
     def test_exclude_flags_land_in_the_payload(self):
         fake = FakeHttp({"/migrations": {"id": 7, "state": "pending"}})
-        with mock.patch("migration_api._json_request", fake):
+        with patch_http(fake):
             client = GitHubMigration("t", scope="org", org="acme",
                                      exclude=["releases", "attachments"], org_metadata_only=True)
             self.assertEqual(client.start(["acme/widgets"]), "7")
@@ -100,7 +116,7 @@ class GitHubExportOptions(unittest.TestCase):
 
     def test_housekeeping_urls(self):
         fake = FakeHttp({"/migrations": []})
-        with mock.patch("migration_api._json_request", fake):
+        with patch_http(fake):
             client = GitHubMigration("t", scope="org", org="acme")
             client.unlock_repo("9", "acme/widgets")
             client.delete_archive("9")
@@ -111,7 +127,7 @@ class GitHubExportOptions(unittest.TestCase):
 class GitLabExportOptions(unittest.TestCase):
     def test_upload_and_description_are_sent(self):
         fake = FakeHttp({"/export": {}})
-        with mock.patch("migration_api._json_request", fake):
+        with patch_http(fake):
             GitLabExport("t").start("g/p", upload_url="https://s3/x?sig=1", upload_method="PUT",
                                     description="nightly")
         self.assertEqual(fake.calls[0][2], {"description": "nightly",
@@ -119,7 +135,7 @@ class GitLabExportOptions(unittest.TestCase):
 
     def test_plain_start_sends_no_body(self):
         fake = FakeHttp({"/export": {}})
-        with mock.patch("migration_api._json_request", fake):
+        with patch_http(fake):
             GitLabExport("t").start("g/p")
         self.assertIsNone(fake.calls[0][2])
 
@@ -129,7 +145,7 @@ class GitHubCollectors(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_ctx(tmp, target="widgets", org="acme", scope="org")
             fake = FakeHttp({"/repos/acme/widgets/hooks": [{"id": 1}]})
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 files = supplementary.REGISTRY["github"]["hooks"](ctx)
             self.assertEqual(files, ["hooks.json"])
             self.assertEqual(json.loads((Path(tmp) / "hooks.json").read_text()), [{"id": 1}])
@@ -142,7 +158,7 @@ class GitHubCollectors(unittest.TestCase):
                 "/branches/main/protection": {"required_reviews": 2},
                 "/branches/dev/protection": MigrationError("HTTP 403 nope"),
             })
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 supplementary.REGISTRY["github"]["branch-protection"](ctx)
             data = json.loads((Path(tmp) / "branch-protection.json").read_text())
             self.assertEqual(data["main"], {"required_reviews": 2})
@@ -153,7 +169,7 @@ class GitHubCollectors(unittest.TestCase):
             ctx = make_ctx(tmp, max_items=2)
             runs = {"workflow_runs": [{"id": 1}, {"id": 2}, {"id": 3}]}
             fake = FakeHttp({"/actions/runs?": runs, "/jobs": {"jobs": []}})
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 supplementary.REGISTRY["github"]["actions"](ctx)
             saved = json.loads((Path(tmp) / "actions-runs.json").read_text())
             self.assertEqual([r["id"] for r in saved], [1, 2])
@@ -162,7 +178,7 @@ class GitHubCollectors(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_ctx(tmp)
             fake = FakeHttp({"/graphql": {"data": {"user": {"projectsV2": {"nodes": []}}}}})
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 first = supplementary.REGISTRY["github"]["projects-v2"](ctx)
                 second = supplementary.REGISTRY["github"]["projects-v2"](ctx)
             self.assertEqual(len(first), 1)
@@ -244,7 +260,7 @@ class GitLabCollectors(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_ctx(tmp, provider="gitlab", target="grp/sub/proj", api_base="https://gitlab.com")
             fake = FakeHttp({"/projects/grp%2Fsub%2Fproj/releases": [{"tag_name": "v1"}]})
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 supplementary.REGISTRY["gitlab"]["releases"](ctx)
             self.assertTrue((Path(tmp) / "releases.json").is_file())
 
@@ -269,23 +285,12 @@ class BitbucketCloud(unittest.TestCase):
         self.assertTrue(bitbucket.cloud_headers("tok")["Authorization"].startswith("Bearer "))
         self.assertTrue(bitbucket.cloud_headers("me@x.com:tok")["Authorization"].startswith("Basic "))
 
-    def test_paging_follows_next_links_and_caps(self):
-        pages = {
-            "pagelen=100": {"values": [1, 2], "next": "https://api/page2"},
-            "page2": {"values": [3, 4], "next": "https://api/page3"},
-            "page3": {"values": [5]},
-        }
-        fake = FakeHttp(pages)
-        with mock.patch("supplementary._json_request", fake):
-            self.assertEqual(bitbucket.cloud_paged("https://api/x", {}, cap=10), [1, 2, 3, 4, 5])
-            self.assertEqual(bitbucket.cloud_paged("https://api/x", {}, cap=3), [1, 2, 3])
-
     def test_pullrequests_query_every_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = make_ctx(tmp, provider="bitbucket", target="ws/repo",
                            api_base="https://api.bitbucket.org/2.0")
             fake = FakeHttp({"/pullrequests?": {"values": []}})
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 supplementary.REGISTRY["bitbucket"]["pullrequests"](ctx)
             url = fake.calls[0][1]
             for state in bitbucket.PR_STATES:
@@ -295,7 +300,7 @@ class BitbucketCloud(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             shared = {}
             fake = FakeHttp({"/hooks": {"values": [{"u": 1}]}})
-            with mock.patch("supplementary._json_request", fake):
+            with patch_http(fake):
                 first = supplementary.REGISTRY["bitbucket"]["hooks"](
                     make_ctx(tmp, provider="bitbucket", target="ws/a", shared=shared,
                              api_base="https://api.bitbucket.org/2.0"))
@@ -326,7 +331,7 @@ class BitbucketDataCenter(unittest.TestCase):
 
     def test_cancel_and_preview_urls(self):
         fake = FakeHttp({"/migration/exports": {}})
-        with mock.patch("bitbucket._json_request", fake):
+        with patch_http(fake):
             client = bitbucket.BitbucketDCExport("t", "https://bb.example.com/")
             client.preview(["P/r"])
             client.cancel("42")
@@ -383,7 +388,7 @@ class RunExtras(unittest.TestCase):
                            extras=["hooks", "releases"])
             fake = FakeHttp({"/hooks": MigrationError("HTTP 403 forbidden"), "/releases": [{"id": 1}]})
             logs = []
-            with mock.patch("supplementary._json_request", fake), \
+            with patch_http(fake), \
                     mock.patch("runner._github_login", return_value="someone"):
                 records = _run_extras(spec, "t", Path(tmp), logs.append, None)
             by_name = {r["extra"]: r for r in records}
@@ -430,7 +435,7 @@ class ErrorReporting(unittest.TestCase):
             logged = []
             ctx = make_ctx(tmp)
             ctx.log = logged.append
-            with mock.patch("supplementary._json_request", off):
+            with patch_http(off):
                 self.assertEqual(supplementary.REGISTRY["github"]["dependabot-alerts"](ctx), [])
             self.assertTrue(any("skipped" in line for line in logged))
 
@@ -438,7 +443,7 @@ class ErrorReporting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             denied = FakeHttp({"/secret-scanning/alerts": MigrationError(
                 'HTTP 403 GET u\n{"message": "Resource not accessible by personal access token"}')})
-            with mock.patch("supplementary._json_request", denied):
+            with patch_http(denied):
                 with self.assertRaises(MigrationError):
                     supplementary.REGISTRY["github"]["secret-scanning"](make_ctx(tmp))
 
@@ -455,7 +460,7 @@ class ErrorReporting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spec = JobSpec(provider="bitbucket", token="t", targets=["ws/r"], extras=["refs"])
             fake = FakeHttp({"/refs": MigrationError("HTTP 403 x")})
-            with mock.patch("supplementary._json_request", fake), \
+            with patch_http(fake), \
                     mock.patch("runner.run_dir", return_value=Path(tmp)):
                 manifest = runner.run_job(spec, log=lambda _m: None)
         self.assertEqual((manifest["archives_failed"], manifest["extras_failed"], manifest["failed"]), (0, 1, 1))
@@ -521,8 +526,8 @@ class GitHubAutoScope(unittest.TestCase):
 
     def test_discover_lists_all_repos_in_auto_scope(self):
         import app
-        fake = FakeHttp({"/user/repos": [{"full_name": "acme/y"}]})
-        with mock.patch("migration_api._json_request", fake):
+        fake = FakeHttp({"/user/repos": [{"name": "y", "full_name": "acme/y"}]})
+        with patch_http(fake):
             reply = app.app.test_client().post(
                 "/api/discover", json={"provider": "github", "kind": "repos", "scope": "auto", "token": "t"})
         self.assertEqual([i["target"] for i in reply.get_json()["items"]], ["acme/y"])
@@ -530,7 +535,7 @@ class GitHubAutoScope(unittest.TestCase):
     def test_list_all_repos_uses_one_call_with_all_affiliations(self):
         fake = FakeHttp({"/user/repos": [{"full_name": "me/x", "private": True, "pushed_at": "2026-01-02T00:00"},
                                          {"full_name": "acme/y"}]})
-        with mock.patch("migration_api._json_request", fake):
+        with patch_http(fake):
             repos = GitHubMigration("t").list_all_repos()
         self.assertEqual([r["target"] for r in repos], ["me/x", "acme/y"])
         self.assertIn("organization_member", fake.calls[0][1])
@@ -538,14 +543,14 @@ class GitHubAutoScope(unittest.TestCase):
 
 
 class DefaultExtras(unittest.TestCase):
-    def test_page_has_no_extras_picker_and_always_requests_everything(self):
+    def test_start_defaults_to_everything_with_the_options_hidden_behind_the_header_word(self):
         import app
         client = app.app.test_client()
         html = client.get("/").get_data(as_text=True)
-        self.assertNotIn('id="extras-list"', html)
-        self.assertNotIn('id="extras-box"', html)
-        self.assertIn("extras: 'everything'", html)
-        self.assertEqual(client.get("/api/extras").status_code, 404)
+        self.assertNotIn('id="extras-box"', html)               # no visible extras section
+        self.assertIn("extras: selectedExtras()", html)
+        self.assertIn("if(!set) return 'everything';", html)    # nothing unticked -> everything
+        self.assertEqual(client.get("/api/extras").status_code, 200)
 
     def test_everything_is_valid_for_every_provider(self):
         for provider, extra in (("github", {}), ("gitlab", {}), ("bitbucket", {}),

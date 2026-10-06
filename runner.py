@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tarfile
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -41,12 +42,22 @@ from migration_api import (  # noqa: E402
 )
 
 import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
+import ratelimit  # noqa: E402
+from safety import MIN_FREE_MB, check_disk, require_valid_target  # noqa: E402
 from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
 from supplementary import REGISTRY, Ctx, resolve_names  # noqa: E402
 
 COMPONENT = "migration-downloader"
 PROVIDERS = {"github", "gitlab", "bitbucket", "bitbucket-dc"}
 load_env()
+
+
+def _strip_url(target: str) -> str:
+    """The repo path from a clone/web URL, else the target as typed."""
+    target = target.strip()
+    path = urlparse(target).path if target.startswith(("http://", "https://")) else target
+    path = path.strip("/")
+    return path[:-4] if path.endswith(".git") else path
 
 
 def _parse_owner_repo(target: str) -> str:
@@ -58,6 +69,13 @@ def _parse_owner_repo(target: str) -> str:
         raise MigrationError(
             f"'{target}' should be owner/repo (the owner tells personal repos from an org's)")
     return path
+
+
+def _max_items(raw) -> int:
+    """Blank -> the default 200; 0 -> no limit; anything else is the cap."""
+    if raw in (None, ""):
+        return 200
+    return max(0, int(raw))
 
 
 def _split(raw) -> List[str]:
@@ -122,7 +140,7 @@ class JobSpec:
             run_name=(data.get("run_name") or "").strip(),
             for_check=str(data.get("for_check", "1")).lower() not in {"0", "false", "off", "no"},
             extras=_split(data.get("extras", "")),
-            max_items=max(1, int(data.get("max_items") or 200)),
+            max_items=_max_items(data.get("max_items")),
             exclude=_split(data.get("exclude", "")),
             org_metadata_only=flag("org_metadata_only"),
             unlock_repos=flag("unlock_repos"),
@@ -166,6 +184,8 @@ class JobSpec:
             if self.scope == "auto":
                 for target in self.targets:
                     _parse_owner_repo(target)     # every target must say who owns it
+        for target in self.targets:
+            require_valid_target(_strip_url(target))
         if self.provider == "bitbucket" and not self.extras:
             raise MigrationError("Bitbucket Cloud has no export archive; pass extras (e.g. all, pullrequests)")
         if self.provider == "bitbucket-dc":
@@ -213,6 +233,8 @@ def run_job(
     spec.validate()
     token = spec.resolved_token()
     dest_dir = run_dir(spec)
+    check_disk(dest_dir, MIN_FREE_MB, what="this run")
+    ratelimit.bind(cancelled, log)      # waits for rate limits show up in the run log
     started = time.time()
 
     log(f"provider   : {spec.provider}")
@@ -264,6 +286,7 @@ def run_job(
         "jobs_failed": sum(1 for j in export_jobs if j.get("error")),
     }
     manifest["failed"] = manifest["archives_failed"] + manifest["extras_failed"] + manifest["jobs_failed"]
+    manifest["issues"] = issues_from_manifest(manifest)
     (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     log("")
@@ -281,8 +304,77 @@ def run_job(
         for e in extras:
             if e["error"]:
                 log(f"  ✗ {e['target']} · {e['extra']}: {e['error']}")
+    if manifest["issues"]:
+        log(f"issues: {len(manifest['issues'])}")
+        for item in manifest["issues"]:
+            log(f"  ! {item['target'] or item['kind']} · {item['step']}: {item['message']}")
     log(f"manifest: {dest_dir / 'manifest.json'}")
     return manifest
+
+
+# ── issues: what went wrong, in plain terms ──────────────────────────────────
+
+_HINTS = [
+    # (all of these must appear in the lower-cased message, hint)
+    (("http 401",), "The host rejected the token. Check it is pasted in full, has not expired or been revoked, "
+                    "and belongs to this host."),
+    (("http 422", "/user/migrations"), "/user/migrations cannot export an org's repos. Use scope auto (the "
+                                       "default) so org repos go through the org's own migration endpoint."),
+    (("http 403", "/orgs/", "/migrations"), "Org exports need an org Owner (or Migrator) and the admin:org scope. "
+                                            "If the org enforces SAML SSO, authorize the token for it first."),
+    (("http 403", "/migrations"), "The token lacks the repo scope, or the account cannot export these repositories."),
+    (("http 404", "/migrations"), "The repository was not found: check the spelling and that the token can see it."),
+    (("dependabot",), "Needs the security_events scope and Dependabot alerts enabled on the repo."),
+    (("code-scanning",), "Needs security_events, and code scanning set up (private repos need GitHub Advanced Security)."),
+    (("secret-scanning",), "Needs security_events/repo scope, and secret scanning enabled (private repos need "
+                           "GitHub Advanced Security)."),
+    (("/hooks",), "Listing webhooks needs admin access to the repository."),
+    (("protection",), "Reading branch protection needs admin access to the repository."),
+    (("http 403", "projectsv2"), "Projects (v2) need the read:project scope."),
+    (("http 403", "packages"), "Packages need the read:packages scope."),
+    (("http 404",), "Not found, or the token's user has no access: often a missing permission or a feature that "
+                    "is switched off for this repository."),
+    (("http 403",), "Forbidden: the token is missing a scope, or the account lacks the role this call needs."),
+    (("rate limit", "429"), "The host throttled the token. The run waits and retries by itself; run again later "
+                            "if this persists."),
+    (("limited to",), "A listing was cut off at the item limit. Raise Max items (0 = no limit) under Download options."),
+    (("timed out",), "The export took longer than the timeout. Raise the timeout; large repos can take over an hour."),
+    (("network error",), "Could not reach the host. Check connectivity and the host / API base URL."),
+    (("only", "mb free"), "Not enough free disk space for this run."),
+    (("cancelled",), "You cancelled the run."),
+    (("not installed",), "A required program is missing on this machine."),
+]
+
+
+def explain(message: str) -> str:
+    lowered = message.lower()
+    for needles, hint in _HINTS:
+        if all(n in lowered for n in needles):
+            return hint
+    return ""
+
+
+def issues_from_manifest(manifest: dict) -> List[dict]:
+    """Everything that went wrong in a run as a flat list. Also works on manifests
+    written before `issues` existed, so old runs get the same summary."""
+    out: List[dict] = []
+
+    def add(kind: str, target: str, step: str, message: str) -> None:
+        out.append({"kind": kind, "target": target, "step": step, "message": message,
+                    "hint": explain(f"{step} {message}")})
+
+    for a in manifest.get("archives", []):
+        if a.get("error"):
+            add("archive", a.get("target", ""), "export + download", a["error"])
+    for j in manifest.get("export_jobs", []):
+        if j.get("error"):
+            add("export-job", ", ".join(j.get("targets", [])), f"export job ({j.get('action', '')})", j["error"])
+    for e in manifest.get("extras", []):
+        if e.get("error"):
+            add("extra", e.get("target", ""), e.get("extra", ""), e["error"])
+        for note in e.get("truncated", []):
+            add("limit", e.get("target", ""), e.get("extra", ""), note)
+    return out
 
 
 def _now() -> str:
@@ -433,7 +525,8 @@ def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResu
             result.path = dest
             result.bytes = dest.stat().st_size
             log(f"  saved {dest.name} ({human(result.bytes)})")
-            _github_cleanup(spec, client, migration_id, batch, log)
+            _github_cleanup(spec, client, migration_id, batch, log, dest,
+                            result.meta.get("content_length"))
         except MigrationError as exc:
             result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
@@ -441,8 +534,22 @@ def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResu
     return results
 
 
-def _github_cleanup(spec, client, migration_id, batch, log) -> None:
-    """Opt-in, and only after the archive is safely on disk."""
+def _download_is_complete(dest: Path, expected) -> bool:
+    """A file of exactly the size the server announced, that opens as a tarball."""
+    try:
+        size = dest.stat().st_size
+    except OSError:
+        return False
+    try:
+        announced = int(expected)
+    except (TypeError, ValueError):
+        return False
+    return size > 0 and size == announced and tarfile.is_tarfile(dest)
+
+
+def _github_cleanup(spec, client, migration_id, batch, log, dest: Path, expected_bytes) -> None:
+    """Opt-in, and only after the archive is verified: unlocking is harmless, but
+    deleting the archive from GitHub is not undoable."""
     if spec.unlock_repos:
         for repo in batch:
             try:
@@ -450,6 +557,10 @@ def _github_cleanup(spec, client, migration_id, batch, log) -> None:
             except MigrationError as exc:
                 log(f"  warning: unlock {repo} failed ({brief_error(exc)})")
     if spec.delete_archive:
+        if not _download_is_complete(dest, expected_bytes):
+            log("  warning: not deleting the archive from GitHub: could not confirm the download is "
+                "complete (size does not match what GitHub announced, or it is not a readable tarball)")
+            return
         try:
             client.delete_archive(migration_id)
         except MigrationError as exc:
@@ -614,6 +725,7 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
                   scope=spec.scope, max_items=spec.max_items, shared=shared, cancelled=cancelled)
         for name in names:
             record = {"target": target, "extra": name, "files": [], "error": ""}
+            ctx.truncated.clear()
             log(f"  {name} …")
             try:
                 if cancelled and cancelled():
@@ -622,6 +734,8 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
             except MigrationError as exc:
                 record["error"] = brief_error(exc)
                 log(f"    ERROR {record['error']}")
+            if ctx.truncated:
+                record["truncated"] = list(ctx.truncated)
             records.append(record)
     return records
 

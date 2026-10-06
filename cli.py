@@ -47,7 +47,8 @@ def main(argv=None) -> int:
                    help="comma list of supplementary collectors, or all (light ones) / everything; "
                         "see --list-extras")
     p.add_argument("--list-extras", action="store_true", help="print collector names per provider and exit")
-    p.add_argument("--max-items", type=int, default=200, help="cap per unbounded listing (default 200)")
+    p.add_argument("--max-items", type=int, default=200,
+                   help="items collected per listing for extras (default 200; 0 = no limit)")
     p.add_argument("--exclude", default="",
                    help="GitHub: comma list of metadata,git_data,attachments,releases,owner_projects")
     p.add_argument("--org-metadata-only", action="store_true", help="GitHub org scope")
