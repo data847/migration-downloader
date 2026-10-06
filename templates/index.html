@@ -49,6 +49,8 @@
   fieldset{border:0;padding:0;margin:0 0 14px;min-width:0}
   label{display:block;font-size:11.5px;color:var(--muted);margin:0 0 5px;
     text-transform:uppercase;letter-spacing:.05em}
+  select{width:100%;background:var(--panel);color:var(--fg);border:1px solid var(--line);
+    border-radius:8px;padding:10px 11px;font:inherit;font-size:15px;min-height:42px}
   input[type=text],input[type=password],input[type=number],textarea{
     width:100%;background:var(--panel);color:var(--fg);border:1px solid var(--line);
     border-radius:8px;padding:10px 11px;font:inherit;font-size:16px;min-height:42px}
@@ -150,11 +152,13 @@
     <div class="seg" role="group" aria-label="Provider">
       <button type="button" data-provider="github" aria-pressed="true">GitHub</button>
       <button type="button" data-provider="gitlab" aria-pressed="false">GitLab</button>
+      <button type="button" data-provider="bitbucket" aria-pressed="false">Bitbucket</button>
+      <button type="button" data-provider="bitbucket-dc" aria-pressed="false" title="Bitbucket Data Center">Bitbucket DC</button>
     </div>
 
     <fieldset style="margin-top:14px">
-      <label>Host</label>
-      <div class="seg" role="group" aria-label="Host">
+      <label id="host-label">Host</label>
+      <div class="seg" role="group" aria-label="Host" id="host-seg">
         <button type="button" data-host="cloud" aria-pressed="true" id="host-cloud">github.com</button>
         <button type="button" data-host="self" aria-pressed="false" id="host-self">Self-hosted</button>
       </div>
@@ -165,7 +169,7 @@
     </fieldset>
 
     <fieldset>
-      <label for="token">Personal access token</label>
+      <label for="token" id="token-label">Personal access token</label>
       <input type="password" id="token" placeholder="paste PAT, or leave blank to use .env">
       <div class="hint" id="token-hint"></div>
     </fieldset>
@@ -196,6 +200,19 @@
         <button class="ghost" type="button" id="clear-targets">Clear</button>
       </div>
       <div class="hint" id="targets-hint"></div>
+    </fieldset>
+
+    <fieldset data-only="bitbucket-dc">
+      <label for="dc_action">Export job</label>
+      <select id="dc_action">
+        <option value="export">Start export and monitor it</option>
+        <option value="preview">Preview only (nothing is exported)</option>
+        <option value="cancel">Cancel a running job…</option>
+        <option value="none">No export job (extras only)</option>
+      </select>
+      <input type="text" id="dc_job_id" placeholder="job id to cancel" hidden style="margin-top:8px">
+      <div class="hint">The export <code>.tar</code> is written on the Bitbucket server
+        (<code>$BITBUCKET_SHARED_HOME/data/migration/export/</code>); it cannot be downloaded here.</div>
     </fieldset>
 
     <fieldset data-only="gitlab">
@@ -287,6 +304,16 @@ Runs survive a page reload and a server restart — this page re-attaches
 to whatever is in flight.</pre>
     </div>
 
+    <div class="card" id="extras-card" hidden>
+      <h2>Extras &amp; export jobs</h2>
+      <div class="hint" style="margin:0 0 8px">Files are on the server at
+        <span class="paths" id="extras-where"></span></div>
+      <div class="scroll">
+        <table><thead><tr><th>Target / collector</th><th>Result</th><th>Status</th></tr></thead>
+        <tbody id="extras-results"></tbody></table>
+      </div>
+    </div>
+
     <div class="card" id="results-card" hidden>
       <h2>Archives
         <span class="acts">
@@ -340,7 +367,8 @@ to whatever is in flight.</pre>
 </div>
 
 <script>
-const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }} };
+const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }},
+  bitbucket: {{ bitbucket_env|tojson }}, 'bitbucket-dc': {{ bitbucket_dc_env|tojson }} };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -356,23 +384,41 @@ function syncVisibility(){
     el.hidden = !(key === provider || (key === 'org' && provider === 'github' && scope === 'org'));
   });
   const gh = provider === 'github';
-  $('targets-label').textContent = gh
-    ? (scope === 'org' ? 'Repositories (bare names, one per line)' : 'Repositories (owner/repo, one per line)')
+  const bb = provider === 'bitbucket', dc = provider === 'bitbucket-dc';
+  const bbAny = bb || dc;
+  $('targets-label').textContent = dc ? 'Repositories (PROJECT_KEY/repo-slug, one per line)'
+    : bb ? 'Repositories (workspace/repo, one per line)'
+    : gh ? (scope === 'org' ? 'Repositories (bare names, one per line)' : 'Repositories (owner/repo, one per line)')
     : 'Projects (namespace/project, one per line)';
-  $('targets').placeholder = gh ? (scope === 'org' ? 'guava' : 'google/guava') : 'group/subgroup/project';
+  $('targets').placeholder = dc ? 'PROJ/my-repo' : bb ? 'my-workspace/my-repo'
+    : gh ? (scope === 'org' ? 'guava' : 'google/guava') : 'group/subgroup/project';
   $('api_base').placeholder = gh ? 'https://api.github.com' : 'https://gitlab.com';
+  // Bitbucket has no repo/owner browser here, and Cloud has a single fixed host
+  $('pick-repos').hidden = bbAny;
+  $('host-seg').hidden = bbAny;
+  $('host-label').textContent = dc ? 'Bitbucket Data Center base URL' : 'Host';
+  $('token-label').textContent = bbAny ? 'API / access token' : 'Personal access token';
+  $('go').textContent = bb ? 'Collect extras' : dc ? 'Run' : 'Start migration & download';
+  $('dc_job_id').hidden = $('dc_action').value !== 'cancel';
   $('scope-hint').innerHTML = scope === 'org'
     ? 'PAT needs <code>repo</code> + <code>admin:org</code>; you must be an Owner or hold the Migrator role.'
     : 'PAT needs <code>repo</code> + <code>user</code>.';
-  $('targets-hint').innerHTML = gh
+  $('targets-hint').innerHTML = dc
+    ? 'Needs a system-admin token. Starts the server-side export job; pick <code>archive</code> under Extras for a per-repo zip.'
+    : bb
+    ? 'Bitbucket Cloud has no export archive, so choose at least one extra. Use a user API token (<code>email:token</code> or a bare access token) with the scopes listed in the README.'
+    : gh
     ? 'Full URLs and <code>.git</code> suffixes are accepted.'
     : 'PAT needs <code>api</code> + <code>write_repository</code>. Numeric project IDs and nested subgroups work.';
   const gh2 = provider === 'github';
   $('host-cloud').textContent = gh2 ? 'github.com' : 'gitlab.com';
   $('host-self').textContent = gh2 ? 'GitHub Enterprise' : 'Self-hosted GitLab';
-  $('host-wrap').hidden = host !== 'self';
-  $('api_base').placeholder = gh2 ? 'https://github.example.com/api/v3' : 'https://gitlab.example.com';
-  $('host-hint').innerHTML = gh2
+  $('host-wrap').hidden = dc ? false : (bb || host !== 'self');
+  $('api_base').placeholder = dc ? 'https://bitbucket.example.com'
+    : gh2 ? 'https://github.example.com/api/v3' : 'https://gitlab.example.com';
+  $('host-hint').innerHTML = dc
+    ? 'Server root, no <code>/rest/api</code> — that is appended for you.'
+    : gh2
     ? 'Enterprise API root — usually <code>https://&lt;host&gt;/api/v3</code>.'
     : 'Instance root, no <code>/api/v4</code> — that is appended for you.';
   $('pick-repos').textContent = gh2 ? 'Browse & select repos…' : 'Browse & select projects…';
@@ -405,7 +451,8 @@ function updateExtrasCount(){
   const n = (extrasChecked[provider] || new Set()).size;
   $('extras-count').textContent = n ? `(${n} selected)` : '';
 }
-$('extras-light').onclick = () => setExtras(e => !e.heavy);
+$('dc_action').onchange = syncVisibility;
+$('extras-light').onclick =() => setExtras(e => !e.heavy);
 $('extras-everything').onclick = () => setExtras(() => true);
 $('extras-none').onclick = () => setExtras(() => false);
 fetch('/api/extras').then(r => r.json()).then(d => { EXTRAS = d.extras || {}; renderExtras(); })
@@ -439,7 +486,26 @@ function append(lines){
   log.textContent += lines.join('\n') + '\n';
   if(stick) log.scrollTop = log.scrollHeight;
 }
+function renderExtrasResults(manifest){
+  const card = $('extras-card');
+  const extras = (manifest && manifest.extras) || [], jobs = (manifest && manifest.export_jobs) || [];
+  if(!extras.length && !jobs.length){ card.hidden = true; return; }
+  card.hidden = false;
+  const jobRows = jobs.map(j => `<tr><td class="mono">export job ${esc(j.job_id || j.action)}
+      <div style="color:var(--muted)">${esc((j.targets || []).join(', '))}</div></td>
+    <td>${esc(j.action)}${j.state ? ' · ' + esc(j.state) : ''}</td>
+    <td>${j.error ? `<span class="pill bad">${esc(j.error.slice(0, 90))}</span>`
+      : `<span class="pill ok">ok</span>`}</td></tr>`);
+  const rows = extras.map(e => `<tr><td class="mono">${esc(e.target)}
+      <div style="color:var(--muted)">${esc(e.extra)}</div></td>
+    <td>${e.files.length} file${e.files.length === 1 ? '' : 's'}</td>
+    <td>${e.error ? `<span class="pill bad">${esc(e.error.slice(0, 90))}</span>`
+      : `<span class="pill ok">ok</span>`}</td></tr>`);
+  $('extras-results').innerHTML = jobRows.concat(rows).join('');
+  $('extras-where').textContent = (manifest.output_dir || '') + '/extras/';
+}
 function renderResults(manifest){
+  renderExtrasResults(manifest);
   const card = $('results-card');
   if(!manifest || !manifest.archives || !manifest.archives.length){ card.hidden = true; return; }
   const run = (manifest.output_dir || '').split('/').pop();
@@ -517,7 +583,9 @@ $('form').onsubmit = async (ev) => {
   const payload = { provider, scope,
     org: $('org').value, token: $('token').value, targets: $('targets').value,
     poll_interval: $('poll').value, timeout: $('timeout').value,
-    api_base: host === 'self' ? $('api_base').value.trim() : '',
+    api_base: (provider === 'bitbucket-dc' || (provider !== 'bitbucket' && host === 'self'))
+      ? $('api_base').value.trim() : '',
+    dc_action: $('dc_action').value, dc_job_id: $('dc_job_id').value.trim(),
     api_version: $('api_version').value,
     run_name: $('run_name').value,
     extras: [...document.querySelectorAll('#extras-list input:checked')].map(cb => cb.value).join(','),
@@ -525,7 +593,7 @@ $('form').onsubmit = async (ev) => {
     single_archive: $('single_archive').checked,
     verify_checksum: $('verify_checksum').checked };
   $('go').disabled = true; $('banner').hidden = true;
-  $('log').textContent = ''; $('results-card').hidden = true; since = 0;
+  $('log').textContent = ''; $('results-card').hidden = true; $('extras-card').hidden = true; since = 0;
   setState('starting', 'run');
   const res = await fetch('/api/jobs', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});

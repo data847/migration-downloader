@@ -215,6 +215,11 @@ token `BITBUCKET_DC_TOKEN`) starts and monitors the server-side export job
 (`--dc-action export|preview|cancel|none`, `--dc-job-id` for cancel); the
 resulting `.tar` is written to the server's shared home, not downloaded here.
 
+In the web UI, the provider switch has **Bitbucket** (Cloud, extras only) and
+**Bitbucket DC** (base URL plus an export-job selector: start, preview, cancel
+or none). Both reuse the Extras picker, and a run's extras and export jobs show
+in their own results card. The repo/org browser is GitHub and GitLab only.
+
 Additional export options:
 
 - GitHub: `--exclude metadata,git_data,attachments,releases,owner_projects`,

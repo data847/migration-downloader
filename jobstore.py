@@ -58,6 +58,13 @@ def _public_spec(spec: JobSpec) -> dict:
         "run_name": spec.run_name,
         "extras": spec.extras,
         "max_items": spec.max_items,
+        "exclude": spec.exclude,
+        "org_metadata_only": spec.org_metadata_only,
+        "unlock_repos": spec.unlock_repos,
+        "delete_archive": spec.delete_archive,
+        "description": spec.description,
+        "dc_action": spec.dc_action,
+        # upload_url is deliberately not stored: a presigned URL is a credential
         "token_hint": mask(spec.resolved_token()),
         "token_from_env": not spec.token,
     }
@@ -223,6 +230,13 @@ def spec_for_resume(job: dict, token: str = "") -> JobSpec:
         run_name=plan["run_name"] or s["run_name"],
         extras=s.get("extras", []),
         max_items=s.get("max_items", 200),
+        exclude=s.get("exclude", []),
+        org_metadata_only=s.get("org_metadata_only", False),
+        unlock_repos=s.get("unlock_repos", False),
+        delete_archive=s.get("delete_archive", False),
+        description=s.get("description", ""),
+        # never start a second Data Center export job on resume; extras re-run
+        dc_action="none" if s["provider"] == "bitbucket-dc" else s.get("dc_action", "export"),
         known_ids=plan["known_ids"],
         skip_done=True,
     )

@@ -74,6 +74,11 @@ def _run_root(run: str) -> Path:
 # ── routes ───────────────────────────────────────────────────────────────────
 
 
+def _env_hint(provider: str) -> str:
+    token = JobSpec(provider=provider).resolved_token()
+    return mask(token) if token else ""
+
+
 @app.get("/")
 def index():
     return render_template(
@@ -82,6 +87,8 @@ def index():
         outputs_dir=str(outputs_for(COMPONENT)),
         github_env=mask(github_token()) if github_token() else "",
         gitlab_env=mask(gitlab_token()) if gitlab_token() else "",
+        bitbucket_env=_env_hint("bitbucket"),
+        bitbucket_dc_env=_env_hint("bitbucket-dc"),
     )
 
 
@@ -133,8 +140,10 @@ def job_log(job_id: str):
         abort(404)
     spec = job.get("spec", {})
     manifest = job.get("manifest") or {}
-    host = spec.get("api_base") or (
-        "https://api.github.com" if spec.get("provider") == "github" else "https://gitlab.com")
+    host = spec.get("api_base") or {
+        "github": "https://api.github.com",
+        "bitbucket": "https://api.bitbucket.org/2.0",
+    }.get(spec.get("provider"), "https://gitlab.com")
     header = [
         "# migration-downloader run log",
         f"# run id     : {job['id']}",

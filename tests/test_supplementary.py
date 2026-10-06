@@ -450,5 +450,45 @@ class ExtrasEndpoint(unittest.TestCase):
             spec.validate()
 
 
+class BitbucketUi(unittest.TestCase):
+    def test_page_offers_both_bitbucket_providers_and_dc_controls(self):
+        import app
+        html = app.app.test_client().get("/").get_data(as_text=True)
+        for needle in ('data-provider="bitbucket"', 'data-provider="bitbucket-dc"',
+                       'id="dc_action"', 'id="extras-card"'):
+            self.assertIn(needle, html)
+
+    def test_job_payload_roundtrips_through_the_spec(self):
+        spec = JobSpec.from_form({"provider": "bitbucket-dc", "targets": "PROJ/repo",
+                                  "api_base": "https://bb.example.com", "dc_action": "preview",
+                                  "extras": "archive"})
+        self.assertEqual((spec.provider, spec.dc_action, spec.extras),
+                         ("bitbucket-dc", "preview", ["archive"]))
+
+    def test_upload_url_is_never_persisted(self):
+        import jobstore
+        spec = JobSpec(provider="gitlab", token="t", targets=["g/p"],
+                       upload_url="https://s3.example.com/x?X-Amz-Signature=abc")
+        self.assertNotIn("abc", json.dumps(jobstore._public_spec(spec)))
+
+    def test_resuming_a_dc_job_never_restarts_the_export(self):
+        import jobstore
+        spec = JobSpec(provider="bitbucket-dc", token="t", targets=["P/r"],
+                       api_base="https://bb.example.com", extras=["archive"])
+        job = {"spec": jobstore._public_spec(spec), "state": "interrupted", "manifest": {}, "log": []}
+        resumed = jobstore.spec_for_resume(job, token="t")
+        self.assertEqual(resumed.dc_action, "none")
+        self.assertEqual(resumed.extras, ["archive"])
+
+    def test_resume_keeps_github_export_options(self):
+        import jobstore
+        spec = JobSpec(provider="github", token="t", targets=["a/b"], exclude=["releases"],
+                       lock_repositories=True, unlock_repos=True)
+        job = {"spec": jobstore._public_spec(spec), "state": "interrupted", "manifest": {}, "log": []}
+        resumed = jobstore.spec_for_resume(job, token="t")
+        self.assertEqual(resumed.exclude, ["releases"])
+        self.assertTrue(resumed.unlock_repos)
+
+
 if __name__ == "__main__":
     unittest.main()
