@@ -17,6 +17,7 @@ from typing import Callable, List, Optional
 
 import bootstrap  # noqa: F401  (sets sys.path)
 
+import for_check  # noqa: E402
 from datalabs_paths import (  # noqa: E402
     ensure_outputs,
     github_token,
@@ -58,6 +59,7 @@ class JobSpec:
     # resume: {target label -> migration/export id already known}
     known_ids: dict = field(default_factory=dict)
     skip_done: bool = False           # don't re-download targets already on disk
+    for_check: bool = True            # write <archive>.for-check.csv (source-side counts/refs/file list) for Garmr
 
     @classmethod
     def from_form(cls, data: dict) -> "JobSpec":
@@ -80,6 +82,7 @@ class JobSpec:
             timeout=max(60, int(data.get("timeout") or 3600)),
             verify_checksum=flag("verify_checksum"),
             run_name=(data.get("run_name") or "").strip(),
+            for_check=str(data.get("for_check", "1")).lower() not in {"0", "false", "off", "no"},
         )
 
     def resolved_token(self) -> str:
@@ -149,6 +152,11 @@ def run_job(
                 log(f"sha256 {r.target} …")
                 r.digest = sha256(r.path)
 
+    for r in results:
+        info = r.meta.pop("for_check", None)
+        if spec.for_check and info and r.path and r.path.exists():
+            _write_for_check(info, r, log)
+
     manifest = {
         "component": COMPONENT,
         "provider": spec.provider,
@@ -173,6 +181,34 @@ def run_job(
             log(f"  ✗ {r.target}: {r.error}")
     log(f"manifest: {dest_dir / 'manifest.json'}")
     return manifest
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _owner_repo(spec: JobSpec, name: str):
+    if spec.scope == "org":
+        return spec.org, name.split("/")[-1]
+    owner, _, repo = name.partition("/")
+    return (owner, repo) if repo else (owner, owner)
+
+
+def _write_for_check(info: dict, result: ArchiveResult, log) -> None:
+    """Write <archive>.for-check.csv. Whatever goes wrong here must never fail the download."""
+    try:
+        files, ocount, obytes = None, 0, 0
+        try:
+            files, ocount, obytes = for_check.list_archive(result.path)
+        except Exception as exc:
+            info["errors"].append(f"file listing: {type(exc).__name__}: {exc}")
+        info["meta"]["content_length"] = result.meta.get("content_length", "")
+        rows = for_check.build_rows(info, archive=result.path, digest=result.digest, files=files,
+                                    ocount=ocount, obytes=obytes)
+        path = for_check.write_csv(for_check.for_check_path(result.path), rows)
+        log(f"  for-check: {path.name} ({len(rows)} rows)")
+    except Exception as exc:
+        log(f"  warning: could not write for-check.csv ({type(exc).__name__}: {exc})")
 
 
 def _github_client(spec: JobSpec, token: str, log) -> GitHubMigration:
@@ -205,6 +241,21 @@ def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
         try:
             if cancelled and cancelled():
                 raise MigrationError("cancelled")
+            fc = None
+            if spec.for_check:
+                pairs = [_owner_repo(spec, n) for n in batch]
+                fc = {"archive_label": f"{pairs[0][0]}/{pairs[0][1]}" if len(pairs) == 1 else "*",
+                      "requested": [f"{o}/{r}" for o, r in pairs], "exported": [], "errors": [],
+                      "repos": [{"label": f"{o}/{r}", "owner": o, "repo": r} for o, r in pairs],
+                      "meta": {"provider": "github", "host": client.api_base, "scope": spec.scope, "org": spec.org,
+                               "api_version": client.api_version, "started_at": _now(),
+                               "opt_lock_repositories": str(bool(client.lock_repositories)).lower(),
+                               "opt_excludes": "none"}}
+                for rp in fc["repos"]:
+                    log(f"  for-check: snapshot before {rp['label']}")
+                    rp["before"] = for_check.snapshot("github", rp["label"], headers=client._headers,
+                                                      api_base=client.api_base, token=token,
+                                                      owner=rp["owner"], repo=rp["repo"])
             migration_id = spec.known_ids.get(label, "")
             if migration_id:
                 log(f"  reusing migration id {migration_id}")
@@ -218,6 +269,17 @@ def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 cancelled=cancelled,
             )
             result.state = data.get("state", "")
+            if fc:
+                for rp in fc["repos"]:
+                    rp["after"] = for_check.snapshot("github", rp["label"], headers=client._headers,
+                                                     api_base=client.api_base, token=token,
+                                                     owner=rp["owner"], repo=rp["repo"])
+                try:
+                    fc["exported"] = [str(x) for x in client.repositories(migration_id) if x]
+                except Exception as exc:
+                    fc["errors"].append(f"exported repos: {type(exc).__name__}: {exc}")
+                fc["meta"].update(migration_id=migration_id, state=result.state, finished_at=_now())
+                result.meta["for_check"] = fc
             stem = safe_name(batch[0] if len(batch) == 1 else f"{spec.org or 'user'}-batch")
             dest = dest_dir / f"{stem}-{migration_id}.tar.gz"
             if spec.skip_done and dest.is_file() and dest.stat().st_size:
@@ -225,6 +287,7 @@ def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 result.skipped = True
             else:
                 client.download(migration_id, dest)
+                result.meta["content_length"] = client.download_info.get("content_length", "")
             result.path = dest
             result.bytes = dest.stat().st_size
             log(f"  saved {dest.name} ({human(result.bytes)})")
@@ -260,6 +323,15 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 result.bytes = dest.stat().st_size
                 results.append(result)
                 continue
+            fc = None
+            if spec.for_check:
+                log(f"  for-check: snapshot before {project}")
+                fc = {"archive_label": project, "requested": [project], "exported": [project], "errors": [],
+                      "repos": [{"label": project}],
+                      "meta": {"provider": "gitlab", "host": client.api_base, "scope": "project", "org": "",
+                               "api_version": "v4", "started_at": _now(), "opt_excludes": "none"}}
+                fc["repos"][0]["before"] = for_check.snapshot("gitlab", project, headers=client._headers,
+                                                              api_base=client.api_base, token=token)
             if spec.known_ids.get(project) and _already_finished(client, project, log):
                 pass
             else:
@@ -273,7 +345,13 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
             result.state = data.get("export_status", "")
             project_id = data.get("id")
             result.migration_id = str(project_id) if project_id else None
+            if fc:
+                fc["repos"][0]["after"] = for_check.snapshot("gitlab", project, headers=client._headers,
+                                                             api_base=client.api_base, token=token)
+                fc["meta"].update(migration_id=result.migration_id or "", state=result.state, finished_at=_now())
+                result.meta["for_check"] = fc
             client.download(project, dest, project_id=project_id)
+            result.meta["content_length"] = client.download_info.get("content_length", "")
             result.path = dest
             result.bytes = dest.stat().st_size
             log(f"  saved {dest.name} ({human(result.bytes)})")

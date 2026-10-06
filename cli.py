@@ -35,6 +35,8 @@ def main(argv=None) -> int:
     p.add_argument("--lock-repositories", action="store_true")
     p.add_argument("--single-archive", action="store_true", help="GitHub: one migration for all repos")
     p.add_argument("--no-checksum", action="store_true")
+    p.add_argument("--no-for-check", action="store_true",
+                   help="do not write <archive>.for-check.csv (source-side counts/refs/file list for Garmr)")
     args = p.parse_args(argv)
 
     targets = list(args.targets)
@@ -56,6 +58,7 @@ def main(argv=None) -> int:
         timeout=args.timeout,
         verify_checksum=not args.no_checksum,
         run_name=args.run_name,
+        for_check=not args.no_for_check,
     )
     try:
         manifest = run_job(spec, log=print)

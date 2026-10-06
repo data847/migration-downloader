@@ -112,12 +112,15 @@ def _json_request(url: str, *, method: str = "GET", headers: dict, payload=None,
         return status, {"raw": raw.decode("utf-8", "replace")}
 
 
-def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int = 120) -> Path:
+def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int = 120,
+              info: Optional[dict] = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix(dest.suffix + ".part")
     try:
         with _request(url, headers=headers, timeout=timeout) as resp, partial.open("wb") as fh:
             total = int(resp.headers.get("Content-Length") or 0)
+            if info is not None:
+                info["content_length"] = total or ""
             done = 0
             next_mark = 0
             while True:
@@ -247,6 +250,7 @@ class GitHubMigration:
         )
         self.lock_repositories = lock_repositories
         self.log = log
+        self.download_info: dict = {}
 
     # -- plumbing ----------------------------------------------------------
     @property
@@ -362,7 +366,12 @@ class GitHubMigration:
     def download(self, migration_id: str, dest: Path) -> Path:
         url = f"{self._root}/{migration_id}/archive"
         self.log(f"  GET {url}")
-        return _download(url, dest, headers=self._headers, log=self.log)
+        return _download(url, dest, headers=self._headers, log=self.log, info=self.download_info)
+
+    def repositories(self, migration_id: str) -> List[str]:
+        """Repos the source says this migration contains (`owner/name` when given)."""
+        _status, data = _json_request(f"{self._root}/{migration_id}/repositories", headers=self._headers)
+        return [r.get("full_name") or r.get("name") for r in data if isinstance(r, dict)] if isinstance(data, list) else []
 
 
 # ── GitLab ───────────────────────────────────────────────────────────────────
@@ -380,6 +389,7 @@ class GitLabExport:
         self.token = token
         self.api_base = api_base.rstrip("/")
         self.log = log
+        self.download_info: dict = {}
 
     @property
     def _headers(self) -> dict:
@@ -477,4 +487,4 @@ class GitLabExport:
         ident = str(project_id) if project_id else project
         url = self._project_url(str(ident), "/export/download")
         self.log(f"  GET {url}")
-        return _download(url, dest, headers=self._headers, log=self.log)
+        return _download(url, dest, headers=self._headers, log=self.log, info=self.download_info)
