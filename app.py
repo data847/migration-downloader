@@ -211,7 +211,7 @@ def discover():
     data = request.get_json(force=True, silent=True) or {}
     provider = (data.get("provider") or "github").strip().lower()
     kind = (data.get("kind") or "repos").strip().lower()       # repos | owners
-    scope = (data.get("scope") or "user").strip().lower()
+    scope = (data.get("scope") or "auto").strip().lower()
     owner = (data.get("owner") or "").strip()                  # org / group
     api_base = (data.get("api_base") or "").strip()
     token = (data.get("token") or "").strip() or (
@@ -220,10 +220,15 @@ def discover():
         return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
     try:
         if provider == "github":
-            client = GitHubMigration(token, scope=scope, org=owner or "x",
+            client = GitHubMigration(token, scope="org" if scope == "org" else "user",
+                                     org=owner or "x",
                                      api_base=api_base or "https://api.github.com")
-            items = client.list_orgs() if kind == "owners" else client.list_repos(
-                org=owner if scope == "org" else "")
+            if kind == "owners":
+                items = client.list_orgs()
+            elif scope == "auto":
+                items = client.list_all_repos()
+            else:
+                items = client.list_repos(org=owner if scope == "org" else "")
         else:
             client = GitLabExport(token, api_base=api_base or "https://gitlab.com")
             items = client.list_groups() if kind == "owners" else client.list_projects(group=owner)

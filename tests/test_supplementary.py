@@ -383,7 +383,8 @@ class RunExtras(unittest.TestCase):
                            extras=["hooks", "releases"])
             fake = FakeHttp({"/hooks": MigrationError("HTTP 403 forbidden"), "/releases": [{"id": 1}]})
             logs = []
-            with mock.patch("supplementary._json_request", fake):
+            with mock.patch("supplementary._json_request", fake), \
+                    mock.patch("runner._github_login", return_value="someone"):
                 records = _run_extras(spec, "t", Path(tmp), logs.append, None)
             by_name = {r["extra"]: r for r in records}
             self.assertIn("403", by_name["hooks"]["error"])
@@ -394,8 +395,94 @@ class RunExtras(unittest.TestCase):
     def test_cancel_stops_further_collectors(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = JobSpec(provider="github", token="t", targets=["acme/widgets"], extras=["hooks"])
-            records = _run_extras(spec, "t", Path(tmp), lambda _m: None, lambda: True)
+            with mock.patch("runner._github_login", return_value="someone"):
+                records = _run_extras(spec, "t", Path(tmp), lambda _m: None, lambda: True)
             self.assertEqual(records[0]["error"], "cancelled")
+
+    def test_org_level_extras_use_the_targets_owner_in_auto_scope(self):
+        from runner import _extras_org
+        spec = JobSpec(provider="github", token="t", targets=["me/a", "acme/b"])
+        self.assertEqual(_extras_org(spec, "me/a", "Me"), "")          # personal, case-insensitive
+        self.assertEqual(_extras_org(spec, "acme/b", "me"), "acme")
+        self.assertEqual(_extras_org(spec, "acme/b", ""), "")           # login unknown -> as a user
+        org_spec = JobSpec(provider="github", token="t", scope="org", org="acme", targets=["b"])
+        self.assertEqual(_extras_org(org_spec, "b", ""), "acme")
+
+
+class GitHubAutoScope(unittest.TestCase):
+    def _spec(self, **kw):
+        return JobSpec(provider="github", token="t", **kw)
+
+    def test_default_scope_is_auto(self):
+        self.assertEqual(JobSpec().scope, "auto")
+        self.assertEqual(JobSpec.from_form({"provider": "github"}).scope, "auto")
+
+    def test_targets_split_into_personal_and_per_org_groups(self):
+        from runner import _github_groups
+        spec = self._spec(targets=["Me/one", "acme/a", "https://github.com/acme/b.git", "other/c", "me/two"])
+        with mock.patch("runner._github_login", return_value="me"):
+            groups = _github_groups(spec, "t", lambda _m: None)
+        self.assertEqual(groups, [
+            ("user", "", ["Me/one", "me/two"]),
+            ("org", "acme", ["acme/a", "https://github.com/acme/b.git"]),
+            ("org", "other", ["other/c"]),
+        ])
+
+    def test_explicit_scopes_are_left_alone(self):
+        from runner import _github_groups
+        spec = self._spec(scope="org", org="acme", targets=["a", "b"])
+        self.assertEqual(_github_groups(spec, "t", lambda _m: None), [("org", "acme", ["a", "b"])])
+
+    def test_auto_needs_owner_repo_targets(self):
+        for bad in ("justname", "a/b/c", "/x", "x/"):
+            with self.assertRaises(MigrationError, msg=bad):
+                self._spec(targets=[bad]).validate()
+        self._spec(targets=["a/b", "https://github.com/a/b.git"]).validate()
+
+    def test_login_failure_is_a_clear_error(self):
+        from runner import _github_login
+        with mock.patch("migration_api._json_request", side_effect=MigrationError("HTTP 401 bad")):
+            with self.assertRaises(MigrationError) as ctx:
+                _github_login(self._spec(targets=["a/b"]), "t", lambda _m: None)
+        self.assertIn("personal repos from org repos", str(ctx.exception))
+
+    def test_each_group_runs_against_its_own_migration_api(self):
+        import runner
+        spec = self._spec(targets=["me/one", "acme/a"], single_archive=True)
+        seen = []
+
+        def fake_scope(group, token, dest, log, cancelled):
+            seen.append((group.scope, group.org, group.targets))
+            return []
+
+        with mock.patch("runner._github_login", return_value="me"), \
+                mock.patch("runner._run_github_scope", fake_scope):
+            runner._run_github(spec, "t", Path("."), lambda _m: None, None)
+        self.assertEqual(seen, [("user", "", ["me/one"]), ("org", "acme", ["acme/a"])])
+
+    def test_page_has_a_single_github_repo_list(self):
+        import app
+        html = app.app.test_client().get("/").get_data(as_text=True)
+        for gone in ('data-scope=', 'id="org"', 'id="pick-owner"', "User repos", "Org repos"):
+            self.assertNotIn(gone, html)
+        self.assertIn("scope: 'auto'", html)
+
+    def test_discover_lists_all_repos_in_auto_scope(self):
+        import app
+        fake = FakeHttp({"/user/repos": [{"full_name": "acme/y"}]})
+        with mock.patch("migration_api._json_request", fake):
+            reply = app.app.test_client().post(
+                "/api/discover", json={"provider": "github", "kind": "repos", "scope": "auto", "token": "t"})
+        self.assertEqual([i["target"] for i in reply.get_json()["items"]], ["acme/y"])
+
+    def test_list_all_repos_uses_one_call_with_all_affiliations(self):
+        fake = FakeHttp({"/user/repos": [{"full_name": "me/x", "private": True, "pushed_at": "2026-01-02T00:00"},
+                                         {"full_name": "acme/y"}]})
+        with mock.patch("migration_api._json_request", fake):
+            repos = GitHubMigration("t").list_all_repos()
+        self.assertEqual([r["target"] for r in repos], ["me/x", "acme/y"])
+        self.assertIn("organization_member", fake.calls[0][1])
+        self.assertTrue(repos[0]["private"])
 
 
 class DefaultExtras(unittest.TestCase):

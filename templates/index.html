@@ -169,24 +169,6 @@
       <div class="hint" id="token-hint"></div>
     </fieldset>
 
-    <div data-only="github">
-      <fieldset>
-        <label>Repository owner type</label>
-        <div class="seg" role="group" aria-label="Scope">
-          <button type="button" data-scope="user" aria-pressed="true">User repos</button>
-          <button type="button" data-scope="org" aria-pressed="false">Org repos</button>
-        </div>
-        <div class="hint" id="scope-hint"></div>
-      </fieldset>
-      <fieldset data-only="org" hidden>
-        <label for="org">Organization</label>
-        <input type="text" id="org" placeholder="TEST_ORG">
-        <div class="inline-act">
-          <button class="ghost" type="button" id="pick-owner">Browse orgs the token can see</button>
-        </div>
-      </fieldset>
-    </div>
-
     <fieldset>
       <label for="targets" id="targets-label">Repositories (one per line)</label>
       <textarea id="targets" placeholder="google/guava"></textarea>
@@ -354,7 +336,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const KEY = 'md.jobId';
-let provider = 'github', scope = 'user', host = 'cloud';
+let provider = 'github', host = 'cloud';
 let jobId = null, since = 0, timer = null;
 let pickerMode = 'repos', pickerItems = [];
 
@@ -362,32 +344,29 @@ let pickerMode = 'repos', pickerItems = [];
 function syncVisibility(){
   document.querySelectorAll('[data-only]').forEach(el => {
     const key = el.dataset.only;
-    el.hidden = !(key === provider || (key === 'org' && provider === 'github' && scope === 'org'));
+    el.hidden = key !== provider;
   });
   const gh = provider === 'github';
   const bb = provider === 'bitbucket', dc = provider === 'bitbucket-dc';
   const bbAny = bb || dc;
   $('targets-label').textContent = dc ? 'Repositories (PROJECT_KEY/repo-slug, one per line)'
     : bb ? 'Repositories (workspace/repo, one per line)'
-    : gh ? (scope === 'org' ? 'Repositories (bare names, one per line)' : 'Repositories (owner/repo, one per line)')
+    : gh ? 'Repositories (owner/repo, one per line — personal and org repos can be mixed)'
     : 'Projects (namespace/project, one per line)';
   $('targets').placeholder = dc ? 'PROJ/my-repo' : bb ? 'my-workspace/my-repo'
-    : gh ? (scope === 'org' ? 'guava' : 'google/guava') : 'group/subgroup/project';
+    : gh ? 'google/guava' : 'group/subgroup/project';
   $('api_base').placeholder = gh ? 'https://api.github.com' : 'https://gitlab.com';
   // Bitbucket has no repo/owner browser here
   $('pick-repos').hidden = bbAny;
   $('token-label').textContent = bbAny ? 'API / access token' : 'Personal access token';
   $('go').textContent = bb ? 'Collect repo data' : dc ? 'Run export & download' : 'Start migration & download';
   $('dc_job_id').hidden = $('dc_action').value !== 'cancel';
-  $('scope-hint').innerHTML = scope === 'org'
-    ? 'PAT needs <code>repo</code> + <code>admin:org</code>; you must be an Owner or hold the Migrator role.'
-    : 'PAT needs <code>repo</code> + <code>user</code>.';
   $('targets-hint').innerHTML = dc
     ? 'Needs a system-admin token. Starts the server-side export job and also saves a per-repo zip.'
     : bb
     ? 'Bitbucket Cloud has no export archive, so this collects repo data over the API instead. Use a user API token (<code>email:token</code> or a bare access token) with the scopes listed in the README.'
     : gh
-    ? 'Full URLs and <code>.git</code> suffixes are accepted.'
+    ? 'Your own repos and any org\'s repos in one list; the owner decides which migration API is used. PAT needs <code>repo</code> + <code>user</code>, plus <code>admin:org</code> and an Owner or Migrator role for org repos. Full URLs and <code>.git</code> suffixes are accepted.'
     : 'PAT needs <code>api</code> + <code>write_repository</code>. Numeric project IDs and nested subgroups work.';
   const gh2 = provider === 'github';
   $('host-cloud').textContent = gh2 ? 'github.com' : bbAny ? 'bitbucket.org' : 'gitlab.com';
@@ -421,11 +400,6 @@ document.querySelectorAll('[data-host]').forEach(b => b.onclick = () => {
   if(provider.startsWith('bitbucket')) provider = bitbucketProvider();
   document.querySelectorAll('[data-host]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   if(host === 'cloud') $('api_base').value = '';
-  syncVisibility();
-});
-document.querySelectorAll('[data-scope]').forEach(b => b.onclick = () => {
-  scope = b.dataset.scope;
-  document.querySelectorAll('[data-scope]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   syncVisibility();
 });
 
@@ -534,8 +508,8 @@ $('refresh').onclick = () => { loadJobs(); loadRuns(); };
 
 $('form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const payload = { provider, scope,
-    org: $('org').value, token: $('token').value, targets: $('targets').value,
+  const payload = { provider, scope: 'auto',
+    token: $('token').value, targets: $('targets').value,
     poll_interval: $('poll').value, timeout: $('timeout').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
     dc_action: $('dc_action').value, dc_job_id: $('dc_job_id').value.trim(),
@@ -557,16 +531,16 @@ $('form').onsubmit = async (ev) => {
 
 /* ── browse / select repos, orgs and groups ──────────────────────────── */
 function discoverBody(kind){
-  return { provider, scope, kind,
+  return { provider, scope: 'auto', kind,
     token: $('token').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
-    owner: provider === 'github' ? $('org').value.trim() : $('group').value.trim() };
+    owner: provider === 'github' ? '' : $('group').value.trim() };
 }
 async function openPicker(mode){
   pickerMode = mode;
   const isOwners = mode === 'owners';
   const noun = provider === 'github'
-    ? (isOwners ? 'organizations' : (scope === 'org' ? `repositories in ${$('org').value.trim() || 'the org'}` : 'your repositories'))
+    ? (isOwners ? 'organizations' : 'repositories (yours and your orgs\')')
     : (isOwners ? 'groups' : ($('group').value.trim() ? `projects in ${$('group').value.trim()}` : 'your projects'));
   $('picker-title').textContent = `Select ${noun}`;
   $('picker-add').hidden = isOwners;
@@ -576,10 +550,6 @@ async function openPicker(mode){
   $('picker-list').innerHTML = '<div class="note">loading…</div>';
   $('picker-note').textContent = '';
   $('backdrop').hidden = false;
-  if(provider === 'github' && scope === 'org' && !isOwners && !$('org').value.trim()){
-    $('picker-list').innerHTML = '<div class="note">Pick an organization first, or browse orgs.</div>';
-    return;
-  }
   const res = await fetch('/api/discover', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(discoverBody(mode))});
   const data = await res.json();
@@ -617,7 +587,7 @@ function renderPicker(){
   if(isOwners){
     $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
       const name = shown[n].name;
-      if(provider === 'github'){ $('org').value = name; } else { $('group').value = name; }
+      $('group').value = name;
       closePicker();
       openPicker('repos');
     });
@@ -647,7 +617,6 @@ $('picker-add').onclick = () => {
   closePicker();
 };
 $('pick-repos').onclick = () => openPicker('repos');
-$('pick-owner').onclick = () => openPicker('owners');
 $('pick-group').onclick = () => openPicker('owners');
 $('clear-targets').onclick = () => { $('targets').value = ''; };
 

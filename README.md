@@ -84,12 +84,18 @@ select-all and private/archived badges:
 
 | | GitHub | GitLab |
 |---|---|---|
-| Owners | **Browse orgs** → `/user/orgs`; picking one loads its repos | **Browse groups** → groups you hold Maintainer+ in |
-| Repos | user scope: repos you own or collaborate on; org scope: the org's repos | projects you could export, newest activity first |
+| Owners | — (one list covers them) | **Browse groups** → groups you hold Maintainer+ in |
+| Repos | one list: repos you own or collaborate on plus every org repo you can reach (`/user/repos?affiliation=owner,collaborator,organization_member`) | projects you could export, newest activity first |
 
-Selected entries are appended to the target list in the exact form the API
-wants — `owner/repo` for user scope, bare names for org scope,
-`group/subgroup/project` for GitLab. GitLab discovery filters to Maintainer
+GitHub has no user/org switch any more: targets are always `owner/repo`, and
+the default `--scope auto` decides per repo. Repos owned by the token's own
+login go through `/user/migrations`; every other owner's go through that org's
+`/orgs/{org}/migrations`, one group per owner (so `--single-archive` bundles
+within an owner, never across). `--scope user` / `--scope org --org X` still
+force the old behaviour, and org scope still takes bare names.
+
+Selected entries are appended to the target list as `owner/repo`
+(GitHub) or `group/subgroup/project` (GitLab). GitLab discovery filters to Maintainer
 (access level 40) or above, since that is the floor for exporting a project, so
 the list holds no rows that would 403 on initiate. Typing targets by hand still
 works; the picker only fills the box.

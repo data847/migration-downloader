@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Headless equivalent of the UI — same flow, scriptable.
 
+  ./.venv/bin/python cli.py github google/guava TEST_ORG/guava   # personal + org repos mixed
   ./.venv/bin/python cli.py github --scope user  google/guava
   ./.venv/bin/python cli.py github --scope org --org TEST_ORG guava
   ./.venv/bin/python cli.py gitlab google/guava --poll-interval 20
@@ -28,7 +29,8 @@ def main(argv=None) -> int:
     p.add_argument("provider", choices=sorted(PROVIDERS))
     p.add_argument("targets", nargs="*", help="owner/repo, bare repo name (org scope) or namespace/project")
     p.add_argument("--file", type=Path, help="read targets from a file, one per line")
-    p.add_argument("--scope", choices=["user", "org"], default="user", help="GitHub only")
+    p.add_argument("--scope", choices=["auto", "user", "org"], default="auto",
+                   help="GitHub only. auto: owner/repo targets, personal vs org decided by owner")
     p.add_argument("--org", default="", help="GitHub organization (with --scope org)")
     p.add_argument("--token", default="", help="PAT; default: from .env")
     p.add_argument("--api-base", default="", help="GitHub Enterprise / self-hosted GitLab base URL")

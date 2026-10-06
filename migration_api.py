@@ -326,6 +326,27 @@ class GitHubMigration:
             if r.get("name")
         ]
 
+    def list_all_repos(self, cap: int = 2000) -> List[dict]:
+        """Personal repos plus every org repo the token can reach, as owner/repo.
+
+        One call covers both because `organization_member` adds the orgs'
+        repos to what the user owns or collaborates on.
+        """
+        url = (f"{self.api_base}/user/repos"
+               "?affiliation=owner,collaborator,organization_member&sort=updated")
+        return [
+            {
+                "target": r.get("full_name"),
+                "label": r.get("full_name"),
+                "private": bool(r.get("private")),
+                "archived": bool(r.get("archived")),
+                "size_kb": r.get("size") or 0,
+                "updated": (r.get("pushed_at") or r.get("updated_at") or "")[:10],
+            }
+            for r in paged(url, headers=self._headers, cap=cap)
+            if r.get("full_name")
+        ]
+
     # -- step 2 ------------------------------------------------------------
     def start(self, repos: Iterable[str]) -> str:
         names = [self.normalise(r) for r in repos if r.strip()]

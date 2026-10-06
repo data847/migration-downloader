@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -47,6 +47,17 @@ PROVIDERS = {"github", "gitlab", "bitbucket", "bitbucket-dc"}
 load_env()
 
 
+def _owner_repo(target: str) -> str:
+    """owner/repo from a URL, .git name or plain pair; auto scope needs the owner."""
+    path = urlparse(target).path if target.startswith(("http://", "https://")) else target
+    path = path.strip().strip("/")
+    path = path[:-4] if path.endswith(".git") else path
+    if path.count("/") != 1 or not all(path.split("/")):
+        raise MigrationError(
+            f"'{target}' should be owner/repo (the owner tells personal repos from an org's)")
+    return path
+
+
 def _split(raw) -> List[str]:
     return [t.strip() for chunk in str(raw or "").splitlines() for t in chunk.split(",") if t.strip()]
 
@@ -54,7 +65,7 @@ def _split(raw) -> List[str]:
 @dataclass
 class JobSpec:
     provider: str = "github"          # github | gitlab
-    scope: str = "user"               # github only: user | org
+    scope: str = "auto"               # github only: auto | user | org
     org: str = ""                     # github org scope
     targets: List[str] = field(default_factory=list)
     token: str = ""                   # blank -> from .env
@@ -94,7 +105,7 @@ class JobSpec:
         targets = [t.strip() for chunk in raw.splitlines() for t in chunk.split(",") if t.strip()]
         return cls(
             provider=(data.get("provider") or "github").strip().lower(),
-            scope=(data.get("scope") or "user").strip().lower(),
+            scope=(data.get("scope") or "auto").strip().lower(),
             org=(data.get("org") or "").strip(),
             targets=targets,
             token=(data.get("token") or "").strip(),
@@ -143,8 +154,14 @@ class JobSpec:
         cancel_only = self.provider == "bitbucket-dc" and self.dc_action == "cancel"
         if not self.targets and not cancel_only:
             raise MigrationError("give at least one repository / project")
-        if self.provider == "github" and self.scope == "org" and not self.org:
-            raise MigrationError("an organization name is required for org scope")
+        if self.provider == "github":
+            if self.scope not in {"auto", "user", "org"}:
+                raise MigrationError("scope must be auto, user or org")
+            if self.scope == "org" and not self.org:
+                raise MigrationError("an organization name is required for org scope")
+            if self.scope == "auto":
+                for target in self.targets:
+                    _owner_repo(target)     # every target must say who owns it
         if self.provider == "bitbucket" and not self.extras:
             raise MigrationError("Bitbucket Cloud has no export archive; pass extras (e.g. all, pullrequests)")
         if self.provider == "bitbucket-dc":
@@ -272,7 +289,44 @@ def _github_client(spec: JobSpec, token: str, log) -> GitHubMigration:
     )
 
 
+def _github_groups(spec, token, log) -> list:
+    """[(scope, org, targets)]. `auto` sends the token owner's repos through the
+    user migration API and each other owner's through that org's."""
+    if spec.scope != "auto":
+        return [(spec.scope, spec.org, spec.targets)]
+    login = _github_login(spec, token, log)
+    personal: List[str] = []
+    by_org: dict = {}
+    for target in spec.targets:
+        owner = _owner_repo(target).split("/")[0]
+        if owner.lower() == login.lower():
+            personal.append(target)
+        else:
+            by_org.setdefault(owner, []).append(target)
+    groups = [("user", "", personal)] if personal else []
+    groups += [("org", owner, targets) for owner, targets in by_org.items()]
+    log(f"owners     : {login} (personal)" + "".join(f", {o} (org)" for o in by_org))
+    return groups
+
+
+def _github_login(spec, token, log) -> str:
+    try:
+        return _github_client(replace(spec, scope="user"), token, log).whoami()
+    except MigrationError as exc:
+        raise MigrationError(
+            "cannot tell personal repos from org repos: token check failed "
+            f"({str(exc).splitlines()[0]})") from None
+
+
 def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+    results: List[ArchiveResult] = []
+    for scope, org, targets in _github_groups(spec, token, log):
+        group = replace(spec, scope=scope, org=org, targets=targets)
+        results += _run_github_scope(group, token, dest_dir, log, cancelled)
+    return results
+
+
+def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
     client = _github_client(spec, token, log)
     try:
         log(f"authenticated as {client.whoami()}")
@@ -427,7 +481,7 @@ def _run_bitbucket_dc(spec, token, dest_dir, log, cancelled) -> List[dict]:
 def _extras_context(spec, token, log):
     """(headers, api_base, target normaliser) for the provider's collectors."""
     if spec.provider == "github":
-        client = _github_client(spec, token, log)
+        client = _github_client(replace(spec, scope="user") if spec.scope == "auto" else spec, token, log)
         return client._headers, client.api_base, client.normalise
     if spec.provider == "gitlab":
         client = GitLabExport(token, api_base=spec.api_base or "https://gitlab.com", log=log)
@@ -443,11 +497,29 @@ def _extras_context(spec, token, log):
             lambda t: t.strip().strip("/"))
 
 
+def _extras_org(spec, target: str, login: str) -> str:
+    """The org owning a GitHub target (so org-level extras use org endpoints), else ''."""
+    if spec.provider != "github":
+        return ""
+    if spec.scope == "org":
+        return spec.org
+    if spec.scope == "auto" and login:
+        owner = target.split("/")[0]
+        return "" if owner.lower() == login.lower() else owner
+    return ""
+
+
 def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
     names = resolve_names(spec.provider, spec.extras)
     headers, api_base, normalise = _extras_context(spec, token, log)
     shared: dict = {}
     records: List[dict] = []
+    login = ""
+    if spec.provider == "github" and spec.scope == "auto":
+        try:
+            login = _github_login(spec, token, log)
+        except MigrationError as exc:
+            log(f"warning: {exc}; owner-level extras will be queried as a user")
     log("")
     log(f"extras: {', '.join(names)}")
     for target in spec.targets:
@@ -457,7 +529,7 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
         out.mkdir(parents=True, exist_ok=True)
         ctx = Ctx(provider=spec.provider, target=target, token=token, api_base=api_base,
                   headers=headers, out=out, log=log,
-                  org=spec.org if spec.provider == "github" and spec.scope == "org" else "",
+                  org=_extras_org(spec, target, login),
                   scope=spec.scope, max_items=spec.max_items, shared=shared, cancelled=cancelled)
         for name in names:
             record = {"target": target, "extra": name, "files": [], "error": ""}
