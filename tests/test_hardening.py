@@ -728,3 +728,9 @@ class TestWeb:
             assert needle in html
         assert "<button type=\"button\" class=\"secret\"" in html
         assert "SAML SSO" in html
+
+    def test_extras_card_is_one_row_per_repo_with_ok_and_failed_counts(self, client):
+        html = client.get("/").get_data(as_text=True)
+        assert "<th>Repository</th><th>Files</th><th>Result</th>" in html
+        assert "function groupExtras(" in html and "${failed} failed" in html
+        assert "reasonOf(" in html and "pill-btn bad" in html

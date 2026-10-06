@@ -170,7 +170,7 @@
   /* the word "download" in the header opens the options dialog; nothing hints at it */
   button.secret{all:unset;cursor:text;color:inherit}
   button.secret:focus-visible{outline:1px dashed var(--muted);outline-offset:3px;cursor:pointer}
-  .pill-btn{background:transparent;cursor:pointer;font:inherit;font-family:var(--mono);font-size:10.5px;
+  .pill-btn{white-space:nowrap;background:transparent;cursor:pointer;font:inherit;font-family:var(--mono);font-size:10.5px;
     letter-spacing:.08em;text-transform:uppercase;padding:2px 10px;border-radius:100px;
     border:1px solid var(--warn);color:var(--warn)}
   .pill-btn:hover,.pill-btn:focus-visible{background:var(--warn);color:var(--accent-fg)}
@@ -186,6 +186,12 @@
   .issue .what{font-family:var(--mono);font-size:12px;color:var(--bad);margin-top:5px;word-break:break-word}
   .issue.limit .what{color:var(--warn)}
   .issue .why{color:var(--muted);font-size:13px;margin-top:6px}
+  .issue .code{display:inline-block;margin-right:8px;padding:0 8px;border:1px solid var(--bad);border-radius:100px;
+    color:var(--bad);font-size:11px}
+  .issue.limit .code{border-color:var(--warn);color:var(--warn)}
+  .reasons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
+  .pill-btn.bad{border-color:var(--bad);color:var(--bad)}
+  .pill-btn.bad:hover,.pill-btn.bad:focus-visible{background:var(--bad);color:var(--accent-fg)}
   .picker .more{color:var(--muted);font-size:12.5px;padding:12px 18px;text-align:center}
   .picker .sso{padding:8px 18px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
   [hidden]{display:none!important}
@@ -331,7 +337,7 @@ to whatever is in flight.</pre>
       <div class="hint" style="margin:0 0 8px">Files are on the server at
         <span class="paths" id="extras-where"></span></div>
       <div class="scroll">
-        <table><thead><tr><th>Target / collector</th><th>Result</th><th>Status</th></tr></thead>
+        <table><thead><tr><th>Repository</th><th>Files</th><th>Result</th></tr></thead>
         <tbody id="extras-results"></tbody></table>
       </div>
     </div>
@@ -537,22 +543,45 @@ function append(lines){
   log.textContent += lines.join('\n') + '\n';
   if(stick) log.scrollTop = log.scrollHeight;
 }
+/* One row per repo, however many extras ran for it: its file count and ok / failed counts.
+   The failed count is a button that lists the reasons (404, 403, ...). */
+function groupExtras(extras){
+  const by = new Map();
+  extras.forEach(e => {
+    if(!by.has(e.target)) by.set(e.target, {target: e.target, ok: 0, failed: 0, limited: 0, files: 0});
+    const g = by.get(e.target);
+    e.error ? g.failed++ : g.ok++;
+    g.files += (e.files || []).length;
+    if((e.truncated || []).length) g.limited++;
+  });
+  return [...by.values()];
+}
+function resultCell(ok, failed, limited, target, kinds){
+  const attrs = (k) => `data-target="${esc(target)}" data-kinds="${esc(k)}"`;
+  return `<span class="pill ok">${ok} ok</span> ` +
+    (failed ? `<button type="button" class="pill-btn bad" ${attrs(kinds)}>${failed} failed</button>`
+            : '<span class="pill">0 failed</span>') +
+    (limited ? ` <button type="button" class="pill-btn" ${attrs('limit')}>${limited} limited</button>` : '');
+}
 function renderExtrasResults(manifest){
   const card = $('extras-card');
   const extras = (manifest && manifest.extras) || [], jobs = (manifest && manifest.export_jobs) || [];
   if(!extras.length && !jobs.length){ card.hidden = true; return; }
   card.hidden = false;
-  const jobRows = jobs.map(j => `<tr><td class="mono">export job ${esc(j.job_id || j.action)}
-      <div style="color:var(--muted)">${esc((j.targets || []).join(', '))}</div></td>
-    <td>${esc(j.action)}${j.state ? ' · ' + esc(j.state) : ''}</td>
-    <td>${j.error ? `<span class="pill bad">${esc(j.error.slice(0, 90))}</span>`
-      : `<span class="pill ok">ok</span>`}</td></tr>`);
-  const rows = extras.map(e => `<tr><td class="mono">${esc(e.target)}
-      <div style="color:var(--muted)">${esc(e.extra)}</div></td>
-    <td>${e.files.length} file${e.files.length === 1 ? '' : 's'}</td>
-    <td>${e.error ? `<span class="pill bad">${esc(e.error.slice(0, 90))}</span>`
-      : `<span class="pill ok">ok</span>`}</td></tr>`);
+  const jobRows = jobs.map(j => {
+    const target = (j.targets || []).join(', ');
+    return `<tr><td class="mono">export job ${esc(j.job_id || j.action)}
+        <div style="color:var(--muted)">${esc(target)}</div></td>
+      <td>${esc(j.action)}${j.state ? ' · ' + esc(j.state) : ''}</td>
+      <td>${resultCell(j.error ? 0 : 1, j.error ? 1 : 0, 0, target, 'export-job')}</td></tr>`;
+  });
+  const rows = groupExtras(extras).map(g => `<tr><td class="mono">${esc(g.target)}
+      <div style="color:var(--muted)">${plural(g.ok + g.failed, 'extra')}</div></td>
+    <td>${plural(g.files, 'file')}</td>
+    <td>${resultCell(g.ok, g.failed, g.limited, g.target, 'extra')}</td></tr>`);
   $('extras-results').innerHTML = jobRows.concat(rows).join('');
+  $('extras-results').querySelectorAll('[data-kinds]').forEach(b => b.onclick = () =>
+    openIssues(jobId, {target: b.dataset.target, kinds: b.dataset.kinds.split(',')}));
   const run = (manifest.output_dir || '').split('/').pop();
   $('zip2').hidden = !rows.length && !(manifest.archives || []).some(a => a.ok);
   $('zip2').href = `/api/archive-zip/${encodeURIComponent(run)}`;
@@ -722,24 +751,42 @@ fetch('/api/extras').then(r => r.json()).then(d => { EXTRAS = d.extras || {}; up
 /* ── issues: what went wrong in a run ─────────────────────────────────── */
 const ISSUE_KIND = {archive: 'Export', extra: 'Extra', 'export-job': 'Export job', limit: 'Limit reached'};
 let issueText = '';
-async function openIssues(id){
+const HTTP_NAMES = {400: 'Bad request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not found',
+  409: 'Conflict', 410: 'Gone', 422: 'Unprocessable', 429: 'Rate limited'};
+function reasonOf(issue){
+  if(issue.kind === 'limit') return 'Limit';
+  const m = /HTTP (\d{3})/.exec(issue.message || '');
+  if(m) return `${m[1]} ${HTTP_NAMES[m[1]] || (m[1] >= '500' ? 'Server error' : 'Error')}`;
+  if(/network error/i.test(issue.message || '')) return 'Network';
+  if(/timed out/i.test(issue.message || '')) return 'Timed out';
+  return 'Failed';
+}
+/* `filter` = {target, kinds}: only that repo's failures (from the results card) */
+async function openIssues(id, filter){
   $('issues-body').innerHTML = '<div class="note">loading…</div>';
   $('issues-backdrop').hidden = false;
   let job;
   try { job = await (await fetch(`/api/jobs/${encodeURIComponent(id)}`)).json(); }
   catch(e){ $('issues-body').innerHTML = `<div class="note">${esc(String(e))}</div>`; return; }
-  const list = job.issues || [];
-  $('issues-title').textContent = list.length ? plural(list.length, 'issue') : 'No issues';
+  let list = job.issues || [];
+  if(filter) list = list.filter(i => i.target === filter.target && filter.kinds.includes(i.kind));
+  const noun = filter && filter.kinds.includes('limit') ? 'limited' : filter ? 'failed' : 'issue';
+  $('issues-title').textContent = !list.length ? 'No issues'
+    : filter ? `${list.length} ${noun} · ${filter.target}` : plural(list.length, 'issue');
+  const reasons = {};
+  list.forEach(i => { const r = reasonOf(i); reasons[r] = (reasons[r] || 0) + 1; });
   const counts = {};
   list.forEach(i => { counts[i.kind] = (counts[i.kind] || 0) + 1; });
   $('issues-sub').textContent = Object.entries(counts)
     .map(([k, n]) => `${n} ${(ISSUE_KIND[k] || k).toLowerCase()}`).join(' · ');
-  $('issues-body').innerHTML = list.length ? list.map(i => `<div class="issue ${esc(i.kind)}">
-      <div class="where">${esc(i.target || (ISSUE_KIND[i.kind] || i.kind))} · ${esc(i.step)}</div>
+  const chips = list.length ? `<div class="reasons">${Object.entries(reasons).sort((a, b) => b[1] - a[1])
+    .map(([r, n]) => `<span class="pill">${n} × ${esc(r)}</span>`).join('')}</div>` : '';
+  $('issues-body').innerHTML = chips + (list.length ? list.map(i => `<div class="issue ${esc(i.kind)}">
+      <div class="where"><span class="code">${esc(reasonOf(i))}</span>${esc(i.target || (ISSUE_KIND[i.kind] || i.kind))} · ${esc(i.step)}</div>
       <div class="what">${esc(i.message)}</div>
       ${i.hint ? `<div class="why">${esc(i.hint)}</div>` : ''}</div>`).join('')
-    : '<div class="note">Nothing went wrong in this run.</div>';
-  issueText = list.map(i => `- ${i.target || i.kind} · ${i.step}: ${i.message}${i.hint ? `\n    ${i.hint}` : ''}`).join('\n');
+    : '<div class="note">Nothing went wrong here.</div>');
+  issueText = list.map(i => `- ${reasonOf(i)} · ${i.target || i.kind} · ${i.step}: ${i.message}${i.hint ? `\n    ${i.hint}` : ''}`).join('\n');
 }
 function closeIssues(){ $('issues-backdrop').hidden = true; }
 $('issues-close').onclick = closeIssues;
