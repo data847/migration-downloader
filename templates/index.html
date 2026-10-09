@@ -3,41 +3,59 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Migration Downloader</title>
+<title>Migration Downloader · LH2 AI Labs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 <style>
+  /* LH2 AI Labs look: near-monochrome, hairlines, mono eyebrows, pill buttons.
+     Tokens mirror lh2.ai (see ../../design/lh2-dashboard-design-system.md). */
   :root{
-    color-scheme:light dark;
-    --bg:#0f1115; --panel:#171a21; --panel-2:#1e222b; --line:#2a2f3a;
-    --fg:#e6e9ef; --muted:#9aa4b6; --accent:#5b9dff; --accent-fg:#fff;
-    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
-    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
-    --pad:24px;
+    color-scheme:dark light;
+    --bg:#000; --panel:#212121; --panel-2:#282828; --line:rgba(255,255,255,.16);
+    --fg:#fff; --muted:#a1a1a1; --dim:#737373;
+    --accent:#f2c14b; --accent-fg:#000; --btn:#fff; --btn-fg:#000;
+    --ok:#57c98a; --warn:#f2c14b; --bad:#ff6b6b; --glow:rgba(255,255,255,.22);
+    --disp:"Inter","Helvetica Neue",Arial,sans-serif;
+    --serif:"Instrument Serif",Georgia,serif;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --r-card:14px; --r-panel:12px; --r-input:8px;
+    --ease:cubic-bezier(.2,.7,.2,1);
+    --pad:28px;
   }
   @media (prefers-color-scheme:light){
-    :root{ --bg:#f6f7f9; --panel:#fff; --panel-2:#f0f2f5; --line:#dfe3ea;
-           --fg:#12151b; --muted:#5c6675; --accent:#1f6feb; }
+    :root{ --bg:#fff; --panel:#fff; --panel-2:#f5f5f5; --line:#e5e5e5;
+           --fg:#0a0a0a; --muted:#5c5c5c; --dim:#737373;
+           --accent:#8a5d00; --accent-fg:#fff; --btn:#0a0a0a; --btn-fg:#fff;
+           --ok:#1a7f4b; --warn:#8a5d00; --bad:#c62828; --glow:rgba(0,0,0,.18); }
   }
   *{box-sizing:border-box}
   html,body{max-width:100%;overflow-x:hidden}
   body{margin:0;background:var(--bg);color:var(--fg);
-    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    -webkit-text-size-adjust:100%}
-  header{padding:16px var(--pad);border-bottom:1px solid var(--line);
-    display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+    font:15px/1.55 var(--disp);-webkit-text-size-adjust:100%;
+    -webkit-font-smoothing:antialiased}
+  header{padding:18px var(--pad);border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap;
     position:sticky;top:0;background:var(--bg);z-index:5}
-  h1{font-size:17px;margin:0;font-weight:650}
-  header .sub{color:var(--muted);font-size:12.5px}
-  main{display:grid;grid-template-columns:minmax(320px,400px) minmax(0,1fr);
+  .brand{font-family:var(--mono);font-size:12px;font-weight:500;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--fg);padding-right:16px;
+    border-right:1px solid var(--line);white-space:nowrap}
+  h1{font-size:20px;margin:0;font-weight:500;letter-spacing:-.01em}
+  h1 em{font-family:var(--serif);font-style:italic;font-weight:400;font-size:1.15em}
+  header .sub{color:var(--muted);font-family:var(--mono);font-size:11px;
+    letter-spacing:.06em;text-transform:uppercase}
+  main{display:grid;grid-template-columns:minmax(320px,420px) minmax(0,1fr);
     align-items:start}
-  .form{padding:18px var(--pad);border-right:1px solid var(--line);
-    position:sticky;top:53px;max-height:calc(100vh - 53px);overflow-y:auto}
-  .right{padding:18px var(--pad);display:flex;flex-direction:column;gap:16px;min-width:0}
+  .form{padding:24px var(--pad);border-right:1px solid var(--line);
+    position:sticky;top:67px;max-height:calc(100vh - 67px);overflow-y:auto}
+  .right{padding:24px var(--pad);display:flex;flex-direction:column;gap:18px;min-width:0}
   @media (max-width:900px){
     :root{--pad:16px}
     main{grid-template-columns:1fr}
     .form{border-right:0;border-bottom:1px solid var(--line);position:static;
       max-height:none;overflow:visible}
     header{position:static}
+    .brand{border-right:0;padding-right:0}
     /* narrow screens scroll the table sideways instead of squeezing each
        cell into a one-character-per-line column */
     .scroll table{min-width:560px}
@@ -46,99 +64,144 @@
     pre#log{font-size:12px;max-height:44vh}
   }
   @media (max-width:420px){ .scroll table{min-width:480px} }
-  fieldset{border:0;padding:0;margin:0 0 14px;min-width:0}
-  label{display:block;font-size:11.5px;color:var(--muted);margin:0 0 5px;
-    text-transform:uppercase;letter-spacing:.05em}
-  input[type=text],input[type=password],input[type=number],textarea{
-    width:100%;background:var(--panel);color:var(--fg);border:1px solid var(--line);
-    border-radius:8px;padding:10px 11px;font:inherit;font-size:16px;min-height:42px}
+  @media (prefers-reduced-motion:reduce){ *{transition:none!important} }
+  fieldset{border:0;padding:0;margin:0 0 16px;min-width:0}
+  label{display:block;font-family:var(--mono);font-size:10.5px;color:var(--muted);
+    margin:0 0 6px;text-transform:uppercase;letter-spacing:.14em}
+  input[type=text],input[type=password],input[type=number],textarea,select{
+    width:100%;background:transparent;color:var(--fg);border:1px solid var(--line);
+    border-radius:var(--r-input);padding:10px 12px;font:inherit;font-size:16px;min-height:44px;
+    transition:border-color .2s}
+  input::placeholder,textarea::placeholder{color:var(--dim)}
   textarea{min-height:104px;font-family:var(--mono);font-size:13px;resize:vertical}
-  input:focus,textarea:focus{outline:2px solid color-mix(in srgb,var(--accent) 55%,transparent);
-    outline-offset:-1px}
+  input:focus,textarea:focus{outline:0;border-color:var(--fg);box-shadow:0 0 0 3px var(--glow)}
+  button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
   .row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 130px;min-width:0}
-  .seg{display:flex;background:var(--panel);border:1px solid var(--line);
-    border-radius:9px;padding:3px;gap:3px}
+  .seg{display:flex;border:1px solid var(--line);border-radius:100px;padding:3px;gap:3px}
   .seg button{flex:1;background:transparent;border:0;color:var(--muted);
-    padding:9px 8px;border-radius:6px;font:inherit;font-size:14px;cursor:pointer;
-    min-height:38px}
-  .seg button[aria-pressed=true]{background:var(--panel-2);color:var(--fg);
-    box-shadow:inset 0 0 0 1px var(--line)}
+    padding:9px 8px;border-radius:100px;font:inherit;font-size:14px;cursor:pointer;
+    min-height:38px;transition:all .2s}
+  .seg button:hover{color:var(--fg)}
+  .seg button[aria-pressed=true]{background:var(--btn);color:var(--btn-fg);font-weight:500}
   .check{display:flex;align-items:center;gap:9px;margin:10px 0;color:var(--fg);
-    font-size:14px;text-transform:none;letter-spacing:0;min-height:34px}
-  .check input{width:auto;min-height:0;accent-color:var(--accent);
-    width:17px;height:17px;flex:none}
+    font-family:var(--disp);font-size:14px;text-transform:none;letter-spacing:0;min-height:34px}
+  .check input{accent-color:var(--btn);width:17px;height:17px;flex:none;min-height:0}
   .hint{color:var(--muted);font-size:12.5px;margin-top:6px}
-  .hint code{background:var(--panel-2);padding:1px 4px;border-radius:4px;font-size:11.5px}
-  button.primary{width:100%;background:var(--accent);color:var(--accent-fg);border:0;
-    border-radius:9px;padding:13px;font:inherit;font-weight:600;cursor:pointer;min-height:46px}
-  button.primary:disabled{opacity:.5;cursor:default}
+  .hint code{background:var(--panel-2);padding:1px 5px;border-radius:3px;
+    font-family:var(--mono);font-size:11.5px}
+  button.primary{width:100%;background:var(--btn);color:var(--btn-fg);border:1px solid var(--btn);
+    border-radius:100px;padding:13px;font:inherit;font-weight:500;cursor:pointer;min-height:46px;
+    transition:all .2s}
+  button.primary:hover:not(:disabled){box-shadow:0 0 0 4px var(--glow)}
+  button.primary:disabled{opacity:.4;cursor:default}
   .ghost{background:transparent;color:var(--fg);border:1px solid var(--line);
-    border-radius:8px;padding:7px 11px;font:inherit;font-size:13px;cursor:pointer;
+    border-radius:100px;padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;
     min-height:34px;white-space:nowrap;text-decoration:none;display:inline-flex;
-    align-items:center;gap:6px}
-  .ghost:hover{border-color:var(--accent);color:var(--accent)}
+    align-items:center;gap:6px;transition:all .2s}
+  .ghost:hover{border-color:var(--fg)}
   .ghost.hot{border-color:var(--accent);color:var(--accent)}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+  .ghost.hot:hover{background:var(--accent);color:var(--accent-fg)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-card);
     overflow:hidden;min-width:0}
-  .card h2{margin:0;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;
-    color:var(--muted);padding:11px 14px;border-bottom:1px solid var(--line);
+  .card h2{margin:0;font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--muted);padding:14px 18px;
+    border-bottom:1px solid var(--line);
     display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
   .card h2 .acts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  pre#log{margin:0;padding:14px;font-family:var(--mono);font-size:12.5px;
+  pre#log{margin:0;padding:18px;font-family:var(--mono);font-size:12.5px;
     max-height:min(50vh,520px);overflow:auto;white-space:pre-wrap;word-break:break-word}
   .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
   table{width:100%;border-collapse:collapse;font-size:13.5px}
-  th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
-  th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;
-    white-space:nowrap}
+  th,td{text-align:left;padding:12px 18px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--muted);font-family:var(--mono);font-weight:500;font-size:10.5px;
+    text-transform:uppercase;letter-spacing:.14em;white-space:nowrap}
   td.mono{font-family:var(--mono);font-size:12px;word-break:break-all}
+  tbody tr:hover{background:var(--panel-2)}
   tr:last-child td{border-bottom:0}
-  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;
+  .pill{display:inline-block;padding:2px 10px;border-radius:100px;font-family:var(--mono);
+    font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
     border:1px solid var(--line);color:var(--muted);white-space:nowrap}
   .pill.run{color:var(--accent);border-color:var(--accent)}
   .pill.ok{color:var(--ok);border-color:var(--ok)}
   .pill.bad{color:var(--bad);border-color:var(--bad)}
   .pill.warn{color:var(--warn);border-color:var(--warn)}
-  a{color:var(--accent)}
-  .steps{display:flex;gap:6px;flex-wrap:wrap}
-  .steps span{font-size:11.5px;color:var(--muted);background:var(--panel);
-    border:1px solid var(--line);border-radius:6px;padding:4px 9px}
+  a{color:var(--fg);text-underline-offset:3px}
+  a.ghost{text-decoration:none}
+  .steps{display:flex;gap:8px;flex-wrap:wrap}
+  .steps span{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--muted);border:1px solid var(--line);border-radius:100px;padding:5px 12px}
   .paths{font-family:var(--mono);font-size:11.5px;color:var(--muted);word-break:break-all}
-  .banner{background:var(--panel-2);border:1px solid var(--warn);border-radius:10px;
-    padding:11px 14px;font-size:13.5px;display:flex;gap:12px;align-items:center;
+  .banner{background:var(--panel-2);border:1px solid var(--warn);border-radius:var(--r-panel);
+    padding:12px 16px;font-size:13.5px;display:flex;gap:12px;align-items:center;
     justify-content:space-between;flex-wrap:wrap}
-  details summary{cursor:pointer;color:var(--muted);font-size:12.5px;margin-bottom:10px;
-    min-height:30px}
+  details summary{cursor:pointer;color:var(--muted);font-family:var(--mono);font-size:11px;
+    letter-spacing:.14em;text-transform:uppercase;margin-bottom:12px;min-height:30px}
   .inline-act{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
-  .backdrop{position:fixed;inset:0;background:#0008;backdrop-filter:blur(2px);
+  .backdrop{position:fixed;inset:0;background:#000a;backdrop-filter:blur(4px);
     display:flex;align-items:center;justify-content:center;padding:16px;z-index:20}
-  .picker{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  .picker{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-card);
     width:min(640px,100%);max-height:min(80vh,700px);display:flex;flex-direction:column;
     overflow:hidden}
-  .picker header{position:static;border-bottom:1px solid var(--line);padding:13px 16px;
+  .picker header{position:static;border-bottom:1px solid var(--line);padding:14px 18px;
     display:flex;justify-content:space-between;align-items:center;gap:10px}
-  .picker header strong{font-size:14px;font-weight:600}
-  .picker .tools{padding:11px 16px;border-bottom:1px solid var(--line);
+  .picker header strong{font-size:14px;font-weight:500}
+  .picker .tools{padding:12px 18px;border-bottom:1px solid var(--line);
     display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .picker .tools input[type=text]{flex:1 1 180px}
   .picker .list{overflow-y:auto;flex:1;min-height:120px}
-  .picker .item{display:flex;gap:10px;align-items:center;padding:9px 16px;
-    border-bottom:1px solid var(--line);cursor:pointer;font-size:13.5px}
+  .picker .item{display:flex;gap:10px;align-items:center;padding:10px 18px;
+    border-bottom:1px solid var(--line);cursor:pointer;font-size:13.5px;
+    font-family:var(--disp);text-transform:none;letter-spacing:0;color:var(--fg);margin:0}
   .picker .item:hover{background:var(--panel-2)}
-  .picker .item input{width:17px;height:17px;flex:none;accent-color:var(--accent);min-height:0}
+  .picker .item input{width:17px;height:17px;flex:none;accent-color:var(--btn);min-height:0}
   .picker .item .name{font-family:var(--mono);font-size:12.5px;word-break:break-all;flex:1}
   .picker .item .meta{color:var(--muted);font-size:11.5px;white-space:nowrap}
-  .picker footer{padding:11px 16px;border-top:1px solid var(--line);display:flex;
+  .picker .grp-head{background:var(--panel-2);position:sticky;top:0;z-index:1;font-weight:600}
+  .picker .grp-head .name{font-weight:600}
+  .picker .tog{background:transparent;border:0;color:var(--muted);cursor:pointer;font:inherit;
+    font-size:13px;width:22px;height:22px;padding:0;flex:none;border-radius:5px;transition:transform .12s}
+  .picker .tog:hover{color:var(--accent)}
+  .picker .tog[aria-expanded=true]{transform:rotate(90deg)}
+  .picker .grp-body .item{padding-left:52px}
+  .picker footer{padding:12px 18px;border-top:1px solid var(--line);display:flex;
     justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-  .picker .note{color:var(--muted);font-size:12.5px;padding:14px 16px}
+  .picker .note{color:var(--muted);font-size:12.5px;padding:14px 18px}
   @media (max-width:520px){ .picker{max-height:92vh} .picker .item .meta{display:none} }
+  /* the word "download" in the header opens the options dialog; nothing hints at it */
+  button.secret{all:unset;cursor:text;color:inherit}
+  button.secret:focus-visible{outline:1px dashed var(--muted);outline-offset:3px;cursor:pointer}
+  .pill-btn{white-space:nowrap;background:transparent;cursor:pointer;font:inherit;font-family:var(--mono);font-size:10.5px;
+    letter-spacing:.08em;text-transform:uppercase;padding:2px 10px;border-radius:100px;
+    border:1px solid var(--warn);color:var(--warn)}
+  .pill-btn:hover,.pill-btn:focus-visible{background:var(--warn);color:var(--accent-fg)}
+  .dlg .body{overflow-y:auto;flex:1;min-height:120px;padding:6px 18px 14px}
+  .dlg h4{margin:14px 0 4px;font-family:var(--mono);font-size:10.5px;font-weight:500;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.14em}
+  .dlg .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));column-gap:12px}
+  .dlg .grid .check{margin:3px 0;font-family:var(--mono);font-size:12.5px}
+  .dlg .row-opt{display:flex;gap:12px;align-items:center;margin:16px 0 4px}
+  .dlg .row-opt input{width:110px;min-height:38px}
+  .issue{border:1px solid var(--line);border-radius:var(--r-panel);padding:11px 14px;margin:10px 0}
+  .issue .where{font-family:var(--mono);font-size:12px;color:var(--fg);word-break:break-all}
+  .issue .what{font-family:var(--mono);font-size:12px;color:var(--bad);margin-top:5px;word-break:break-word}
+  .issue.limit .what{color:var(--warn)}
+  .issue .why{color:var(--muted);font-size:13px;margin-top:6px}
+  .issue .code{display:inline-block;margin-right:8px;padding:0 8px;border:1px solid var(--bad);border-radius:100px;
+    color:var(--bad);font-size:11px}
+  .issue.limit .code{border-color:var(--warn);color:var(--warn)}
+  .reasons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
+  .pill-btn.bad{border-color:var(--bad);color:var(--bad)}
+  .pill-btn.bad:hover,.pill-btn.bad:focus-visible{background:var(--bad);color:var(--accent-fg)}
+  .picker .more{color:var(--muted);font-size:12.5px;padding:12px 18px;text-align:center}
+  .picker .sso{padding:8px 18px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
   [hidden]{display:none!important}
 </style>
 </head>
 <body>
 <header>
-  <h1>Migration Downloader</h1>
-  <span class="sub">GitHub Migration API &amp; GitLab Export API — initiate, poll, download</span>
+  <span class="brand">LH2 AI Labs</span>
+  <h1>Migration <em>Downloader</em></h1>
+  <span class="sub">GitHub Migration API &amp; GitLab Export API · initiate · poll · <button type="button" class="secret" id="opts-open" aria-haspopup="dialog">download</button></span>
 </header>
 
 <main>
@@ -146,11 +209,12 @@
     <div class="seg" role="group" aria-label="Provider">
       <button type="button" data-provider="github" aria-pressed="true">GitHub</button>
       <button type="button" data-provider="gitlab" aria-pressed="false">GitLab</button>
+      <button type="button" data-provider="bitbucket" aria-pressed="false">Bitbucket</button>
     </div>
 
     <fieldset style="margin-top:14px">
-      <label>Host</label>
-      <div class="seg" role="group" aria-label="Host">
+      <label id="host-label">Host</label>
+      <div class="seg" role="group" aria-label="Host" id="host-seg">
         <button type="button" data-host="cloud" aria-pressed="true" id="host-cloud">github.com</button>
         <button type="button" data-host="self" aria-pressed="false" id="host-self">Self-hosted</button>
       </div>
@@ -161,28 +225,10 @@
     </fieldset>
 
     <fieldset>
-      <label for="token">Personal access token</label>
+      <label for="token" id="token-label">Personal access token</label>
       <input type="password" id="token" placeholder="paste PAT, or leave blank to use .env">
       <div class="hint" id="token-hint"></div>
     </fieldset>
-
-    <div data-only="github">
-      <fieldset>
-        <label>Repository owner type</label>
-        <div class="seg" role="group" aria-label="Scope">
-          <button type="button" data-scope="user" aria-pressed="true">User repos</button>
-          <button type="button" data-scope="org" aria-pressed="false">Org repos</button>
-        </div>
-        <div class="hint" id="scope-hint"></div>
-      </fieldset>
-      <fieldset data-only="org" hidden>
-        <label for="org">Organization</label>
-        <input type="text" id="org" placeholder="TEST_ORG">
-        <div class="inline-act">
-          <button class="ghost" type="button" id="pick-owner">Browse orgs the token can see</button>
-        </div>
-      </fieldset>
-    </div>
 
     <fieldset>
       <label for="targets" id="targets-label">Repositories (one per line)</label>
@@ -192,6 +238,19 @@
         <button class="ghost" type="button" id="clear-targets">Clear</button>
       </div>
       <div class="hint" id="targets-hint"></div>
+    </fieldset>
+
+    <fieldset data-only="bitbucket-dc">
+      <label for="dc_action">Export job</label>
+      <select id="dc_action">
+        <option value="export">Start export and monitor it</option>
+        <option value="preview">Preview only (nothing is exported)</option>
+        <option value="cancel">Cancel a running job…</option>
+        <option value="none">No export job (extras only)</option>
+      </select>
+      <input type="text" id="dc_job_id" placeholder="job id to cancel" hidden style="margin-top:8px">
+      <div class="hint">The export <code>.tar</code> is written on the Bitbucket server
+        (<code>$BITBUCKET_SHARED_HOME/data/migration/export/</code>); it cannot be downloaded here.</div>
     </fieldset>
 
     <fieldset data-only="gitlab">
@@ -231,7 +290,9 @@
 
     <button class="primary" id="go" type="submit">Start migration &amp; download</button>
     <div class="hint" style="margin-top:12px">
-      Archives are written to<br><span class="paths">{{ outputs_dir }}</span>
+      <span id="extras-note">Each run also collects everything the archive omits (wikis, CI history,
+      hooks, alerts, packages and so on) under</span> <code>extras/</code>.
+      Output is written to<br><span class="paths">{{ outputs_dir }}</span>
     </div>
   </form>
 
@@ -267,10 +328,24 @@ Runs survive a page reload and a server restart — this page re-attaches
 to whatever is in flight.</pre>
     </div>
 
+    <div class="card" id="extras-card" hidden>
+      <h2>Extras &amp; export jobs
+        <span class="acts">
+          <a class="ghost hot" id="zip2" href="#" hidden>⬇ Download everything (.zip)</a>
+        </span>
+      </h2>
+      <div class="hint" style="margin:0 0 8px">Files are on the server at
+        <span class="paths" id="extras-where"></span></div>
+      <div class="scroll">
+        <table><thead><tr><th>Repository</th><th>Files</th><th>Result</th></tr></thead>
+        <tbody id="extras-results"></tbody></table>
+      </div>
+    </div>
+
     <div class="card" id="results-card" hidden>
       <h2>Archives
         <span class="acts">
-          <a class="ghost hot" id="zip" href="#" hidden>⬇ Download all (.zip)</a>
+          <a class="ghost hot" id="zip" href="#" hidden>⬇ Download everything (.zip)</a>
         </span>
       </h2>
       <div class="scroll">
@@ -311,6 +386,8 @@ to whatever is in flight.</pre>
       <span class="pill" id="picker-count">0</span>
     </div>
     <div class="list" id="picker-list"></div>
+    <div class="sso" id="picker-sso" hidden>Organizations that enforce SAML SSO only appear once this token
+      is authorized for them (GitHub → Settings → Developer settings → Tokens → Configure SSO).</div>
     <footer>
       <span class="hint" id="picker-note" style="margin:0"></span>
       <button class="primary" type="button" id="picker-add"
@@ -319,40 +396,99 @@ to whatever is in flight.</pre>
   </div>
 </div>
 
+<div class="backdrop" id="opts-backdrop" hidden>
+  <div class="picker dlg" role="dialog" aria-modal="true" aria-labelledby="opts-title">
+    <header>
+      <strong id="opts-title">Download options</strong>
+      <button class="ghost" type="button" id="opts-close">Done</button>
+    </header>
+    <div class="tools">
+      <button class="ghost" type="button" id="opts-all">Everything</button>
+      <button class="ghost" type="button" id="opts-light">Light only</button>
+      <button class="ghost" type="button" id="opts-none">None</button>
+      <span class="pill" id="opts-count">0</span>
+    </div>
+    <div class="body">
+      <div class="hint" style="margin:8px 0 0">Besides the archive, each run collects these read-only extras
+        and saves them under <code>extras/</code>. Untick what you do not want.</div>
+      <div id="opts-list"></div>
+      <div class="row-opt">
+        <label for="opt-max" style="margin:0">Max items per listing</label>
+        <input type="number" id="opt-max" min="0" step="50">
+        <span class="hint" style="margin:0">0 = no limit</span>
+      </div>
+    </div>
+    <footer>
+      <span class="hint" id="opts-note" style="margin:0">Heavy ones pull wikis and CI logs and can be large.</span>
+    </footer>
+  </div>
+</div>
+
+<div class="backdrop" id="issues-backdrop" hidden>
+  <div class="picker dlg" role="dialog" aria-modal="true" aria-labelledby="issues-title">
+    <header>
+      <strong id="issues-title">Issues</strong>
+      <button class="ghost" type="button" id="issues-close">Close</button>
+    </header>
+    <div class="body" id="issues-body"></div>
+    <footer>
+      <span class="hint" id="issues-sub" style="margin:0"></span>
+      <button class="ghost" type="button" id="issues-copy">Copy summary</button>
+    </footer>
+  </div>
+</div>
+
 <script>
-const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }} };
+const ENV = { github: {{ github_env|tojson }}, gitlab: {{ gitlab_env|tojson }},
+  bitbucket: {{ bitbucket_env|tojson }}, 'bitbucket-dc': {{ bitbucket_dc_env|tojson }} };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const KEY = 'md.jobId';
-let provider = 'github', scope = 'user', host = 'cloud';
+let provider = 'github', host = 'cloud';
 let jobId = null, since = 0, timer = null;
 let pickerMode = 'repos', pickerItems = [];
+let pickerSel = new Set(), pickerOpen = new Set();   // ticked repos / expanded owners
+let pickerPage = 0, pickerMore = false, pickerLoading = false, pickerGen = 0, pickerError = '';
+let pickerNotes = new Set();
 
 /* ── form wiring ─────────────────────────────────────────────────────── */
 function syncVisibility(){
   document.querySelectorAll('[data-only]').forEach(el => {
     const key = el.dataset.only;
-    el.hidden = !(key === provider || (key === 'org' && provider === 'github' && scope === 'org'));
+    el.hidden = key !== provider;
   });
   const gh = provider === 'github';
-  $('targets-label').textContent = gh
-    ? (scope === 'org' ? 'Repositories (bare names, one per line)' : 'Repositories (owner/repo, one per line)')
+  const bb = provider === 'bitbucket', dc = provider === 'bitbucket-dc';
+  const bbAny = bb || dc;
+  $('targets-label').textContent = dc ? 'Repositories (PROJECT_KEY/repo-slug, one per line)'
+    : bb ? 'Repositories (workspace/repo, one per line)'
+    : gh ? 'Repositories (owner/repo, one per line — personal and org repos can be mixed)'
     : 'Projects (namespace/project, one per line)';
-  $('targets').placeholder = gh ? (scope === 'org' ? 'guava' : 'google/guava') : 'group/subgroup/project';
+  $('targets').placeholder = dc ? 'PROJ/my-repo' : bb ? 'my-workspace/my-repo'
+    : gh ? 'google/guava' : 'group/subgroup/project';
   $('api_base').placeholder = gh ? 'https://api.github.com' : 'https://gitlab.com';
-  $('scope-hint').innerHTML = scope === 'org'
-    ? 'PAT needs <code>repo</code> + <code>admin:org</code>; you must be an Owner or hold the Migrator role.'
-    : 'PAT needs <code>repo</code> + <code>user</code>.';
-  $('targets-hint').innerHTML = gh
-    ? 'Full URLs and <code>.git</code> suffixes are accepted.'
+  // Bitbucket has no repo/owner browser here
+  $('pick-repos').hidden = bbAny;
+  $('token-label').textContent = bbAny ? 'API / access token' : 'Personal access token';
+  $('go').textContent = bb ? 'Collect repo data' : dc ? 'Run export & download' : 'Start migration & download';
+  $('dc_job_id').hidden = $('dc_action').value !== 'cancel';
+  $('targets-hint').innerHTML = dc
+    ? 'Needs a system-admin token. Starts the server-side export job and also saves a per-repo zip.'
+    : bb
+    ? 'Bitbucket Cloud has no export archive, so this collects repo data over the API instead. Use a user API token (<code>email:token</code> or a bare access token) with the scopes listed in the README.'
+    : gh
+    ? 'Your own repos and any org\'s repos in one list; the owner decides which migration API is used. PAT needs <code>repo</code> + <code>user</code>, plus <code>admin:org</code> and an Owner or Migrator role for org repos. Full URLs and <code>.git</code> suffixes are accepted.'
     : 'PAT needs <code>api</code> + <code>write_repository</code>. Numeric project IDs and nested subgroups work.';
   const gh2 = provider === 'github';
-  $('host-cloud').textContent = gh2 ? 'github.com' : 'gitlab.com';
-  $('host-self').textContent = gh2 ? 'GitHub Enterprise' : 'Self-hosted GitLab';
+  $('host-cloud').textContent = gh2 ? 'github.com' : bbAny ? 'bitbucket.org' : 'gitlab.com';
+  $('host-self').textContent = gh2 ? 'GitHub Enterprise' : bbAny ? 'Data Center (self-hosted)' : 'Self-hosted GitLab';
   $('host-wrap').hidden = host !== 'self';
-  $('api_base').placeholder = gh2 ? 'https://github.example.com/api/v3' : 'https://gitlab.example.com';
-  $('host-hint').innerHTML = gh2
+  $('api_base').placeholder = dc ? 'https://bitbucket.example.com'
+    : gh2 ? 'https://github.example.com/api/v3' : 'https://gitlab.example.com';
+  $('host-hint').innerHTML = dc
+    ? 'Server root, no <code>/rest/api</code> — that is appended for you.'
+    : gh2
     ? 'Enterprise API root — usually <code>https://&lt;host&gt;/api/v3</code>.'
     : 'Instance root, no <code>/api/v4</code> — that is appended for you.';
   $('pick-repos').textContent = gh2 ? 'Browse & select repos…' : 'Browse & select projects…';
@@ -360,26 +496,44 @@ function syncVisibility(){
   $('token-hint').innerHTML = env
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
     : `No ${provider} token found in <code>{{ env_file }}</code>; paste one above.`;
+  updateExtrasNote();
 }
+$('dc_action').onchange = syncVisibility;
+
+/* Bitbucket is one button; the host picks the backend provider, like github.com vs
+   Enterprise: bitbucket.org -> Cloud ('bitbucket'), self-hosted -> 'bitbucket-dc'. */
+const bitbucketProvider = () => host === 'self' ? 'bitbucket-dc' : 'bitbucket';
 document.querySelectorAll('[data-provider]').forEach(b => b.onclick = () => {
-  provider = b.dataset.provider;
+  provider = b.dataset.provider === 'bitbucket' ? bitbucketProvider() : b.dataset.provider;
   document.querySelectorAll('[data-provider]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   syncVisibility();
 });
 document.querySelectorAll('[data-host]').forEach(b => b.onclick = () => {
   host = b.dataset.host;
+  if(provider.startsWith('bitbucket')) provider = bitbucketProvider();
   document.querySelectorAll('[data-host]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   if(host === 'cloud') $('api_base').value = '';
   syncVisibility();
 });
-document.querySelectorAll('[data-scope]').forEach(b => b.onclick = () => {
-  scope = b.dataset.scope;
-  document.querySelectorAll('[data-scope]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
-  syncVisibility();
-});
 
 /* ── log + results ───────────────────────────────────────────────────── */
-function setState(text, cls){ const el = $('state'); el.textContent = text; el.className = 'pill ' + (cls || ''); }
+function setState(text, cls, onClick){
+  const el = $('state');
+  el.textContent = text;
+  el.className = 'pill ' + (cls || '');
+  el.onclick = onClick || null;
+  if(onClick){ el.className = 'pill-btn'; el.setAttribute('role', 'button'); el.tabIndex = 0;
+    el.onkeydown = (e) => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); onClick(); } }; }
+  else { el.removeAttribute('role'); el.removeAttribute('tabindex'); el.onkeydown = null; }
+}
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+function stateFor(job){
+  const issues = (job.issues || []).length;
+  if(job.state !== 'running' && issues && (job.state === 'partial' || job.state === 'done'))
+    setState(plural(issues, 'issue'), 'warn', () => openIssues(job.id));
+  else if(job.state === 'partial') setState('issues', 'warn', () => openIssues(job.id));
+  else setState(job.state, STATE_CLS[job.state] || '');
+}
 const STATE_CLS = {running:'run', done:'ok', partial:'warn', error:'bad', cancelled:'warn', interrupted:'warn'};
 
 function append(lines){
@@ -389,7 +543,52 @@ function append(lines){
   log.textContent += lines.join('\n') + '\n';
   if(stick) log.scrollTop = log.scrollHeight;
 }
+/* One row per repo, however many extras ran for it: its file count and ok / failed counts.
+   The failed count is a button that lists the reasons (404, 403, ...). */
+function groupExtras(extras){
+  const by = new Map();
+  extras.forEach(e => {
+    if(!by.has(e.target)) by.set(e.target, {target: e.target, ok: 0, failed: 0, limited: 0, files: 0});
+    const g = by.get(e.target);
+    e.error ? g.failed++ : g.ok++;
+    g.files += (e.files || []).length;
+    if((e.truncated || []).length) g.limited++;
+  });
+  return [...by.values()];
+}
+function resultCell(ok, failed, limited, target, kinds){
+  const attrs = (k) => `data-target="${esc(target)}" data-kinds="${esc(k)}"`;
+  return `<span class="pill ok">${ok} ok</span> ` +
+    (failed ? `<button type="button" class="pill-btn bad" ${attrs(kinds)}>${failed} failed</button>`
+            : '<span class="pill">0 failed</span>') +
+    (limited ? ` <button type="button" class="pill-btn" ${attrs('limit')}>${limited} limited</button>` : '');
+}
+function renderExtrasResults(manifest){
+  const card = $('extras-card');
+  const extras = (manifest && manifest.extras) || [], jobs = (manifest && manifest.export_jobs) || [];
+  if(!extras.length && !jobs.length){ card.hidden = true; return; }
+  card.hidden = false;
+  const jobRows = jobs.map(j => {
+    const target = (j.targets || []).join(', ');
+    return `<tr><td class="mono">export job ${esc(j.job_id || j.action)}
+        <div style="color:var(--muted)">${esc(target)}</div></td>
+      <td>${esc(j.action)}${j.state ? ' · ' + esc(j.state) : ''}</td>
+      <td>${resultCell(j.error ? 0 : 1, j.error ? 1 : 0, 0, target, 'export-job')}</td></tr>`;
+  });
+  const rows = groupExtras(extras).map(g => `<tr><td class="mono">${esc(g.target)}
+      <div style="color:var(--muted)">${plural(g.ok + g.failed, 'extra')}</div></td>
+    <td>${plural(g.files, 'file')}</td>
+    <td>${resultCell(g.ok, g.failed, g.limited, g.target, 'extra')}</td></tr>`);
+  $('extras-results').innerHTML = jobRows.concat(rows).join('');
+  $('extras-results').querySelectorAll('[data-kinds]').forEach(b => b.onclick = () =>
+    openIssues(jobId, {target: b.dataset.target, kinds: b.dataset.kinds.split(',')}));
+  const run = (manifest.output_dir || '').split('/').pop();
+  $('zip2').hidden = !rows.length && !(manifest.archives || []).some(a => a.ok);
+  $('zip2').href = `/api/archive-zip/${encodeURIComponent(run)}`;
+  $('extras-where').textContent = (manifest.output_dir || '') + '/extras/';
+}
 function renderResults(manifest){
+  renderExtrasResults(manifest);
   const card = $('results-card');
   if(!manifest || !manifest.archives || !manifest.archives.length){ card.hidden = true; return; }
   const run = (manifest.output_dir || '').split('/').pop();
@@ -428,7 +627,7 @@ async function poll(){
   append(job.lines); since = job.total_lines;
   const running = job.state === 'running';
   $('log-title').textContent = `Run log · ${job.created_utc.replace('T',' ').slice(0,19)}Z`;
-  setState(job.state, STATE_CLS[job.state] || '');
+  stateFor(job);
   $('cancel').hidden = !running;
   $('dl-log').hidden = false;
   $('dl-log').href = `/api/jobs/${job.id}/log`;
@@ -445,7 +644,7 @@ function banner(job){
     $('banner').hidden = false;
     $('banner-text').textContent = job.state === 'interrupted'
       ? 'This run was cut off by a server restart — its archive is still building remotely.'
-      : `${job.state}: some targets did not finish.`;
+      : `${plural((job.issues || []).length || 1, 'issue')}: some targets did not finish.`;
     $('resume').dataset.job = job.id;
   } else $('banner').hidden = true;
 }
@@ -464,17 +663,19 @@ $('refresh').onclick = () => { loadJobs(); loadRuns(); };
 
 $('form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const payload = { provider, scope,
-    org: $('org').value, token: $('token').value, targets: $('targets').value,
+  const payload = { provider, scope: 'auto',
+    token: $('token').value, targets: $('targets').value,
     poll_interval: $('poll').value, timeout: $('timeout').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
+    dc_action: $('dc_action').value, dc_job_id: $('dc_job_id').value.trim(),
     api_version: $('api_version').value,
     run_name: $('run_name').value,
+    extras: selectedExtras(), max_items: maxItems,
     lock_repositories: $('lock_repositories').checked,
     single_archive: $('single_archive').checked,
     verify_checksum: $('verify_checksum').checked };
   $('go').disabled = true; $('banner').hidden = true;
-  $('log').textContent = ''; $('results-card').hidden = true; since = 0;
+  $('log').textContent = ''; $('results-card').hidden = true; $('extras-card').hidden = true; since = 0;
   setState('starting', 'run');
   const res = await fetch('/api/jobs', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
@@ -483,99 +684,297 @@ $('form').onsubmit = async (ev) => {
   attach(data.id);
 };
 
+/* ── download options: opened by the word "download" in the header ───── */
+let EXTRAS = {};
+const optSel = {};                  // provider -> Set of ticked extras (absent = everything)
+let maxItems = 0;                 // 0 = no limit
+const OPT_KEY = 'md.opts.v2';   // v2: the item limit now defaults to 0 (none); v1 saved 200
+try {
+  const saved = JSON.parse(localStorage.getItem(OPT_KEY) || '{}');
+  if(Number.isInteger(saved.maxItems) && saved.maxItems >= 0) maxItems = saved.maxItems;
+  Object.entries(saved.sel || {}).forEach(([p, names]) => { optSel[p] = new Set(names); });
+} catch(e){ /* storage blocked or corrupt: fall back to the defaults */ }
+function saveOpts(){
+  try { localStorage.setItem(OPT_KEY, JSON.stringify({maxItems,
+    sel: Object.fromEntries(Object.entries(optSel).map(([p, set]) => [p, [...set]]))})); } catch(e){}
+}
+function optNames(){ return EXTRAS[provider] || []; }
+function selectedExtras(){
+  const names = optNames().map(e => e.name), set = optSel[provider];
+  if(!set) return 'everything';
+  const picked = names.filter(n => set.has(n));
+  return picked.length === names.length ? 'everything' : picked.join(',');
+}
+function updateExtrasNote(){
+  const names = optNames(), set = optSel[provider];
+  const n = set ? names.filter(e => set.has(e.name)).length : names.length;
+  $('extras-note').textContent = !names.length || n === names.length
+    ? 'Each run also collects everything the archive omits (wikis, CI history, hooks, alerts, packages and so on) under'
+    : `Each run also collects ${n} of ${names.length} extras (wikis, CI history, hooks, alerts and so on) under`;
+}
+function renderOpts(){
+  const names = optNames();
+  if(!optSel[provider]) optSel[provider] = new Set(names.map(e => e.name));
+  const set = optSel[provider];
+  const group = (title, items) => items.length ? `<h4>${title}</h4><div class="grid">${
+    items.map(e => `<label class="check"><input type="checkbox" value="${esc(e.name)}"${
+      set.has(e.name) ? ' checked' : ''}> ${esc(e.name)}</label>`).join('')}</div>` : '';
+  $('opts-list').innerHTML = names.length
+    ? group('Light', names.filter(e => !e.heavy)) + group('Heavy', names.filter(e => e.heavy))
+    : '<div class="note">Options are not available right now.</div>';
+  $('opts-list').querySelectorAll('input').forEach(cb => cb.onchange = () => {
+    cb.checked ? set.add(cb.value) : set.delete(cb.value); optCount(); });
+  $('opt-max').value = maxItems;
+  optCount();
+}
+function optCount(){
+  const names = optNames(), set = optSel[provider] || new Set();
+  $('opts-count').textContent = `${names.filter(e => set.has(e.name)).length} / ${names.length}`;
+  saveOpts(); updateExtrasNote();
+}
+function setOpts(pred){ optSel[provider] = new Set(optNames().filter(pred).map(e => e.name)); renderOpts(); }
+function openOpts(){ renderOpts(); $('opts-backdrop').hidden = false; }
+function closeOpts(){
+  const v = parseInt($('opt-max').value, 10);
+  maxItems = Number.isInteger(v) && v >= 0 ? v : 0;
+  saveOpts(); $('opts-backdrop').hidden = true;
+}
+$('opts-open').onclick = openOpts;
+$('opts-close').onclick = closeOpts;
+$('opts-backdrop').onclick = (e) => { if(e.target === $('opts-backdrop')) closeOpts(); };
+$('opts-all').onclick = () => setOpts(() => true);
+$('opts-light').onclick = () => setOpts(e => !e.heavy);
+$('opts-none').onclick = () => setOpts(() => false);
+fetch('/api/extras').then(r => r.json()).then(d => { EXTRAS = d.extras || {}; updateExtrasNote(); })
+  .catch(() => {});
+
+/* ── issues: what went wrong in a run ─────────────────────────────────── */
+const ISSUE_KIND = {archive: 'Export', extra: 'Extra', 'export-job': 'Export job', limit: 'Limit reached'};
+let issueText = '';
+const HTTP_NAMES = {400: 'Bad request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not found',
+  409: 'Conflict', 410: 'Gone', 422: 'Unprocessable', 429: 'Rate limited'};
+function reasonOf(issue){
+  if(issue.kind === 'limit') return 'Limit';
+  const m = /HTTP (\d{3})/.exec(issue.message || '');
+  if(m) return `${m[1]} ${HTTP_NAMES[m[1]] || (m[1] >= '500' ? 'Server error' : 'Error')}`;
+  if(/network error/i.test(issue.message || '')) return 'Network';
+  if(/timed out/i.test(issue.message || '')) return 'Timed out';
+  return 'Failed';
+}
+/* `filter` = {target, kinds}: only that repo's failures (from the results card) */
+async function openIssues(id, filter){
+  $('issues-body').innerHTML = '<div class="note">loading…</div>';
+  $('issues-backdrop').hidden = false;
+  let job;
+  try { job = await (await fetch(`/api/jobs/${encodeURIComponent(id)}`)).json(); }
+  catch(e){ $('issues-body').innerHTML = `<div class="note">${esc(String(e))}</div>`; return; }
+  let list = job.issues || [];
+  if(filter) list = list.filter(i => i.target === filter.target && filter.kinds.includes(i.kind));
+  const noun = filter && filter.kinds.includes('limit') ? 'limited' : filter ? 'failed' : 'issue';
+  $('issues-title').textContent = !list.length ? 'No issues'
+    : filter ? `${list.length} ${noun} · ${filter.target}` : plural(list.length, 'issue');
+  const reasons = {};
+  list.forEach(i => { const r = reasonOf(i); reasons[r] = (reasons[r] || 0) + 1; });
+  const counts = {};
+  list.forEach(i => { counts[i.kind] = (counts[i.kind] || 0) + 1; });
+  $('issues-sub').textContent = Object.entries(counts)
+    .map(([k, n]) => `${n} ${(ISSUE_KIND[k] || k).toLowerCase()}`).join(' · ');
+  const chips = list.length ? `<div class="reasons">${Object.entries(reasons).sort((a, b) => b[1] - a[1])
+    .map(([r, n]) => `<span class="pill">${n} × ${esc(r)}</span>`).join('')}</div>` : '';
+  $('issues-body').innerHTML = chips + (list.length ? list.map(i => `<div class="issue ${esc(i.kind)}">
+      <div class="where"><span class="code">${esc(reasonOf(i))}</span>${esc(i.target || (ISSUE_KIND[i.kind] || i.kind))} · ${esc(i.step)}</div>
+      <div class="what">${esc(i.message)}</div>
+      ${i.hint ? `<div class="why">${esc(i.hint)}</div>` : ''}</div>`).join('')
+    : '<div class="note">Nothing went wrong here.</div>');
+  issueText = list.map(i => `- ${reasonOf(i)} · ${i.target || i.kind} · ${i.step}: ${i.message}${i.hint ? `\n    ${i.hint}` : ''}`).join('\n');
+}
+function closeIssues(){ $('issues-backdrop').hidden = true; }
+$('issues-close').onclick = closeIssues;
+$('issues-backdrop').onclick = (e) => { if(e.target === $('issues-backdrop')) closeIssues(); };
+$('issues-copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(issueText); $('issues-copy').textContent = 'Copied'; }
+  catch(e){ $('issues-copy').textContent = 'Copy failed'; }
+  setTimeout(() => { $('issues-copy').textContent = 'Copy summary'; }, 1500);
+};
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeIssues(); if(!$('opts-backdrop').hidden) closeOpts(); } });
+
 /* ── browse / select repos, orgs and groups ──────────────────────────── */
 function discoverBody(kind){
-  return { provider, scope, kind,
+  return { provider, scope: 'auto', kind,
     token: $('token').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
-    owner: provider === 'github' ? $('org').value.trim() : $('group').value.trim() };
+    owner: provider === 'github' ? '' : $('group').value.trim() };
 }
 async function openPicker(mode){
   pickerMode = mode;
   const isOwners = mode === 'owners';
   const noun = provider === 'github'
-    ? (isOwners ? 'organizations' : (scope === 'org' ? `repositories in ${$('org').value.trim() || 'the org'}` : 'your repositories'))
+    ? (isOwners ? 'organizations' : 'repositories (yours and your orgs\')')
     : (isOwners ? 'groups' : ($('group').value.trim() ? `projects in ${$('group').value.trim()}` : 'your projects'));
   $('picker-title').textContent = `Select ${noun}`;
   $('picker-add').hidden = isOwners;
   $('picker-all').hidden = isOwners;
   $('picker-none').hidden = isOwners;
+  $('picker-sso').hidden = provider !== 'github';
   $('picker-search').value = '';
+  pickerSel = new Set(); pickerOpen = new Set();
+  pickerItems = []; pickerPage = 0; pickerMore = true; pickerLoading = false;
+  pickerNotes = new Set(); pickerError = '';
+  pickerGen += 1;
   $('picker-list').innerHTML = '<div class="note">loading…</div>';
   $('picker-note').textContent = '';
   $('backdrop').hidden = false;
-  if(provider === 'github' && scope === 'org' && !isOwners && !$('org').value.trim()){
-    $('picker-list').innerHTML = '<div class="note">Pick an organization first, or browse orgs.</div>';
-    return;
+  await loadPickerPage();
+}
+async function loadPickerPage(){
+  if(pickerLoading || !pickerMore) return;
+  pickerLoading = true;
+  const gen = pickerGen;
+  let data = null, failed = '';
+  try {
+    const res = await fetch('/api/discover', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({...discoverBody(pickerMode), page: pickerPage + 1})});
+    data = await res.json();
+    if(!res.ok) failed = data.error || 'request failed';
+  } catch(e){ failed = String(e); }
+  if(gen !== pickerGen) return;                 // closed or reopened while waiting
+  pickerLoading = false;
+  if(failed){
+    pickerMore = false; pickerError = failed;
+    if(!pickerItems.length){ $('picker-list').innerHTML = `<div class="note">${esc(failed)}</div>`; return; }
+  } else {
+    pickerPage += 1;
+    pickerMore = !!data.has_more;
+    pickerItems.push(...data.items);
+    (data.notes || []).forEach(n => pickerNotes.add(n));
+    if(!pickerItems.length){ $('picker-list').innerHTML = '<div class="note">nothing visible to this token</div>'; pickerNote(); return; }
   }
-  const res = await fetch('/api/discover', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(discoverBody(mode))});
-  const data = await res.json();
-  if(!res.ok){
-    $('picker-list').innerHTML = `<div class="note">${esc(data.error)}</div>`;
-    return;
-  }
-  pickerItems = data.items;
-  if(!pickerItems.length){
-    $('picker-list').innerHTML = '<div class="note">nothing visible to this token</div>';
-    return;
-  }
-  $('picker-note').textContent = provider === 'gitlab' && !isOwners
-    ? `${pickerItems.length} project(s) at Maintainer level or above`
-    : `${pickerItems.length} found`;
   renderPicker();
+  maybeLoadMore();
+}
+/* load more when the list is scrolled near its end, when it does not fill the box yet,
+   or while a filter is active (so a match on a later page is not hidden) */
+function maybeLoadMore(){
+  if(!pickerMore || pickerLoading || $('backdrop').hidden) return;
+  const list = $('picker-list');
+  const filtering = $('picker-search').value.trim() !== '';
+  if(filtering || list.scrollHeight - list.scrollTop - list.clientHeight < 240 || list.scrollHeight <= list.clientHeight)
+    loadPickerPage();
+}
+function pickerNote(){
+  const parts = [`${pickerItems.length} loaded`, pickerMore ? 'scroll for more' : 'all loaded'];
+  if(pickerError) parts.push(pickerError);
+  $('picker-note').textContent = parts.join(' · ');
+  const warn = [...pickerNotes];
+  if(warn.length){ $('picker-sso').hidden = false; $('picker-sso').textContent = warn.join(' '); }
 }
 function renderPicker(){
+  const keep = $('picker-list').scrollTop;
+  renderPickerRows();
+  $('picker-list').scrollTop = keep;            // new pages arrive without jumping to the top
+  if(pickerMore || pickerLoading)
+    $('picker-list').insertAdjacentHTML('beforeend', '<div class="more">loading more…</div>');
+  pickerNote();
+}
+function renderPickerRows(){
   const q = $('picker-search').value.trim().toLowerCase();
   const isOwners = pickerMode === 'owners';
   const shown = pickerItems.filter(i =>
     !q || (i.label || i.name || '').toLowerCase().includes(q));
-  $('picker-list').innerHTML = shown.length ? shown.map((i, n) => {
-    const key = isOwners ? i.name : i.target;
+  if(!shown.length){
+    $('picker-list').innerHTML = '<div class="note">nothing matches that filter</div>';
+    updateCount();
+    return;
+  }
+  if(isOwners){
+    $('picker-list').innerHTML = shown.map(i => `<label class="item">
+      <span class="name">${esc(i.label || i.name)}</span>${esc(i.description || '').slice(0,60)}</label>`).join('');
+    $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
+      $('group').value = shown[n].name;
+      closePicker();
+      openPicker('repos');
+    });
+    updateCount();
+    return;
+  }
+  // repos: one collapsible row per owner (org, user or top-level group)
+  const groups = new Map();
+  shown.forEach(i => {
+    const owner = i.target.split('/')[0];
+    if(!groups.has(owner)) groups.set(owner, []);
+    groups.get(owner).push(i);
+  });
+  const repoRow = i => {
     const badges = [
       i.private ? '<span class="pill">private</span>' : '',
       i.archived ? '<span class="pill warn">archived</span>' : '',
     ].join(' ');
-    const meta = isOwners ? esc(i.description || '').slice(0,60)
-      : `${badges} <span class="meta">${esc(i.updated || '')}</span>`;
     return `<label class="item">
-      ${isOwners ? '' : `<input type="checkbox" value="${esc(key)}" data-i="${n}">`}
-      <span class="name">${esc(i.label || i.name)}</span>${meta}</label>`;
-  }).join('') : '<div class="note">nothing matches that filter</div>';
-  if(isOwners){
-    $('picker-list').querySelectorAll('.item').forEach((el, n) => el.onclick = () => {
-      const name = shown[n].name;
-      if(provider === 'github'){ $('org').value = name; } else { $('group').value = name; }
-      closePicker();
-      openPicker('repos');
+      <input type="checkbox" class="repo-cb" value="${esc(i.target)}"${pickerSel.has(i.target) ? ' checked' : ''}>
+      <span class="name">${esc(i.target.slice(i.target.indexOf('/') + 1))}</span>
+      ${badges} <span class="meta">${esc(i.updated || '')}</span></label>`;
+  };
+  $('picker-list').innerHTML = [...groups].map(([owner, items]) => {
+    const open = q ? true : pickerOpen.has(owner);       // a filter reveals its matches
+    return `<div class="grp" data-owner="${esc(owner)}">
+      <label class="item grp-head">
+        <input type="checkbox" class="grp-cb" aria-label="select all of ${esc(owner)}">
+        <button type="button" class="tog" aria-expanded="${open}" aria-label="show repos of ${esc(owner)}">▸</button>
+        <span class="name">${esc(owner)}</span>
+        <span class="meta">${items.length}${pickerMore ? '+' : ''} repo${items.length === 1 && !pickerMore ? '' : 's'}</span></label>
+      <div class="grp-body"${open ? '' : ' hidden'}>${items.map(repoRow).join('')}</div></div>`;
+  }).join('');
+  $('picker-list').querySelectorAll('.grp').forEach(grp => {
+    const head = grp.querySelector('.grp-cb'), boxes = [...grp.querySelectorAll('.repo-cb')];
+    const refresh = () => {
+      const n = boxes.filter(b => b.checked).length;
+      head.checked = n === boxes.length; head.indeterminate = n > 0 && n < boxes.length;
+    };
+    head.onchange = () => {
+      boxes.forEach(b => { b.checked = head.checked; head.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value); });
+      refresh(); updateCount();
+    };
+    boxes.forEach(b => b.onchange = () => {
+      b.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value);
+      refresh(); updateCount();
     });
-  } else {
-    $('picker-list').querySelectorAll('input').forEach(cb =>
-      cb.onchange = () => updateCount());
-  }
+    grp.querySelector('.tog').onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();           // the row is a <label>: don't toggle the box
+      const body = grp.querySelector('.grp-body'), owner = grp.dataset.owner;
+      body.hidden = !body.hidden;
+      e.currentTarget.setAttribute('aria-expanded', String(!body.hidden));
+      body.hidden ? pickerOpen.delete(owner) : pickerOpen.add(owner);
+    };
+    // clicking the owner name expands it too, rather than ticking everything
+    grp.querySelector('.grp-head .name').onclick = (e) => {
+      e.preventDefault(); grp.querySelector('.tog').click();
+    };
+    refresh();
+  });
   updateCount();
 }
 function updateCount(){
-  const n = $('picker-list').querySelectorAll('input:checked').length;
-  $('picker-count').textContent = pickerMode === 'owners' ? '' : `${n} selected`;
+  $('picker-count').textContent = pickerMode === 'owners' ? '' : `${pickerSel.size} selected`;
 }
-function closePicker(){ $('backdrop').hidden = true; }
+function shownRepoBoxes(){ return [...$('picker-list').querySelectorAll('.repo-cb')]; }
+function closePicker(){ $('backdrop').hidden = true; pickerGen += 1; pickerLoading = false; }
 $('picker-close').onclick = closePicker;
 $('backdrop').onclick = (e) => { if(e.target === $('backdrop')) closePicker(); };
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closePicker(); });
-$('picker-search').oninput = renderPicker;
+$('picker-search').oninput = () => { renderPicker(); maybeLoadMore(); };
+$('picker-list').addEventListener('scroll', maybeLoadMore);
 $('picker-all').onclick = () => {
-  $('picker-list').querySelectorAll('input').forEach(cb => cb.checked = true); updateCount(); };
+  shownRepoBoxes().forEach(cb => pickerSel.add(cb.value)); renderPicker(); };
 $('picker-none').onclick = () => {
-  $('picker-list').querySelectorAll('input').forEach(cb => cb.checked = false); updateCount(); };
+  shownRepoBoxes().forEach(cb => pickerSel.delete(cb.value)); renderPicker(); };
 $('picker-add').onclick = () => {
-  const picked = [...$('picker-list').querySelectorAll('input:checked')].map(cb => cb.value);
+  const picked = [...pickerSel];
   const existing = $('targets').value.split('\n').map(t => t.trim()).filter(Boolean);
   $('targets').value = [...new Set([...existing, ...picked])].join('\n') + (picked.length ? '\n' : '');
   closePicker();
 };
 $('pick-repos').onclick = () => openPicker('repos');
-$('pick-owner').onclick = () => openPicker('owners');
 $('pick-group').onclick = () => openPicker('owners');
 $('clear-targets').onclick = () => { $('targets').value = ''; };
 
@@ -586,13 +985,17 @@ async function loadJobs(){
       <td class="mono">${esc(j.created_utc.replace('T',' ').slice(0,19))}</td>
       <td>${esc(j.provider)}</td>
       <td class="mono">${esc(j.targets.slice(0,2).join(', '))}${j.targets.length>2 ? ` +${j.targets.length-2}` : ''}</td>
-      <td><span class="pill ${STATE_CLS[j.state]||''}">${esc(j.state)}</span></td>
+      <td>${(j.state === 'partial' || (j.state === 'done' && j.issues))
+        ? `<button type="button" class="pill-btn" data-issues="${esc(j.id)}">${esc(plural(j.issues || 1, 'issue'))}</button>`
+        : `<span class="pill ${STATE_CLS[j.state]||''}">${esc(j.state)}</span>`}</td>
       <td style="text-align:right;white-space:nowrap">
         <button class="ghost" data-view="${esc(j.id)}">View</button>
         <a class="ghost" href="/api/jobs/${encodeURIComponent(j.id)}/log" title="secrets redacted">⬇ log</a></td>
     </tr>`).join('') : '<tr><td colspan="5" style="color:var(--muted)">no runs yet</td></tr>';
   $('jobs').querySelectorAll('[data-view]').forEach(b =>
     b.onclick = () => attach(b.dataset.view));
+  $('jobs').querySelectorAll('[data-issues]').forEach(b =>
+    b.onclick = () => openIssues(b.dataset.issues));
 }
 async function loadRuns(){
   const {runs} = await (await fetch('/api/runs')).json();

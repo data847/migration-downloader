@@ -56,6 +56,15 @@ def _public_spec(spec: JobSpec) -> dict:
         "timeout": spec.timeout,
         "verify_checksum": spec.verify_checksum,
         "run_name": spec.run_name,
+        "extras": spec.extras,
+        "max_items": spec.max_items,
+        "exclude": spec.exclude,
+        "org_metadata_only": spec.org_metadata_only,
+        "unlock_repos": spec.unlock_repos,
+        "delete_archive": spec.delete_archive,
+        "description": spec.description,
+        "dc_action": spec.dc_action,
+        # upload_url is deliberately not stored: a presigned URL is a credential
         "token_hint": mask(spec.resolved_token()),
         "token_from_env": not spec.token,
     }
@@ -120,6 +129,13 @@ def request_cancel(job_id: str) -> bool:
         return True
 
 
+def _issue_count(job: dict) -> int:
+    from runner import issues_from_manifest      # local: keeps the import block untouched for other branches
+    manifest = job.get("manifest") or {}
+    issues = manifest.get("issues")
+    return len(issues if issues is not None else issues_from_manifest(manifest)) if manifest else 0
+
+
 def listing(limit: int = 25) -> List[dict]:
     """Newest first, log bodies stripped — for the sidebar / history table."""
     with _lock:
@@ -135,6 +151,7 @@ def listing(limit: int = 25) -> List[dict]:
                 "run_name": (j.get("manifest") or {}).get("output_dir", "").split("/")[-1],
                 "lines": len(j["log"]),
                 "resumable": bool(resume_plan(j)),
+                "issues": _issue_count(j),
             }
             for j in jobs
         ]
@@ -219,6 +236,15 @@ def spec_for_resume(job: dict, token: str = "") -> JobSpec:
         timeout=s["timeout"],
         verify_checksum=s["verify_checksum"],
         run_name=plan["run_name"] or s["run_name"],
+        extras=s.get("extras", []),
+        max_items=s.get("max_items", 0),
+        exclude=s.get("exclude", []),
+        org_metadata_only=s.get("org_metadata_only", False),
+        unlock_repos=s.get("unlock_repos", False),
+        delete_archive=s.get("delete_archive", False),
+        description=s.get("description", ""),
+        # never start a second Data Center export job on resume; extras re-run
+        dc_action="none" if s["provider"] == "bitbucket-dc" else s.get("dc_action", "export"),
         known_ids=plan["known_ids"],
         skip_done=True,
     )

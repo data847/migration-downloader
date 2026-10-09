@@ -15,6 +15,7 @@ Tokens are never written to the log stream.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import time
 import urllib.error
@@ -28,19 +29,45 @@ from typing import Callable, Iterable, List, Optional
 GITHUB_API_VERSION_USER = "2022-11-28"
 GITHUB_API_VERSION_ORG = "2026-03-10"
 GITHUB_API_BASE = "https://api.github.com"
+# `exclude_<name>` booleans accepted by POST .../migrations
+GITHUB_EXCLUDE_OPTIONS = frozenset(
+    {"metadata", "git_data", "attachments", "releases", "owner_projects"}
+)
 GITLAB_API_BASE = "https://gitlab.com"
 
 DOWNLOAD_CHUNK = 1024 * 1024
 
 Logger = Callable[[str], None]
 
-
-class MigrationError(RuntimeError):
-    """Any non-recoverable failure in a migration/export run."""
+import ratelimit  # noqa: E402
+from errors import MigrationError  # noqa: E402,F401  (re-exported for every importer)
+from safety import http_url, require_same_origin  # noqa: E402
 
 
 def _noop(_message: str) -> None:
     pass
+
+
+def brief_error(exc: BaseException) -> str:
+    """One line for logs and manifests: the failing request, plus the API's own
+    explanation (`— Must be an organization owner`) when it sent one."""
+    lines = str(exc).splitlines()
+    head = lines[0] if lines else str(exc)
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            data = None
+        message = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            message = str(data.get("message") or (err if isinstance(err, str) else "")
+                          or (err.get("message") if isinstance(err, dict) else "") or "")
+        return f"{head} — {(message or line)[:200]}"
+    return head
 
 
 def mask(token: str) -> str:
@@ -85,13 +112,55 @@ def _request(
     body: Optional[bytes] = None,
     timeout: int = 60,
 ):
-    req = urllib.request.Request(url, data=body, method=method)
-    for key, value in headers.items():
-        req.add_header(key, value)
-    return _opener.open(req, timeout=timeout)
+    """Open a request, waiting out rate limits and retrying transient failures.
+
+    POSTs are only retried when the server clearly did not act (429, rate-limit
+    403), never after a 5xx or a dropped connection: a repeat could start a
+    second migration.
+    """
+    http_url(url)
+    host = urllib.parse.urlparse(url).netloc
+    safe_to_repeat = method in {"GET", "HEAD", "DELETE"}
+    attempt = 0
+    while True:
+        ratelimit.before(host)
+        req = urllib.request.Request(url, data=body, method=method)
+        for key, value in headers.items():
+            req.add_header(key, value)
+        try:
+            resp = _opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raw = b""
+            if exc.code == 403:             # the body says whether it was a limit
+                raw = exc.read()
+            transient = exc.code >= 500
+            delay = None if (transient and not safe_to_repeat) else ratelimit.delay_for(
+                exc.code, exc.headers, raw.decode("utf-8", "replace")[:400], attempt)
+            if delay is None:
+                if raw:                     # hand the body on for the error message
+                    raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.headers, io.BytesIO(raw)) from None
+                raise
+            try:
+                ratelimit.wait(delay, f"HTTP {exc.code} from {host}")
+            except ratelimit.Cancelled:
+                raise MigrationError("cancelled while waiting out a rate limit") from None
+            attempt += 1
+            continue
+        except urllib.error.URLError as exc:
+            delay = ratelimit.delay_for_network(attempt) if safe_to_repeat else None
+            if delay is None:
+                raise
+            try:
+                ratelimit.wait(delay, f"network error talking to {host} ({exc.reason})")
+            except ratelimit.Cancelled:
+                raise MigrationError("cancelled while retrying") from None
+            attempt += 1
+            continue
+        ratelimit.observe(host, resp.headers)
+        return resp
 
 
-def _json_request(url: str, *, method: str = "GET", headers: dict, payload=None, timeout: int = 60):
+def _read_json(url: str, method: str, headers: dict, payload, timeout: int):
     body = json.dumps(payload).encode() if payload is not None else None
     if body is not None:
         headers = {**headers, "Content-Type": "application/json"}
@@ -99,25 +168,54 @@ def _json_request(url: str, *, method: str = "GET", headers: dict, payload=None,
         with _request(url, method=method, headers=headers, body=body, timeout=timeout) as resp:
             raw = resp.read()
             status = resp.status
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as exc:  # surface GitHub/GitLab's own message
         detail = exc.read().decode("utf-8", "replace")[:600]
         raise MigrationError(f"HTTP {exc.code} {method} {url}\n{detail}") from None
     except urllib.error.URLError as exc:
         raise MigrationError(f"network error {method} {url}: {exc.reason}") from None
     if not raw.strip():
-        return status, {}
+        return status, {}, hdrs
     try:
-        return status, json.loads(raw)
+        return status, json.loads(raw), hdrs
     except json.JSONDecodeError:
-        return status, {"raw": raw.decode("utf-8", "replace")}
+        return status, {"raw": raw.decode("utf-8", "replace")}, hdrs
 
 
-def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int = 120) -> Path:
+def _json_request(url: str, *, method: str = "GET", headers: dict, payload=None, timeout: int = 60):
+    status, data, _hdrs = _read_json(url, method, headers, payload, timeout)
+    return status, data
+
+
+def next_link(link_header: Optional[str]) -> Optional[str]:
+    """The `rel="next"` URL from an RFC 8288 Link header, if there is one."""
+    for part in (link_header or "").split(","):
+        pieces = part.split(";")
+        if len(pieces) > 1 and any(p.strip().replace(" ", "") == 'rel="next"' for p in pieces[1:]):
+            return pieces[0].strip().strip("<>")
+    return None
+
+
+def _json_page(url: str, *, headers: dict, timeout: int = 60):
+    """One GET: (data, next page URL or None, lower-cased response headers).
+
+    Following `Link: rel=next` is the only paging that works for every
+    endpoint: some take `page=N`, others (Dependabot, secret scanning) only
+    cursors, and a wrong guess silently repeats the same page.
+    """
+    _status, data, hdrs = _read_json(url, "GET", headers, None, timeout)
+    return data, next_link(hdrs.get("link")), hdrs
+
+
+def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int = 120,
+              info: Optional[dict] = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix(dest.suffix + ".part")
     try:
         with _request(url, headers=headers, timeout=timeout) as resp, partial.open("wb") as fh:
             total = int(resp.headers.get("Content-Length") or 0)
+            if info is not None:
+                info["content_length"] = total or ""
             done = 0
             next_mark = 0
             while True:
@@ -145,24 +243,34 @@ def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int 
     return dest
 
 
-def paged(url: str, *, headers: dict, per_page: int = 100, cap: int = 600) -> list:
-    """Walk `?page=N` until a short page, `cap` items, or an error.
+def fetch_page(url: str, *, headers: dict, page: int = 1, per_page: int = 100):
+    """One numbered page of a listing: (items, has_more, response headers)."""
+    sep = "&" if "?" in url else "?"
+    data, nxt, hdrs = _json_page(f"{url}{sep}per_page={per_page}&page={page}", headers=headers)
+    batch = data if isinstance(data, list) else []
+    more = bool(nxt) if "link" in hdrs else len(batch) >= per_page
+    return batch, more, hdrs
 
-    Used for discovery (listing repos/projects/orgs). Both APIs page the same
-    way, and both cap `per_page` at 100.
-    """
+
+def paged(url: str, *, headers: dict, per_page: int = 100, cap: Optional[int] = None) -> list:
+    """Every item of a listing (both APIs cap `per_page` at 100), following the
+    server's own next-page links. `cap` is optional and off by default."""
     items: list = []
-    page = 1
-    while len(items) < cap:
-        sep = "&" if "?" in url else "?"
-        _status, batch = _json_request(f"{url}{sep}per_page={per_page}&page={page}", headers=headers)
-        if not isinstance(batch, list) or not batch:
-            break
+    sep = "&" if "?" in url else "?"
+    nxt: Optional[str] = f"{url}{sep}per_page={per_page}"
+    while nxt:
+        data, link, _hdrs = _json_page(nxt, headers=headers)
+        batch = data if isinstance(data, list) else []
         items.extend(batch)
-        if len(batch) < per_page:
-            break
-        page += 1
-    return items[:cap]
+        if cap and len(items) >= cap:
+            return items[:cap]
+        nxt = require_same_origin(url, link) if link else None
+    return items
+
+
+SSO_NOTE = ("Some organizations are not shown: they require SAML SSO and this token is not "
+            "authorized for them. Authorize it under GitHub → Settings → Developer settings → "
+            "Personal access tokens → Configure SSO, then reload the list.")
 
 
 def human(size: float) -> str:
@@ -208,7 +316,7 @@ class ArchiveResult:
             "state": self.state,
             "error": self.error,
             "skipped": self.skipped,
-            "ok": bool(self.path) and not self.error,
+            "ok": (bool(self.path) or bool(self.meta.get("uploaded_to"))) and not self.error,
         }
 
 
@@ -230,6 +338,8 @@ class GitHubMigration:
         api_base: str = GITHUB_API_BASE,
         api_version: str = "",
         lock_repositories: bool = False,
+        exclude: Iterable[str] = (),
+        org_metadata_only: bool = False,
         log: Logger = _noop,
     ):
         if scope not in {"user", "org"}:
@@ -246,7 +356,17 @@ class GitHubMigration:
             GITHUB_API_VERSION_USER if scope == "user" else GITHUB_API_VERSION_ORG
         )
         self.lock_repositories = lock_repositories
+        bad = set(exclude) - GITHUB_EXCLUDE_OPTIONS
+        if bad:
+            raise MigrationError(
+                f"unknown exclude option(s) {sorted(bad)}; choose from {sorted(GITHUB_EXCLUDE_OPTIONS)}"
+            )
+        if org_metadata_only and scope != "org":
+            raise MigrationError("org_metadata_only is only valid for org scope")
+        self.exclude = sorted(set(exclude))
+        self.org_metadata_only = org_metadata_only
         self.log = log
+        self.download_info: dict = {}
 
     # -- plumbing ----------------------------------------------------------
     @property
@@ -282,6 +402,36 @@ class GitHubMigration:
         return data.get("login", "?")
 
     # -- discovery ---------------------------------------------------------
+    @staticmethod
+    def _repo_row(r: dict, bare: bool = False) -> dict:
+        return {
+            # org scope migrates bare names, everything else owner/repo
+            "target": r.get("name") if bare else r.get("full_name"),
+            "label": r.get("full_name") or r.get("name"),
+            "private": bool(r.get("private")),
+            "archived": bool(r.get("archived")),
+            "size_kb": r.get("size") or 0,
+            "updated": (r.get("pushed_at") or r.get("updated_at") or "")[:10],
+        }
+
+    def _repos_url(self, org: str = "", everything: bool = False) -> str:
+        if org:
+            return f"{self.api_base}/orgs/{org.strip('/')}/repos?type=all&sort=updated"
+        affiliation = "owner,collaborator,organization_member" if everything else "owner,collaborator"
+        return f"{self.api_base}/user/repos?affiliation={affiliation}&sort=updated"
+
+    def repos_page(self, page: int = 1, *, org: str = "", everything: bool = False) -> dict:
+        """One page of repos for the lazy-loading picker, plus anything the user should know."""
+        batch, more, hdrs = fetch_page(self._repos_url(org, everything), headers=self._headers, page=page)
+        notes = [SSO_NOTE] if hdrs.get("x-github-sso", "").startswith("partial-results") else []
+        return {"items": [self._repo_row(r, bare=bool(org)) for r in batch if r.get("name")],
+                "has_more": more, "notes": notes}
+
+    def orgs_page(self, page: int = 1) -> dict:
+        batch, more, _hdrs = fetch_page(f"{self.api_base}/user/orgs", headers=self._headers, page=page)
+        return {"items": [{"name": o.get("login", ""), "description": o.get("description") or ""}
+                          for o in batch if o.get("login")], "has_more": more, "notes": []}
+
     def list_orgs(self) -> List[dict]:
         """Orgs the token can see. Migration needs Owner or the Migrator role,
         which cannot be read from here — so every org is listed and a 403 on
@@ -293,23 +443,18 @@ class GitHubMigration:
     def list_repos(self, org: str = "") -> List[dict]:
         """Repos visible to the token — the whole org's when `org` is given,
         otherwise the ones the user owns or collaborates on."""
-        if org:
-            url = f"{self.api_base}/orgs/{org.strip('/')}/repos?type=all&sort=updated"
-        else:
-            url = f"{self.api_base}/user/repos?affiliation=owner,collaborator&sort=updated"
-        return [
-            {
-                # org scope migrates bare names, user scope owner/repo
-                "target": r.get("name") if org else r.get("full_name"),
-                "label": r.get("full_name") or r.get("name"),
-                "private": bool(r.get("private")),
-                "archived": bool(r.get("archived")),
-                "size_kb": r.get("size") or 0,
-                "updated": (r.get("pushed_at") or r.get("updated_at") or "")[:10],
-            }
-            for r in paged(url, headers=self._headers)
-            if r.get("name")
-        ]
+        return [self._repo_row(r, bare=bool(org))
+                for r in paged(self._repos_url(org), headers=self._headers) if r.get("name")]
+
+    def list_all_repos(self, cap: Optional[int] = None) -> List[dict]:
+        """Personal repos plus every org repo the token can reach, as owner/repo.
+
+        One call covers both because `organization_member` adds the orgs'
+        repos to what the user owns or collaborates on.
+        """
+        return [self._repo_row(r)
+                for r in paged(self._repos_url(everything=True), headers=self._headers, cap=cap)
+                if r.get("full_name")]
 
     # -- step 2 ------------------------------------------------------------
     def start(self, repos: Iterable[str]) -> str:
@@ -317,6 +462,9 @@ class GitHubMigration:
         if not names:
             raise MigrationError("no repositories given")
         payload = {"lock_repositories": self.lock_repositories, "repositories": names}
+        payload.update({f"exclude_{name}": True for name in self.exclude})
+        if self.org_metadata_only:
+            payload["org_metadata_only"] = True
         self.log(f"  POST {self._root}  repositories={names}")
         _status, data = _json_request(self._root, method="POST", headers=self._headers, payload=payload)
         migration_id = data.get("id")
@@ -362,7 +510,32 @@ class GitHubMigration:
     def download(self, migration_id: str, dest: Path) -> Path:
         url = f"{self._root}/{migration_id}/archive"
         self.log(f"  GET {url}")
-        return _download(url, dest, headers=self._headers, log=self.log)
+        return _download(url, dest, headers=self._headers, log=self.log, info=self.download_info)
+
+    def repositories(self, migration_id: str) -> List[str]:
+        """Repos the source says this migration contains (`owner/name` when given)."""
+        _status, data = _json_request(f"{self._root}/{migration_id}/repositories", headers=self._headers)
+        return [r.get("full_name") or r.get("name") for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+
+    # -- housekeeping (read-only listings, plus two opt-in mutations) ------
+    def list_migrations(self) -> list:
+        return paged(self._root, headers=self._headers)
+
+    def migration_repositories(self, migration_id: str) -> list:
+        return paged(f"{self._root}/{migration_id}/repositories", headers=self._headers)
+
+    def delete_archive(self, migration_id: str) -> None:
+        """Removes the archive from GitHub. Irreversible, so callers must opt in."""
+        url = f"{self._root}/{migration_id}/archive"
+        self.log(f"  DELETE {url}")
+        _json_request(url, method="DELETE", headers=self._headers)
+
+    def unlock_repo(self, migration_id: str, repo_name: str) -> None:
+        """Releases the lock that `lock_repositories` placed on a repo."""
+        name = repo_name.strip("/").split("/")[-1]
+        url = f"{self._root}/{migration_id}/repos/{urllib.parse.quote(name, safe='')}/lock"
+        self.log(f"  DELETE {url}")
+        _json_request(url, method="DELETE", headers=self._headers)
 
 
 # ── GitLab ───────────────────────────────────────────────────────────────────
@@ -380,6 +553,7 @@ class GitLabExport:
         self.token = token
         self.api_base = api_base.rstrip("/")
         self.log = log
+        self.download_info: dict = {}
 
     @property
     def _headers(self) -> dict:
@@ -406,10 +580,43 @@ class GitLabExport:
     # to that level rather than listing projects that would 403 on initiate
     MIN_ACCESS_LEVEL = 40
 
+    def _groups_url(self) -> str:
+        return f"{self.api_base}/api/v4/groups?min_access_level={self.MIN_ACCESS_LEVEL}&all_available=false"
+
+    def _projects_url(self, group: str = "") -> str:
+        if group:
+            ident = group if group.isdigit() else urllib.parse.quote(group.strip("/"), safe="")
+            return (f"{self.api_base}/api/v4/groups/{ident}/projects"
+                    f"?include_subgroups=true&min_access_level={self.MIN_ACCESS_LEVEL}"
+                    f"&order_by=last_activity_at")
+        return (f"{self.api_base}/api/v4/projects"
+                f"?membership=true&min_access_level={self.MIN_ACCESS_LEVEL}"
+                f"&order_by=last_activity_at")
+
+    @staticmethod
+    def _project_row(p: dict) -> dict:
+        return {
+            "target": p.get("path_with_namespace", ""),
+            "label": p.get("path_with_namespace", ""),
+            "private": p.get("visibility") != "public",
+            "archived": bool(p.get("archived")),
+            "size_kb": 0,
+            "updated": (p.get("last_activity_at") or "")[:10],
+        }
+
+    def groups_page(self, page: int = 1) -> dict:
+        batch, more, _hdrs = fetch_page(self._groups_url(), headers=self._headers, page=page)
+        return {"items": [{"name": g.get("full_path", ""), "description": g.get("description") or ""}
+                          for g in batch if g.get("full_path")], "has_more": more, "notes": []}
+
+    def projects_page(self, page: int = 1, group: str = "") -> dict:
+        batch, more, _hdrs = fetch_page(self._projects_url(group), headers=self._headers, page=page)
+        return {"items": [self._project_row(p) for p in batch if p.get("path_with_namespace")],
+                "has_more": more, "notes": []}
+
     def list_groups(self) -> List[dict]:
-        url = f"{self.api_base}/api/v4/groups?min_access_level={self.MIN_ACCESS_LEVEL}&all_available=false"
         return [{"name": g.get("full_path", ""), "description": g.get("description") or ""}
-                for g in paged(url, headers=self._headers) if g.get("full_path")]
+                for g in paged(self._groups_url(), headers=self._headers) if g.get("full_path")]
 
     def list_projects(self, group: str = "") -> List[dict]:
         """Projects the token could export — optionally only inside one group.
@@ -417,33 +624,30 @@ class GitLabExport:
         Works the same against gitlab.com and a self-hosted instance; the only
         difference is `api_base`.
         """
-        if group:
-            ident = group if group.isdigit() else urllib.parse.quote(group.strip("/"), safe="")
-            url = (f"{self.api_base}/api/v4/groups/{ident}/projects"
-                   f"?include_subgroups=true&min_access_level={self.MIN_ACCESS_LEVEL}"
-                   f"&order_by=last_activity_at")
-        else:
-            url = (f"{self.api_base}/api/v4/projects"
-                   f"?membership=true&min_access_level={self.MIN_ACCESS_LEVEL}"
-                   f"&order_by=last_activity_at")
-        return [
-            {
-                "target": p.get("path_with_namespace", ""),
-                "label": p.get("path_with_namespace", ""),
-                "private": p.get("visibility") != "public",
-                "archived": bool(p.get("archived")),
-                "size_kb": 0,
-                "updated": (p.get("last_activity_at") or "")[:10],
-            }
-            for p in paged(url, headers=self._headers)
-            if p.get("path_with_namespace")
-        ]
+        return [self._project_row(p)
+                for p in paged(self._projects_url(group), headers=self._headers)
+                if p.get("path_with_namespace")]
 
     # -- step 2 ------------------------------------------------------------
-    def start(self, project: str) -> None:
+    def start(
+        self,
+        project: str,
+        *,
+        upload_url: str = "",
+        upload_method: str = "",
+        description: str = "",
+    ) -> None:
+        """`upload_url` makes GitLab push the finished archive there itself."""
         url = self._project_url(project, "/export")
-        self.log(f"  POST {url}")
-        status, _data = _json_request(url, method="POST", headers=self._headers)
+        payload: dict = {}
+        if description:
+            payload["description"] = description
+        if upload_url:
+            payload["upload"] = {"url": upload_url, "http_method": upload_method or "PUT"}
+        self.log(f"  POST {url}" + ("  (GitLab will upload the archive itself)" if upload_url else ""))
+        status, _data = _json_request(
+            url, method="POST", headers=self._headers, payload=payload or None
+        )
         self.log(f"  HTTP {status} — export scheduled" if status in (200, 202) else f"  HTTP {status}")
 
     # -- step 3 ------------------------------------------------------------
@@ -477,4 +681,35 @@ class GitLabExport:
         ident = str(project_id) if project_id else project
         url = self._project_url(str(ident), "/export/download")
         self.log(f"  GET {url}")
-        return _download(url, dest, headers=self._headers, log=self.log)
+        return _download(url, dest, headers=self._headers, log=self.log, info=self.download_info)
+
+    # -- relations export (direct-transfer format, one file per relation) ---
+    RELATION_DONE, RELATION_FAILED = 2, 3
+
+    def relations_export(self, project: str, dest_dir: Path, *, interval: int = 15,
+                         timeout: int = 3600, cancelled=None) -> List[Path]:
+        url = self._project_url(project, "/export_relations")
+        self.log(f"  POST {url}")
+        _json_request(url, method="POST", headers=self._headers)
+        deadline = time.time() + timeout
+        while True:
+            if cancelled and cancelled():
+                raise MigrationError("cancelled while waiting for the relations export")
+            _status, rows = _json_request(f"{url}/status", headers=self._headers)
+            rows = rows if isinstance(rows, list) else []
+            failed = [r.get("relation") for r in rows if r.get("status") == self.RELATION_FAILED]
+            if failed:
+                raise MigrationError(f"relations export failed for {failed}")
+            if rows and all(r.get("status") == self.RELATION_DONE for r in rows):
+                break
+            if time.time() > deadline:
+                raise MigrationError(f"timed out waiting for the relations export of {project}")
+            GitHubMigration._sleep(interval, cancelled)
+        saved = []
+        for row in rows:
+            name = row.get("relation", "")
+            dest = dest_dir / f"{safe_name(name)}.ndjson.gz"
+            saved.append(_download(
+                f"{url}/download?relation={urllib.parse.quote(name, safe='')}",
+                dest, headers=self._headers, log=self.log))
+        return saved

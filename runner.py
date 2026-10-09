@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import json
 import sys
+import tarfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
+from urllib.parse import urlparse
 
 import bootstrap  # noqa: F401  (sets sys.path)
 
+import for_check  # noqa: E402
 from datalabs_paths import (  # noqa: E402
     ensure_outputs,
+    env,
     github_token,
     gitlab_token,
     load_env,
@@ -30,20 +34,58 @@ from migration_api import (  # noqa: E402
     GitHubMigration,
     GitLabExport,
     MigrationError,
+    brief_error,
     human,
     mask,
     safe_name,
     sha256,
 )
 
+import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
+import ratelimit  # noqa: E402
+from safety import MIN_FREE_MB, check_disk, require_valid_target  # noqa: E402
+from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
+from supplementary import REGISTRY, Ctx, resolve_names  # noqa: E402
+
 COMPONENT = "migration-downloader"
+PROVIDERS = {"github", "gitlab", "bitbucket", "bitbucket-dc"}
 load_env()
+
+
+def _strip_url(target: str) -> str:
+    """The repo path from a clone/web URL, else the target as typed."""
+    target = target.strip()
+    path = urlparse(target).path if target.startswith(("http://", "https://")) else target
+    path = path.strip("/")
+    return path[:-4] if path.endswith(".git") else path
+
+
+def _parse_owner_repo(target: str) -> str:
+    """owner/repo from a URL, .git name or plain pair; auto scope needs the owner."""
+    path = urlparse(target).path if target.startswith(("http://", "https://")) else target
+    path = path.strip().strip("/")
+    path = path[:-4] if path.endswith(".git") else path
+    if path.count("/") != 1 or not all(path.split("/")):
+        raise MigrationError(
+            f"'{target}' should be owner/repo (the owner tells personal repos from an org's)")
+    return path
+
+
+def _max_items(raw) -> int:
+    """Blank -> no limit (the default); 0 -> no limit; anything else is the cap."""
+    if raw in (None, ""):
+        return 0
+    return max(0, int(raw))
+
+
+def _split(raw) -> List[str]:
+    return [t.strip() for chunk in str(raw or "").splitlines() for t in chunk.split(",") if t.strip()]
 
 
 @dataclass
 class JobSpec:
     provider: str = "github"          # github | gitlab
-    scope: str = "user"               # github only: user | org
+    scope: str = "auto"               # github only: auto | user | org
     org: str = ""                     # github org scope
     targets: List[str] = field(default_factory=list)
     token: str = ""                   # blank -> from .env
@@ -58,6 +100,22 @@ class JobSpec:
     # resume: {target label -> migration/export id already known}
     known_ids: dict = field(default_factory=dict)
     skip_done: bool = False           # don't re-download targets already on disk
+    for_check: bool = True            # write <archive>.for-check.csv (source-side counts/refs/file list) for Garmr
+    # supplementary collectors (see supplementary.py / bitbucket.py)
+    extras: List[str] = field(default_factory=list)   # names, or all / everything
+    max_items: int = 0                # cap per unbounded listing (runs, commits, PRs…)
+    # github migration options
+    exclude: List[str] = field(default_factory=list)  # metadata, git_data, attachments, releases, owner_projects
+    org_metadata_only: bool = False
+    unlock_repos: bool = False        # github: release the lock after download
+    delete_archive: bool = False      # github: delete the archive from GitHub after download
+    # gitlab project export options
+    upload_url: str = ""              # GitLab pushes the archive here instead of us downloading it
+    upload_method: str = ""           # PUT (default) | POST
+    description: str = ""
+    # bitbucket data center export job
+    dc_action: str = "export"         # export | preview | cancel | none
+    dc_job_id: str = ""               # for cancel
 
     @classmethod
     def from_form(cls, data: dict) -> "JobSpec":
@@ -68,7 +126,7 @@ class JobSpec:
         targets = [t.strip() for chunk in raw.splitlines() for t in chunk.split(",") if t.strip()]
         return cls(
             provider=(data.get("provider") or "github").strip().lower(),
-            scope=(data.get("scope") or "user").strip().lower(),
+            scope=(data.get("scope") or "auto").strip().lower(),
             org=(data.get("org") or "").strip(),
             targets=targets,
             token=(data.get("token") or "").strip(),
@@ -80,23 +138,72 @@ class JobSpec:
             timeout=max(60, int(data.get("timeout") or 3600)),
             verify_checksum=flag("verify_checksum"),
             run_name=(data.get("run_name") or "").strip(),
+            for_check=str(data.get("for_check", "1")).lower() not in {"0", "false", "off", "no"},
+            extras=_split(data.get("extras", "")),
+            max_items=_max_items(data.get("max_items")),
+            exclude=_split(data.get("exclude", "")),
+            org_metadata_only=flag("org_metadata_only"),
+            unlock_repos=flag("unlock_repos"),
+            delete_archive=flag("delete_archive"),
+            upload_url=(data.get("upload_url") or "").strip(),
+            upload_method=(data.get("upload_method") or "").strip().upper(),
+            description=(data.get("description") or "").strip(),
+            dc_action=(data.get("dc_action") or "export").strip().lower(),
+            dc_job_id=(data.get("dc_job_id") or "").strip(),
         )
 
     def resolved_token(self) -> str:
         if self.token:
             return self.token
-        return github_token() if self.provider == "github" else gitlab_token()
+        return {
+            "github": github_token,
+            "gitlab": gitlab_token,
+            "bitbucket": lambda: env("BITBUCKET_TOKEN", "BB_TOKEN"),
+            "bitbucket-dc": lambda: env("BITBUCKET_DC_TOKEN", "BITBUCKET_TOKEN"),
+        }.get(self.provider, lambda: "")()
+
+    def token_env_hint(self) -> str:
+        return {
+            "github": "GITHUB_TOKEN / GH_TOKEN",
+            "gitlab": "GITLAB_TOKEN",
+            "bitbucket": "BITBUCKET_TOKEN / BB_TOKEN",
+            "bitbucket-dc": "BITBUCKET_DC_TOKEN",
+        }.get(self.provider, "")
 
     def validate(self) -> None:
-        if self.provider not in {"github", "gitlab"}:
-            raise MigrationError("provider must be 'github' or 'gitlab'")
-        if not self.targets:
+        if self.provider not in PROVIDERS:
+            raise MigrationError(f"provider must be one of {sorted(PROVIDERS)}")
+        cancel_only = self.provider == "bitbucket-dc" and self.dc_action == "cancel"
+        if not self.targets and not cancel_only:
             raise MigrationError("give at least one repository / project")
-        if self.provider == "github" and self.scope == "org" and not self.org:
-            raise MigrationError("an organization name is required for org scope")
+        if self.provider == "github":
+            if self.scope not in {"auto", "user", "org"}:
+                raise MigrationError("scope must be auto, user or org")
+            if self.scope == "org" and not self.org:
+                raise MigrationError("an organization name is required for org scope")
+            if self.scope == "auto":
+                for target in self.targets:
+                    _parse_owner_repo(target)     # every target must say who owns it
+        for target in self.targets:
+            require_valid_target(_strip_url(target))
+        if self.provider == "bitbucket" and not self.extras:
+            raise MigrationError("Bitbucket Cloud has no export archive; pass extras (e.g. all, pullrequests)")
+        if self.provider == "bitbucket-dc":
+            if not self.api_base:
+                raise MigrationError("Bitbucket Data Center needs --api-base (its base URL)")
+            if self.dc_action not in {"export", "preview", "cancel", "none"}:
+                raise MigrationError("dc_action must be export, preview, cancel or none")
+            if cancel_only and not self.dc_job_id:
+                raise MigrationError("dc_action cancel needs dc_job_id")
+        if self.extras:
+            resolve_names(self.provider, self.extras)   # fail fast on a typo
+        if self.upload_url and self.provider != "gitlab":
+            raise MigrationError("upload_url only applies to GitLab")
+        if self.unlock_repos and not self.lock_repositories:
+            raise MigrationError("unlock_repos only makes sense with lock_repositories")
         if not self.resolved_token():
-            key = "GITHUB_TOKEN / GH_TOKEN" if self.provider == "github" else "GITLAB_TOKEN"
-            raise MigrationError(f"no token supplied and none found in .env ({key})")
+            raise MigrationError(
+                f"no token supplied and none found in .env ({self.token_env_hint()})")
 
 
 def _already_finished(client: GitLabExport, project: str, log) -> bool:
@@ -126,6 +233,8 @@ def run_job(
     spec.validate()
     token = spec.resolved_token()
     dest_dir = run_dir(spec)
+    check_disk(dest_dir, MIN_FREE_MB, what="this run")
+    ratelimit.bind(cancelled, log)      # waits for rate limits show up in the run log
     started = time.time()
 
     log(f"provider   : {spec.provider}")
@@ -138,16 +247,26 @@ def run_job(
     if spec.known_ids:
         log(f"resuming with {len(spec.known_ids)} known id(s) — step 2 skipped for those")
         log("")
+    export_jobs: List[dict] = []
     if spec.provider == "github":
         results = _run_github(spec, token, dest_dir, log, cancelled)
-    else:
+    elif spec.provider == "gitlab":
         results = _run_gitlab(spec, token, dest_dir, log, cancelled)
+    elif spec.provider == "bitbucket-dc":
+        export_jobs = _run_bitbucket_dc(spec, token, dest_dir, log, cancelled)
+
+    extras = _run_extras(spec, token, dest_dir, log, cancelled) if spec.extras else []
 
     if spec.verify_checksum:
         for r in results:
             if r.path and r.path.exists():
                 log(f"sha256 {r.target} …")
                 r.digest = sha256(r.path)
+
+    for r in results:
+        info = r.meta.pop("for_check", None)
+        if spec.for_check and info and r.path and r.path.exists():
+            _write_for_check(info, r, log)
 
     manifest = {
         "component": COMPONENT,
@@ -159,20 +278,131 @@ def run_job(
         "elapsed_seconds": round(time.time() - started, 1),
         "output_dir": str(dest_dir),
         "archives": [r.as_dict() for r in results],
-        "ok": sum(1 for r in results if r.path and not r.error),
-        "failed": sum(1 for r in results if r.error),
+        "export_jobs": export_jobs,
+        "extras": extras,
+        "ok": sum(1 for r in results if r.as_dict()["ok"]),
+        "archives_failed": sum(1 for r in results if r.error),
+        "extras_failed": sum(1 for e in extras if e["error"]),
+        "jobs_failed": sum(1 for j in export_jobs if j.get("error")),
     }
+    manifest["failed"] = manifest["archives_failed"] + manifest["extras_failed"] + manifest["jobs_failed"]
+    manifest["issues"] = issues_from_manifest(manifest)
     (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     log("")
-    log(f"done: {manifest['ok']} archive(s) downloaded, {manifest['failed']} failed")
+    log(f"done: {manifest['ok']} archive(s) downloaded, {manifest['archives_failed']} failed")
     for r in results:
         if r.path:
             log(f"  ✓ {r.path.name}  {human(r.bytes)}")
+        elif r.meta.get("uploaded_to") and not r.error:
+            log(f"  ✓ {r.target}: uploaded by GitLab to {r.meta['uploaded_to']}")
         else:
             log(f"  ✗ {r.target}: {r.error}")
+    if extras:
+        good = sum(1 for e in extras if not e["error"])
+        log(f"extras: {good}/{len(extras)} collector run(s) succeeded")
+        for e in extras:
+            if e["error"]:
+                log(f"  ✗ {e['target']} · {e['extra']}: {e['error']}")
+    if manifest["issues"]:
+        log(f"issues: {len(manifest['issues'])}")
+        for item in manifest["issues"]:
+            log(f"  ! {item['target'] or item['kind']} · {item['step']}: {item['message']}")
     log(f"manifest: {dest_dir / 'manifest.json'}")
     return manifest
+
+
+# ── issues: what went wrong, in plain terms ──────────────────────────────────
+
+_HINTS = [
+    # (all of these must appear in the lower-cased message, hint)
+    (("http 401",), "The host rejected the token. Check it is pasted in full, has not expired or been revoked, "
+                    "and belongs to this host."),
+    (("http 422", "/user/migrations"), "/user/migrations cannot export an org's repos. Use scope auto (the "
+                                       "default) so org repos go through the org's own migration endpoint."),
+    (("http 403", "/orgs/", "/migrations"), "Org exports need an org Owner (or Migrator) and the admin:org scope. "
+                                            "If the org enforces SAML SSO, authorize the token for it first."),
+    (("http 403", "/migrations"), "The token lacks the repo scope, or the account cannot export these repositories."),
+    (("http 404", "/migrations"), "The repository was not found: check the spelling and that the token can see it."),
+    (("dependabot",), "Needs the security_events scope and Dependabot alerts enabled on the repo."),
+    (("code-scanning",), "Needs security_events, and code scanning set up (private repos need GitHub Advanced Security)."),
+    (("secret-scanning",), "Needs security_events/repo scope, and secret scanning enabled (private repos need "
+                           "GitHub Advanced Security)."),
+    (("/hooks",), "Listing webhooks needs admin access to the repository."),
+    (("protection",), "Reading branch protection needs admin access to the repository."),
+    (("http 403", "projectsv2"), "Projects (v2) need the read:project scope."),
+    (("http 403", "packages"), "Packages need the read:packages scope."),
+    (("http 404",), "Not found, or the token's user has no access: often a missing permission or a feature that "
+                    "is switched off for this repository."),
+    (("http 403",), "Forbidden: the token is missing a scope, or the account lacks the role this call needs."),
+    (("rate limit", "429"), "The host throttled the token. The run waits and retries by itself; run again later "
+                            "if this persists."),
+    (("limited to",), "A listing was cut off at the item limit. Raise Max items (0 = no limit) under Download options."),
+    (("timed out",), "The export took longer than the timeout. Raise the timeout; large repos can take over an hour."),
+    (("network error",), "Could not reach the host. Check connectivity and the host / API base URL."),
+    (("only", "mb free"), "Not enough free disk space for this run."),
+    (("cancelled",), "You cancelled the run."),
+    (("not installed",), "A required program is missing on this machine."),
+]
+
+
+def explain(message: str) -> str:
+    lowered = message.lower()
+    for needles, hint in _HINTS:
+        if all(n in lowered for n in needles):
+            return hint
+    return ""
+
+
+def issues_from_manifest(manifest: dict) -> List[dict]:
+    """Everything that went wrong in a run as a flat list. Also works on manifests
+    written before `issues` existed, so old runs get the same summary."""
+    out: List[dict] = []
+
+    def add(kind: str, target: str, step: str, message: str) -> None:
+        out.append({"kind": kind, "target": target, "step": step, "message": message,
+                    "hint": explain(f"{step} {message}")})
+
+    for a in manifest.get("archives", []):
+        if a.get("error"):
+            add("archive", a.get("target", ""), "export + download", a["error"])
+    for j in manifest.get("export_jobs", []):
+        if j.get("error"):
+            add("export-job", ", ".join(j.get("targets", [])), f"export job ({j.get('action', '')})", j["error"])
+    for e in manifest.get("extras", []):
+        if e.get("error"):
+            add("extra", e.get("target", ""), e.get("extra", ""), e["error"])
+        for note in e.get("truncated", []):
+            add("limit", e.get("target", ""), e.get("extra", ""), note)
+    return out
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _owner_repo(spec: JobSpec, name: str):
+    if spec.scope == "org":
+        return spec.org, name.split("/")[-1]
+    owner, _, repo = name.partition("/")
+    return (owner, repo) if repo else (owner, owner)
+
+
+def _write_for_check(info: dict, result: ArchiveResult, log) -> None:
+    """Write <archive>.for-check.csv. Whatever goes wrong here must never fail the download."""
+    try:
+        files, ocount, obytes = None, 0, 0
+        try:
+            files, ocount, obytes = for_check.list_archive(result.path)
+        except Exception as exc:
+            info["errors"].append(f"file listing: {type(exc).__name__}: {exc}")
+        info["meta"]["content_length"] = result.meta.get("content_length", "")
+        rows = for_check.build_rows(info, archive=result.path, digest=result.digest, files=files,
+                                    ocount=ocount, obytes=obytes)
+        path = for_check.write_csv(for_check.for_check_path(result.path), rows)
+        log(f"  for-check: {path.name} ({len(rows)} rows)")
+    except Exception as exc:
+        log(f"  warning: could not write for-check.csv ({type(exc).__name__}: {exc})")
 
 
 def _github_client(spec: JobSpec, token: str, log) -> GitHubMigration:
@@ -183,16 +413,56 @@ def _github_client(spec: JobSpec, token: str, log) -> GitHubMigration:
         api_base=spec.api_base or "https://api.github.com",
         api_version=spec.api_version,
         lock_repositories=spec.lock_repositories,
+        exclude=spec.exclude,
+        org_metadata_only=spec.org_metadata_only,
         log=log,
     )
 
 
+def _github_groups(spec, token, log) -> list:
+    """[(scope, org, targets)]. `auto` sends the token owner's repos through the
+    user migration API and each other owner's through that org's."""
+    if spec.scope != "auto":
+        return [(spec.scope, spec.org, spec.targets)]
+    login = _github_login(spec, token, log)
+    personal: List[str] = []
+    by_org: dict = {}
+    for target in spec.targets:
+        owner = _parse_owner_repo(target).split("/")[0]
+        if owner.lower() == login.lower():
+            personal.append(target)
+        else:
+            by_org.setdefault(owner, []).append(target)
+    groups = [("user", "", personal)] if personal else []
+    groups += [("org", owner, targets) for owner, targets in by_org.items()]
+    log("owners     : " + ", ".join(
+        ([f"{login} (personal)"] if personal else []) + [f"{o} (org)" for o in by_org]))
+    return groups
+
+
+def _github_login(spec, token, log) -> str:
+    try:
+        return _github_client(replace(spec, scope="user"), token, log).whoami()
+    except MigrationError as exc:
+        raise MigrationError(
+            "cannot tell personal repos from org repos: token check failed "
+            f"({brief_error(exc)})") from None
+
+
 def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+    results: List[ArchiveResult] = []
+    for scope, org, targets in _github_groups(spec, token, log):
+        group = replace(spec, scope=scope, org=org, targets=targets)
+        results += _run_github_scope(group, token, dest_dir, log, cancelled)
+    return results
+
+
+def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
     client = _github_client(spec, token, log)
     try:
         log(f"authenticated as {client.whoami()}")
     except MigrationError as exc:
-        log(f"warning: token check failed ({exc.args[0].splitlines()[0]})")
+        log(f"warning: token check failed ({brief_error(exc)})")
 
     batches = [spec.targets] if spec.single_archive else [[t] for t in spec.targets]
     results: List[ArchiveResult] = []
@@ -205,6 +475,21 @@ def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
         try:
             if cancelled and cancelled():
                 raise MigrationError("cancelled")
+            fc = None
+            if spec.for_check:
+                pairs = [_owner_repo(spec, n) for n in batch]
+                fc = {"archive_label": f"{pairs[0][0]}/{pairs[0][1]}" if len(pairs) == 1 else "*",
+                      "requested": [f"{o}/{r}" for o, r in pairs], "exported": [], "errors": [],
+                      "repos": [{"label": f"{o}/{r}", "owner": o, "repo": r} for o, r in pairs],
+                      "meta": {"provider": "github", "host": client.api_base, "scope": spec.scope, "org": spec.org,
+                               "api_version": client.api_version, "started_at": _now(),
+                               "opt_lock_repositories": str(bool(client.lock_repositories)).lower(),
+                               "opt_excludes": "none"}}
+                for rp in fc["repos"]:
+                    log(f"  for-check: snapshot before {rp['label']}")
+                    rp["before"] = for_check.snapshot("github", rp["label"], headers=client._headers,
+                                                      api_base=client.api_base, token=token,
+                                                      owner=rp["owner"], repo=rp["repo"])
             migration_id = spec.known_ids.get(label, "")
             if migration_id:
                 log(f"  reusing migration id {migration_id}")
@@ -218,6 +503,17 @@ def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 cancelled=cancelled,
             )
             result.state = data.get("state", "")
+            if fc:
+                for rp in fc["repos"]:
+                    rp["after"] = for_check.snapshot("github", rp["label"], headers=client._headers,
+                                                     api_base=client.api_base, token=token,
+                                                     owner=rp["owner"], repo=rp["repo"])
+                try:
+                    fc["exported"] = [str(x) for x in client.repositories(migration_id) if x]
+                except Exception as exc:
+                    fc["errors"].append(f"exported repos: {type(exc).__name__}: {exc}")
+                fc["meta"].update(migration_id=migration_id, state=result.state, finished_at=_now())
+                result.meta["for_check"] = fc
             stem = safe_name(batch[0] if len(batch) == 1 else f"{spec.org or 'user'}-batch")
             dest = dest_dir / f"{stem}-{migration_id}.tar.gz"
             if spec.skip_done and dest.is_file() and dest.stat().st_size:
@@ -225,14 +521,50 @@ def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 result.skipped = True
             else:
                 client.download(migration_id, dest)
+                result.meta["content_length"] = client.download_info.get("content_length", "")
             result.path = dest
             result.bytes = dest.stat().st_size
             log(f"  saved {dest.name} ({human(result.bytes)})")
+            _github_cleanup(spec, client, migration_id, batch, log, dest,
+                            result.meta.get("content_length"))
         except MigrationError as exc:
-            result.error = str(exc).splitlines()[0]
+            result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
         results.append(result)
     return results
+
+
+def _download_is_complete(dest: Path, expected) -> bool:
+    """A file of exactly the size the server announced, that opens as a tarball."""
+    try:
+        size = dest.stat().st_size
+    except OSError:
+        return False
+    try:
+        announced = int(expected)
+    except (TypeError, ValueError):
+        return False
+    return size > 0 and size == announced and tarfile.is_tarfile(dest)
+
+
+def _github_cleanup(spec, client, migration_id, batch, log, dest: Path, expected_bytes) -> None:
+    """Opt-in, and only after the archive is verified: unlocking is harmless, but
+    deleting the archive from GitHub is not undoable."""
+    if spec.unlock_repos:
+        for repo in batch:
+            try:
+                client.unlock_repo(migration_id, repo)
+            except MigrationError as exc:
+                log(f"  warning: unlock {repo} failed ({brief_error(exc)})")
+    if spec.delete_archive:
+        if not _download_is_complete(dest, expected_bytes):
+            log("  warning: not deleting the archive from GitHub: could not confirm the download is "
+                "complete (size does not match what GitHub announced, or it is not a readable tarball)")
+            return
+        try:
+            client.delete_archive(migration_id)
+        except MigrationError as exc:
+            log(f"  warning: delete archive failed ({brief_error(exc)})")
 
 
 def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
@@ -240,7 +572,7 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
     try:
         log(f"authenticated as {client.whoami()}")
     except MigrationError as exc:
-        log(f"warning: token check failed ({exc.args[0].splitlines()[0]})")
+        log(f"warning: token check failed ({brief_error(exc)})")
 
     results: List[ArchiveResult] = []
     for index, raw in enumerate(spec.targets, 1):
@@ -260,10 +592,20 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 result.bytes = dest.stat().st_size
                 results.append(result)
                 continue
+            fc = None
+            if spec.for_check:
+                log(f"  for-check: snapshot before {project}")
+                fc = {"archive_label": project, "requested": [project], "exported": [project], "errors": [],
+                      "repos": [{"label": project}],
+                      "meta": {"provider": "gitlab", "host": client.api_base, "scope": "project", "org": "",
+                               "api_version": "v4", "started_at": _now(), "opt_excludes": "none"}}
+                fc["repos"][0]["before"] = for_check.snapshot("gitlab", project, headers=client._headers,
+                                                              api_base=client.api_base, token=token)
             if spec.known_ids.get(project) and _already_finished(client, project, log):
                 pass
             else:
-                client.start(project)
+                client.start(project, upload_url=spec.upload_url,
+                             upload_method=spec.upload_method, description=spec.description)
             data = client.wait(
                 project,
                 interval=spec.poll_interval,
@@ -273,15 +615,129 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
             result.state = data.get("export_status", "")
             project_id = data.get("id")
             result.migration_id = str(project_id) if project_id else None
+            if fc:
+                fc["repos"][0]["after"] = for_check.snapshot("gitlab", project, headers=client._headers,
+                                                             api_base=client.api_base, token=token)
+                fc["meta"].update(migration_id=result.migration_id or "", state=result.state, finished_at=_now())
+                result.meta["for_check"] = fc
+            if spec.upload_url:
+                # host only: a presigned URL's query string is a credential
+                result.meta["uploaded_to"] = urlparse(spec.upload_url).netloc or "remote"
+                log(f"  export finished; GitLab uploads it to {result.meta['uploaded_to']}")
+                results.append(result)
+                continue
             client.download(project, dest, project_id=project_id)
+            result.meta["content_length"] = client.download_info.get("content_length", "")
             result.path = dest
             result.bytes = dest.stat().st_size
             log(f"  saved {dest.name} ({human(result.bytes)})")
         except MigrationError as exc:
-            result.error = str(exc).splitlines()[0]
+            result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
         results.append(result)
     return results
+
+
+def _run_bitbucket_dc(spec, token, dest_dir, log, cancelled) -> List[dict]:
+    """Preview / start / cancel the Data Center export job. The tar stays on the
+    server's shared home, so there is nothing to download."""
+    client = BitbucketDCExport(token, spec.api_base, log=log)
+    if spec.dc_action == "none":
+        return []
+    job: dict = {"action": spec.dc_action, "targets": spec.targets}
+    try:
+        if spec.dc_action == "cancel":
+            job["job_id"] = spec.dc_job_id
+            job["response"] = client.cancel(spec.dc_job_id)
+        elif spec.dc_action == "preview":
+            preview = client.preview(spec.targets)
+            (dest_dir / "export-preview.json").write_text(json.dumps(preview, indent=2))
+            job["preview"] = "export-preview.json"
+        else:
+            job_id = client.start(spec.targets)
+            job["job_id"] = job_id
+            data = client.wait(job_id, interval=spec.poll_interval, timeout=spec.timeout,
+                               cancelled=cancelled)
+            job["state"] = data.get("state", "")
+            messages = client.messages(job_id)
+            (dest_dir / "export-messages.json").write_text(json.dumps(messages, indent=2))
+            job["messages"] = len(messages)
+            log(f"  tar is on the server: $BITBUCKET_SHARED_HOME/data/migration/export/"
+                f"Bitbucket_export_{job_id}.tar")
+    except MigrationError as exc:
+        job["error"] = brief_error(exc)
+        log(f"  ERROR {job['error']}")
+    return [job]
+
+
+def _extras_context(spec, token, log):
+    """(headers, api_base, target normaliser) for the provider's collectors."""
+    if spec.provider == "github":
+        client = _github_client(replace(spec, scope="user") if spec.scope == "auto" else spec, token, log)
+        return client._headers, client.api_base, client.normalise
+    if spec.provider == "gitlab":
+        client = GitLabExport(token, api_base=spec.api_base or "https://gitlab.com", log=log)
+        return client._headers, client.api_base, client.normalise
+    if spec.provider == "bitbucket":
+        def normalise(target: str) -> str:
+            target = target.strip().strip("/")
+            if target.startswith(("http://", "https://")):
+                target = urlparse(target).path.strip("/")
+            return target[:-4] if target.endswith(".git") else target
+        return cloud_headers(token), (spec.api_base or BITBUCKET_CLOUD_BASE).rstrip("/"), normalise
+    return (BitbucketDCExport(token, spec.api_base)._headers, spec.api_base.rstrip("/"),
+            lambda t: t.strip().strip("/"))
+
+
+def _extras_org(spec, target: str, login: str) -> str:
+    """The org owning a GitHub target (so org-level extras use org endpoints), else ''."""
+    if spec.provider != "github":
+        return ""
+    if spec.scope == "org":
+        return spec.org
+    if spec.scope == "auto" and login:
+        owner = target.split("/")[0]
+        return "" if owner.lower() == login.lower() else owner
+    return ""
+
+
+def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
+    names = resolve_names(spec.provider, spec.extras)
+    headers, api_base, normalise = _extras_context(spec, token, log)
+    shared: dict = {}
+    records: List[dict] = []
+    login = ""
+    if spec.provider == "github" and spec.scope == "auto":
+        try:
+            login = _github_login(spec, token, log)
+        except MigrationError as exc:
+            log(f"warning: {exc}; owner-level extras will be queried as a user")
+    log("")
+    log(f"extras: {', '.join(names)}")
+    for target in spec.targets:
+        target = normalise(target)
+        log(f"[extras] {target}")
+        out = dest_dir / "extras" / safe_name(target)
+        out.mkdir(parents=True, exist_ok=True)
+        ctx = Ctx(provider=spec.provider, target=target, token=token, api_base=api_base,
+                  headers=headers, out=out, log=log,
+                  org=_extras_org(spec, target, login),
+                  scope=spec.scope, max_items=spec.max_items, shared=shared, cancelled=cancelled)
+        for name in names:
+            record = {"target": target, "extra": name, "files": [], "error": ""}
+            ctx.truncated.clear()
+            log(f"  {name} …")
+            try:
+                if cancelled and cancelled():
+                    raise MigrationError("cancelled")
+                record["files"] = REGISTRY[spec.provider][name](ctx)
+            except MigrationError as exc:
+                record["error"] = brief_error(exc)
+                log(f"    ERROR {record['error']}")
+            if ctx.truncated:
+                record["truncated"] = list(ctx.truncated)
+            records.append(record)
+    return records
 
 
 def list_runs(limit: int = 40) -> List[dict]:
