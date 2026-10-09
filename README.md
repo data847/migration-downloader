@@ -25,6 +25,49 @@ The one manual step, straight from the document. Create a PAT with:
 | GitHub, personal repos | `repo` + `user` |
 | GitHub, org repos | `repo` + `admin:org` — and you must be an org **Owner** or hold the [Migrator role](https://docs.github.com/en/migrations/ado/granting-the-migrator-role) |
 | GitLab | `api` + `write_repository` (a *legacy* token on GitLab.com) |
+| Bitbucket Cloud | an API token with `read:repository:bitbucket`, `read:pullrequest:bitbucket`, `read:pipeline:bitbucket`, `admin:repository:bitbucket`, `read:webhook:bitbucket`, `read:snippet:bitbucket` (details below) |
+| Bitbucket Data Center | an HTTP access token: read access to the repos for browsing and `archive`; **system admin** for the export job |
+
+The scopes above cover the export plus everything the extras collect; GitHub and
+GitLab need a few more for the extras (see [Extras](#extras-what-the-archives-leave-out)).
+
+### Bitbucket tokens
+
+Bitbucket Cloud has no export archive, so everything it does is read-only API
+calls, and the scopes decide which collectors work:
+
+| Scope (Cloud API token) | Used by |
+|---|---|
+| `read:repository:bitbucket` | the repo picker, `repo-metadata`, `refs`, `commits`, `commit-statuses`, `commit-diffstat`, `commit-patches`, `branching-model`, `downloads`, `forks` |
+| `read:pullrequest:bitbucket` | `pullrequests`, `pr-diffs` |
+| `read:pipeline:bitbucket` | `pipelines`, `pipeline-logs` |
+| `admin:repository:bitbucket` | `branch-restrictions` and the pipelines config (Bitbucket gates both behind admin) |
+| `read:webhook:bitbucket` | `hooks` (repo and workspace) |
+| `read:snippet:bitbucket` | `snippets` |
+
+A missing scope only fails its own collectors; the rest of the run carries on and
+the failure is listed under the run's issues. App passwords no longer work
+(removed July 2026).
+
+Which kind of token to paste:
+
+| Token | Made at | Paste into the token box as |
+|---|---|---|
+| API token (belongs to you) | id.atlassian.com → Security → API tokens | `email@example.com:API_TOKEN` |
+| Repository / project / workspace access token | Bitbucket → Repository (or Workspace) settings → Access tokens | the token alone |
+| Data Center HTTP access token | Data Center → Profile → Personal access tokens | the token alone, plus the server's base URL |
+
+An **access token only reaches its own repo, project or workspace**: `snippets` and
+workspace-level `hooks` will report a 403 with one. Use an API token for those.
+You can check which format a token is with
+`curl -u 'EMAIL:TOKEN' https://api.bitbucket.org/2.0/user` (API token) or
+`curl -H 'Authorization: Bearer TOKEN' https://api.bitbucket.org/2.0/repositories/WORKSPACE/REPO`
+(access token).
+
+These scope names and the access-token limits come from Atlassian's documentation
+(read through a summary, not the pages themselves); they have not been checked
+against a live Bitbucket account, so treat a 403 as "check the scope" first. The Data Center
+export permission (system admin) is likewise unverified.
 
 Then either paste it into the UI (used for that run only, never stored), or put
 it in an env file so you never paste it again:
@@ -236,11 +279,8 @@ tasks.
 
 Extra token needs beyond the export scopes: GitHub `admin:repo_hook` (or
 `read:repo_hook`), `security_events`, `read:project`, `read:packages`; GitLab
-Maintainer on the project (for `hooks`). Bitbucket Cloud takes a user API token
-(an `email:token` pair or a bare access token, `BITBUCKET_TOKEN` in the env
-file) with `read:repository`, `read:pullrequest`, `read:pipeline`,
-`admin:repository` (branch restrictions, pipelines config), `read:webhook` and
-`read:snippet`.
+Maintainer on the project (for `hooks`). Bitbucket's scopes and token formats are
+in [Bitbucket tokens](#bitbucket-tokens) (put the token in `BITBUCKET_TOKEN`).
 
 `wiki` shells out to `git` (the image installs it). Credentials are passed
 through git's environment config, never the URL or argv.

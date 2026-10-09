@@ -43,5 +43,20 @@ def test_every_module_the_app_imports_is_copied():
     assert seen - {"datalabs_paths.py"} <= copied_modules(), sorted(seen - copied_modules())
 
 
+def test_readme_names_the_bitbucket_scope_for_every_cloud_collector():
+    """Adding a collector without saying which scope it needs would repeat the
+    gap where the README listed GitHub and GitLab tokens but not Bitbucket's."""
+    import bitbucket  # noqa: F401  (registers the collectors)
+    import supplementary
+
+    text = (ROOT / "README.md").read_text()
+    section = text[text.index("### Bitbucket tokens"): text.index("Which kind of token to paste")]
+    missing = [n for n in supplementary.REGISTRY["bitbucket"] if f"`{n}`" not in section]
+    assert not missing, f"add these to the Bitbucket scope table in the README: {missing}"
+    for scope in ("read:repository:bitbucket", "read:pullrequest:bitbucket", "read:pipeline:bitbucket",
+                  "admin:repository:bitbucket", "read:webhook:bitbucket", "read:snippet:bitbucket"):
+        assert scope in text.split("## Step 1: the token")[1].split("### Bitbucket tokens")[0]
+
+
 def test_git_is_installed_in_the_image_for_wiki_clones_and_for_check():
     assert re.search(r"apt-get install[^\n]*\bgit\b", (ROOT / "Dockerfile").read_text().replace("\\\n", " "))
