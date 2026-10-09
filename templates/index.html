@@ -468,9 +468,10 @@ function syncVisibility(){
   $('targets').placeholder = dc ? 'PROJ/my-repo' : bb ? 'my-workspace/my-repo'
     : gh ? 'google/guava' : 'group/subgroup/project';
   $('api_base').placeholder = gh ? 'https://api.github.com' : 'https://gitlab.com';
-  // Bitbucket has no repo/owner browser here
-  $('pick-repos').hidden = bbAny;
   $('token-label').textContent = bbAny ? 'API / access token' : 'Personal access token';
+  $('token').placeholder = dc ? 'HTTP access token, or leave blank to use .env'
+    : bb ? 'email@example.com:API_TOKEN  ·  or an access token on its own'
+    : 'paste PAT, or leave blank to use .env';
   $('go').textContent = bb ? 'Collect repo data' : dc ? 'Run export & download' : 'Start migration & download';
   $('dc_job_id').hidden = $('dc_action').value !== 'cancel';
   $('targets-hint').innerHTML = dc
@@ -491,7 +492,7 @@ function syncVisibility(){
     : gh2
     ? 'Enterprise API root — usually <code>https://&lt;host&gt;/api/v3</code>.'
     : 'Instance root, no <code>/api/v4</code> — that is appended for you.';
-  $('pick-repos').textContent = gh2 ? 'Browse & select repos…' : 'Browse & select projects…';
+  $('pick-repos').textContent = gh2 || bbAny ? 'Browse & select repos…' : 'Browse & select projects…';
   const env = ENV[provider];
   $('token-hint').innerHTML = env
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
@@ -803,13 +804,15 @@ function discoverBody(kind){
   return { provider, scope: 'auto', kind,
     token: $('token').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
-    owner: provider === 'github' ? '' : $('group').value.trim() };
+    owner: provider === 'gitlab' ? $('group').value.trim() : '' };
 }
 async function openPicker(mode){
   pickerMode = mode;
   const isOwners = mode === 'owners';
   const noun = provider === 'github'
     ? (isOwners ? 'organizations' : 'repositories (yours and your orgs\')')
+    : provider === 'bitbucket' ? 'repositories (every workspace you belong to)'
+    : provider === 'bitbucket-dc' ? 'repositories (the ones this token can read)'
     : (isOwners ? 'groups' : ($('group').value.trim() ? `projects in ${$('group').value.trim()}` : 'your projects'));
   $('picker-title').textContent = `Select ${noun}`;
   $('picker-add').hidden = isOwners;

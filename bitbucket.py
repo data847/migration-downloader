@@ -266,6 +266,49 @@ def bb_forks(ctx):
     return [ctx.save_json("forks", cloud_paged(ctx, bb_url(ctx, "/forks")))]
 
 
+# ── browsing repos for the picker ────────────────────────────────────────────
+
+BROWSE_PAGE = 100
+
+
+def cloud_repos_page(token: str, page: int = 1, api_base: str = BITBUCKET_CLOUD_BASE) -> dict:
+    """One page of the repos the token's user is a member of, across every workspace."""
+    url = (f"{api_base.rstrip('/')}/repositories?role=member&sort=-updated_on"
+           f"&pagelen={BROWSE_PAGE}&page={page}")
+    data, _link, _hdrs = supplementary._json_page(url, headers=cloud_headers(token))
+    values = data.get("values", []) if isinstance(data, dict) else []
+    return {
+        "items": [{
+            "target": r["full_name"], "label": r["full_name"],
+            "private": bool(r.get("is_private")), "archived": False,
+            "size_kb": int((r.get("size") or 0) / 1024), "updated": (r.get("updated_on") or "")[:10],
+        } for r in values if r.get("full_name")],
+        "has_more": bool(data.get("next")) if isinstance(data, dict) else False,
+        "notes": [],
+    }
+
+
+def dc_repos_page(token: str, api_base: str, page: int = 1) -> dict:
+    """One page of the repos the token can read on a Data Center server, as PROJECT/slug."""
+    if not api_base:
+        raise MigrationError("Bitbucket Data Center needs its base URL to list repositories")
+    start = (page - 1) * BROWSE_PAGE
+    url = f"{api_base.rstrip('/')}/rest/api/1.0/repos?limit={BROWSE_PAGE}&start={start}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+               "User-Agent": "DataLabs-migration-downloader"}
+    data, _link, _hdrs = supplementary._json_page(url, headers=headers)
+    values = data.get("values", []) if isinstance(data, dict) else []
+    rows = []
+    for r in values:
+        key = (r.get("project") or {}).get("key")
+        if key and r.get("slug"):
+            rows.append({"target": f"{key}/{r['slug']}", "label": f"{key}/{r['slug']}",
+                         "private": not r.get("public", False), "archived": bool(r.get("archived")),
+                         "size_kb": 0, "updated": ""})
+    more = isinstance(data, dict) and not data.get("isLastPage", True)
+    return {"items": rows, "has_more": more, "notes": []}
+
+
 # ── Bitbucket Data Center ────────────────────────────────────────────────────
 
 

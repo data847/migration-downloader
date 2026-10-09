@@ -28,6 +28,7 @@ from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # 
 from migration_api import GitHubMigration, GitLabExport, MigrationError, brief_error, mask  # noqa: E402
 from runner import COMPONENT, JobSpec, issues_from_manifest, list_runs, run_job  # noqa: E402
 from supplementary import HEAVY, REGISTRY  # noqa: E402
+import bitbucket  # noqa: E402
 import bundle  # noqa: E402
 import jobstore  # noqa: E402
 import redact  # noqa: E402
@@ -231,12 +232,15 @@ def discover():
         page = max(1, int(data.get("page") or 1))
     except (TypeError, ValueError):
         return jsonify(error="page must be a number"), 400
-    token = (data.get("token") or "").strip() or (
-        github_token() if provider == "github" else gitlab_token())
+    token = (data.get("token") or "").strip() or JobSpec(provider=provider).resolved_token()
     if not token:
         return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
     try:
-        if provider == "github":
+        if provider == "bitbucket":
+            result = bitbucket.cloud_repos_page(token, page)
+        elif provider == "bitbucket-dc":
+            result = bitbucket.dc_repos_page(token, api_base, page)
+        elif provider == "github":
             client = GitHubMigration(token, scope="org" if scope == "org" else "user",
                                      org=owner or "x",
                                      api_base=api_base or "https://api.github.com")

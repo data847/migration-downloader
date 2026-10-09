@@ -677,6 +677,7 @@ class TestIssues:
 def client(monkeypatch):
     import app
     monkeypatch.setattr(app, "github_token", lambda: "env-token")
+    monkeypatch.setattr(runner, "github_token", lambda: "env-token")      # what discovery resolves through
     return app.app.test_client()
 
 

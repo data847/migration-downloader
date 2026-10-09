@@ -94,6 +94,14 @@ login go through `/user/migrations`; every other owner's go through that org's
 within an owner, never across). `--scope user` / `--scope org --org X` still
 force the old behaviour, and org scope still takes bare names.
 
+Bitbucket has the same picker. Cloud lists every repo the token's user is a
+member of (`/repositories?role=member`) as `workspace/repo`; Data Center lists
+what the token can read (`/rest/api/1.0/repos`) as `PROJECT/slug` and needs its
+base URL typed first. Token format for the box: an API token is
+`email@example.com:API_TOKEN`; a repository, project or workspace access token
+is pasted on its own; a Data Center HTTP access token is pasted on its own.
+Leave the box blank to use `BITBUCKET_TOKEN` / `BITBUCKET_DC_TOKEN` from `.env`.
+
 Selected entries are appended to the target list as `owner/repo`
 (GitHub) or `group/subgroup/project` (GitLab). GitLab discovery filters to Maintainer
 (access level 40) or above, since that is the floor for exporting a project, so
