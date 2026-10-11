@@ -248,19 +248,26 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
         result = ArchiveResult(target=project)
         log("")
         log(f"[{index}/{len(spec.targets)}] {project}")
-        dest = dest_dir / f"{safe_name(project)}.tar.gz"
+        # id-suffixed, like GitHub's naming — two distinct projects can
+        # normalise to the same safe_name() stem (e.g. "team-a/proj" and
+        # "team/a-proj" both -> "team-a-proj"), which would otherwise let one
+        # silently overwrite the other's archive. Before the id is known
+        # (first attempt), fall back to the unsuffixed name.
+        stem = safe_name(project)
+        known_id = spec.known_ids.get(project, "")
+        precheck_dest = dest_dir / (f"{stem}-{known_id}.tar.gz" if known_id else f"{stem}.tar.gz")
         try:
             if cancelled and cancelled():
                 raise MigrationError("cancelled")
-            if spec.skip_done and dest.is_file() and dest.stat().st_size:
+            if spec.skip_done and precheck_dest.is_file() and precheck_dest.stat().st_size:
                 # resume: the archive is already on disk, don't re-export it
-                log(f"  already downloaded ({human(dest.stat().st_size)}) — skipping")
+                log(f"  already downloaded ({human(precheck_dest.stat().st_size)}) — skipping")
                 result.skipped = True
-                result.path = dest
-                result.bytes = dest.stat().st_size
+                result.path = precheck_dest
+                result.bytes = precheck_dest.stat().st_size
                 results.append(result)
                 continue
-            if spec.known_ids.get(project) and _already_finished(client, project, log):
+            if known_id and _already_finished(client, project, log):
                 pass
             else:
                 client.start(project)
@@ -273,6 +280,7 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
             result.state = data.get("export_status", "")
             project_id = data.get("id")
             result.migration_id = str(project_id) if project_id else None
+            dest = dest_dir / (f"{stem}-{project_id}.tar.gz" if project_id else f"{stem}.tar.gz")
             client.download(project, dest, project_id=project_id)
             result.path = dest
             result.bytes = dest.stat().st_size
