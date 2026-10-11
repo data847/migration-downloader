@@ -112,7 +112,7 @@ def job_status(job_id: str):
         manifest=job["manifest"],
         spec=job["spec"],
         created_utc=job["created_utc"],
-        lines=job["log"][since:],
+        lines=redact.scrub_lines(job["log"][since:]),
         total_lines=len(job["log"]),
         resumable=bool(jobstore.resume_plan(job)),
     )
