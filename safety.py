@@ -15,6 +15,7 @@ None of these are clever; each closes one specific way things go wrong:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import urllib.parse
@@ -46,6 +47,35 @@ def http_url(url: str) -> str:
     if scheme not in {"http", "https"}:
         raise MigrationError(f"refusing to open a {scheme or 'schemeless'} URL")
     return url
+
+
+# Hosts a token from .env may be sent to without the user pasting it explicitly.
+DEFAULT_API_HOSTS = {
+    "github": {"api.github.com"},
+    "gitlab": {"gitlab.com"},
+    "bitbucket": {"api.bitbucket.org"},
+    "bitbucket-dc": set(),
+}
+
+
+def _env_hosts(name: str) -> set:
+    return {h.strip().lower() for h in os.environ.get(name, "").split(",") if h.strip()}
+
+
+def trusted_api_base(provider: str, api_base: str) -> bool:
+    """May the .env token be sent to `api_base`? A request body chooses api_base,
+    so without this an attacker-chosen host would receive the stored token.
+    Self-hosted instances opt in with MD_TRUSTED_API_HOSTS=host1,host2."""
+    if not api_base:
+        return True
+    host = (urllib.parse.urlparse(api_base).hostname or "").lower()
+    return host in DEFAULT_API_HOSTS.get(provider, set()) | _env_hosts("MD_TRUSTED_API_HOSTS")
+
+
+def request_host_allowed(host_header: str) -> bool:
+    """Host/Origin allow-list against DNS rebinding: the UI is local-only."""
+    host = urllib.parse.urlparse("//" + (host_header or "")).hostname or ""
+    return host.lower() in {"localhost", "127.0.0.1", "::1"} | _env_hosts("MD_ALLOWED_HOSTS")
 
 
 def _origin(url: str):

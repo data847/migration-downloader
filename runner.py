@@ -43,7 +43,7 @@ from migration_api import (  # noqa: E402
 
 import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
 import ratelimit  # noqa: E402
-from safety import MIN_FREE_MB, check_disk, require_valid_target  # noqa: E402
+from safety import MIN_FREE_MB, check_disk, require_valid_target, trusted_api_base  # noqa: E402
 from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
 from supplementary import REGISTRY, Ctx, resolve_names  # noqa: E402
 
@@ -71,11 +71,21 @@ def _parse_owner_repo(target: str) -> str:
     return path
 
 
+def _int(data: dict, key: str, default: int) -> int:
+    try:
+        return int(data.get(key) or default)
+    except (TypeError, ValueError):
+        raise MigrationError(f"{key} must be a whole number") from None
+
+
 def _max_items(raw) -> int:
     """Blank -> no limit (the default); 0 -> no limit; anything else is the cap."""
     if raw in (None, ""):
         return 0
-    return max(0, int(raw))
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        raise MigrationError("max_items must be a whole number") from None
 
 
 def _split(raw) -> List[str]:
@@ -134,8 +144,8 @@ class JobSpec:
             api_version=(data.get("api_version") or "").strip(),
             lock_repositories=flag("lock_repositories"),
             single_archive=flag("single_archive"),
-            poll_interval=max(5, int(data.get("poll_interval") or 15)),
-            timeout=max(60, int(data.get("timeout") or 3600)),
+            poll_interval=max(5, _int(data, "poll_interval", 15)),
+            timeout=max(60, _int(data, "timeout", 3600)),
             verify_checksum=flag("verify_checksum"),
             run_name=(data.get("run_name") or "").strip(),
             for_check=str(data.get("for_check", "1")).lower() not in {"0", "false", "off", "no"},
@@ -201,6 +211,10 @@ class JobSpec:
             raise MigrationError("upload_url only applies to GitLab")
         if self.unlock_repos and not self.lock_repositories:
             raise MigrationError("unlock_repos only makes sense with lock_repositories")
+        if not self.token and not trusted_api_base(self.provider, self.api_base):
+            raise MigrationError(
+                "paste a token to use a custom API base: the token stored in .env is only sent to the "
+                "default host (list self-hosted hosts in MD_TRUSTED_API_HOSTS to allow it)")
         if not self.resolved_token():
             raise MigrationError(
                 f"no token supplied and none found in .env ({self.token_env_hint()})")

@@ -27,6 +27,7 @@ import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ensure_outputs, outputs_for
 from migration_api import mask, normalise_gitlab_project, safe_name
+import redact
 from runner import COMPONENT, JobSpec
 
 JOBS_DIR = ensure_outputs(COMPONENT, ".jobs")
@@ -81,7 +82,7 @@ def create(spec: JobSpec) -> str:
             "manifest": None,
             "error": "",
             "cancel": False,
-            "spec": _public_spec(spec),
+            "spec": redact.scrub_spec(_public_spec(spec)),
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "updated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
@@ -109,6 +110,10 @@ def update(job_id: str, **fields) -> None:
         job = _jobs.get(job_id)
         if job is None:
             return
+        if "manifest" in fields:
+            fields["manifest"] = redact.scrub_obj(fields["manifest"])
+        if "error" in fields:
+            fields["error"] = redact.scrub(fields["error"] or "")
         job.update(fields)
         job["updated_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _flush(job_id, force=True)

@@ -659,7 +659,7 @@ $('resume').onclick = async () => {
   $('banner').hidden = true;
   attach(data.id);
 };
-$('cancel').onclick = () => fetch(`/api/jobs/${jobId}/cancel`, {method:'POST'});
+$('cancel').onclick = () => fetch(`/api/jobs/${jobId}/cancel`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
 $('refresh').onclick = () => { loadJobs(); loadRuns(); };
 
 $('form').onsubmit = async (ev) => {

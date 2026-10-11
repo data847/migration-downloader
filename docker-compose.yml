@@ -4,7 +4,8 @@ services:
     image: migration-downloader:latest
     container_name: migration-downloader
     ports:
-      - "8765:8765"
+      # loopback only: the UI has no login and can use the tokens in .env
+      - "127.0.0.1:8765:8765"
     volumes:
       # invariant #2 — archives, manifests and job records land in the one
       # outputs root on the host, not inside the container

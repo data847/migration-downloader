@@ -113,6 +113,16 @@ def scrub_obj(obj: Any) -> Any:
     return obj
 
 
+def scrub_spec(spec: dict) -> dict:
+    """A job's public spec, scrubbed. `token_hint` is already masked, so it is
+    kept rather than blanked by the secret-key rule."""
+    hint = spec.get("token_hint")
+    out = scrub_obj(spec)
+    if isinstance(out, dict) and hint is not None:
+        out["token_hint"] = hint
+    return out
+
+
 TEXT_SUFFIXES = {"", ".log", ".txt", ".md", ".json", ".ndjson", ".yml", ".yaml", ".out"}
 MAX_SCRUB_BYTES = 256 * 1024 * 1024        # per file / per zip, uncompressed
 

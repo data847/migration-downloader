@@ -770,3 +770,41 @@ class TestJobLogEndpoint:
         reply = client.get(f"/api/jobs/{job_id}/log")
         assert reply.status_code == 200 and reply.mimetype == "text/plain"
         assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in reply.get_data(as_text=True)
+
+
+class TestWebGuard:
+    def test_text_plain_post_is_refused(self, client):
+        reply = client.post("/api/jobs", data='{"provider":"github"}', content_type="text/plain")
+        assert reply.status_code == 415
+
+    def test_foreign_host_and_origin_are_refused(self, client):
+        assert client.get("/api/runs", headers={"Host": "evil.example:8765"}).status_code == 403
+        assert client.get("/api/runs", headers={"Origin": "http://evil.example"}).status_code == 403
+        assert client.post("/api/discover", json={}, headers={"Origin": "null"}).status_code == 403
+        assert client.get("/api/runs", headers={"Host": "127.0.0.1:8765"}).status_code == 200
+
+    def test_malformed_bodies_are_400_not_500(self, client):
+        assert client.post("/api/jobs", json=[1, 2]).status_code == 400
+        assert client.post("/api/jobs", json={"targets": "o/r", "poll_interval": "abc"}).status_code == 400
+        assert client.post("/api/jobs", json={"targets": "o/r", "max_items": "x"}).status_code == 400
+
+    def test_env_token_is_never_sent_to_a_custom_api_base(self, client, monkeypatch):
+        monkeypatch.setattr(mig.GitHubMigration, "repos_page",
+                            lambda *a, **k: pytest.fail("env token must not reach a custom host"))
+        reply = client.post("/api/discover", json={"provider": "github", "api_base": "https://evil.example"})
+        assert reply.status_code == 400 and "custom API base" in reply.get_json()["error"]
+        spec = runner.JobSpec(provider="github", targets=["o/r"], api_base="https://evil.example")
+        with pytest.raises(MigrationError, match="custom API base"):
+            spec.validate()
+        monkeypatch.setenv("MD_TRUSTED_API_HOSTS", "ghe.corp.example")
+        runner.JobSpec(provider="github", targets=["o/r"], api_base="https://ghe.corp.example/api/v3").validate()
+
+    def test_job_response_scrubs_error_manifest_and_spec(self, client):
+        import jobstore
+        job_id = jobstore.create(runner.JobSpec(provider="github", token="t", targets=["o/r"],
+                                                api_base="https://user:pw@ghe.example"))
+        jobstore.update(job_id, state="error", error="HTTP 500 {\"token\": \"x\"} Bearer abc123def456",
+                        manifest={"archives": [{"target": "o/r", "error": "Authorization: Bearer zzzzzzzz"}]})
+        body = client.get(f"/api/jobs/{job_id}").get_data(as_text=True)
+        assert "pw@" not in body and "abc123def456" not in body and "zzzzzzzz" not in body
+        assert "token_hint" in body

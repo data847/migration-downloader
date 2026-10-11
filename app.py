@@ -20,6 +20,7 @@ import sys
 import threading
 import traceback
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 
@@ -33,12 +34,36 @@ import bitbucket  # noqa: E402
 import bundle  # noqa: E402
 import jobstore  # noqa: E402
 import redact  # noqa: E402
+from safety import request_host_allowed, trusted_api_base  # noqa: E402
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 # pick up template edits without a restart
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 atexit.register(jobstore.flush_all)
+
+
+@app.before_request
+def _guard():
+    """The UI has no login, so anything that can reach the port could drive it.
+    Pin it to local Host/Origin (DNS rebinding) and to real JSON bodies: a
+    cross-origin form or text/plain fetch is a "simple" request that skips the
+    CORS preflight, and application/json is not."""
+    if not request_host_allowed(request.host):
+        return jsonify(error="host not allowed (set MD_ALLOWED_HOSTS to add one)"), 403
+    origin = request.headers.get("Origin")
+    if origin and origin != "null" and not request_host_allowed(urlparse(origin).netloc):
+        return jsonify(error="cross-origin request refused"), 403
+    if origin == "null":
+        return jsonify(error="cross-origin request refused"), 403
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and request.mimetype != "application/json":
+        return jsonify(error="Content-Type must be application/json"), 415
+    return None
+
+
+def _body() -> dict:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
 
 
 def _start(spec: JobSpec) -> str:
@@ -94,8 +119,8 @@ def index():
 
 @app.post("/api/jobs")
 def create_job():
-    spec = JobSpec.from_form(request.get_json(force=True, silent=True) or {})
     try:
+        spec = JobSpec.from_form(_body())
         spec.validate()
     except MigrationError as exc:
         return jsonify(error=str(exc)), 400
@@ -122,13 +147,15 @@ def job_status(job_id: str):
         issues = manifest.get("issues")
         if issues is None:
             issues = issues_from_manifest(manifest)
+    # server error bodies and a user:pw@ api_base can carry secrets, and none of
+    # these fields went through the log scrubber
     return jsonify(
         id=job["id"],
         state=job["state"],
-        error=job["error"],
-        issues=issues,
-        manifest=manifest,
-        spec=job["spec"],
+        error=redact.scrub(job["error"] or ""),
+        issues=redact.scrub_obj(issues),
+        manifest=redact.scrub_obj(manifest),
+        spec=redact.scrub_spec(job["spec"]),
         created_utc=job["created_utc"],
         lines=redact.scrub_lines(job["log"][since:]),
         total_lines=len(job["log"]),
@@ -205,7 +232,7 @@ def resume_job(job_id: str):
         return jsonify(error="that run is still going"), 409
     if not jobstore.resume_plan(job):
         return jsonify(error="nothing left to resume — every archive is downloaded"), 400
-    token = (request.get_json(force=True, silent=True) or {}).get("token", "")
+    token = str(_body().get("token") or "").strip()
     spec = jobstore.spec_for_resume(job, token=token)
     try:
         spec.validate()
@@ -226,7 +253,7 @@ def discover():
     `api_base` is honoured throughout, so this works against GitHub Enterprise
     and a self-hosted GitLab exactly as it does against the public hosts.
     """
-    data = request.get_json(force=True, silent=True) or {}
+    data = _body()
     provider = (data.get("provider") or "github").strip().lower()
     kind = (data.get("kind") or "repos").strip().lower()       # repos | owners
     scope = (data.get("scope") or "auto").strip().lower()
@@ -236,7 +263,11 @@ def discover():
         page = max(1, int(data.get("page") or 1))
     except (TypeError, ValueError):
         return jsonify(error="page must be a number"), 400
-    token = (data.get("token") or "").strip() or JobSpec(provider=provider).resolved_token()
+    token = (data.get("token") or "").strip()
+    if not token and not trusted_api_base(provider, api_base):
+        return jsonify(error="paste a token to use a custom API base: the .env token is only "
+                             "sent to the default host"), 400
+    token = token or JobSpec(provider=provider).resolved_token()
     if not token:
         return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
     try:
