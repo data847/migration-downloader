@@ -91,7 +91,9 @@ def _run_root(run: str) -> Path:
     """Resolve `<outputs>/migration-downloader/<run>`, refusing path escapes."""
     root = outputs_for(COMPONENT).resolve()
     path = (root / run).resolve()
-    if root != path.parent or not path.is_dir():
+    # dot-dirs (.jobs holds raw job records) are never runs; a real run has a manifest
+    if (run.startswith(".") or root != path.parent or not path.is_dir()
+            or not (path / "manifest.json").is_file()):
         abort(404)
     return path
 

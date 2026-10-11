@@ -808,3 +808,45 @@ class TestWebGuard:
         body = client.get(f"/api/jobs/{job_id}").get_data(as_text=True)
         assert "pw@" not in body and "abc123def456" not in body and "zzzzzzzz" not in body
         assert "token_hint" in body
+
+
+@pytest.fixture
+def outputs(tmp_path, monkeypatch):
+    """A private outputs root + job store, so path tests touch nothing real."""
+    import datalabs_paths
+    import jobstore
+    monkeypatch.setattr(datalabs_paths, "OUTPUTS_ROOT", tmp_path)
+    monkeypatch.setattr(jobstore, "JOBS_DIR", tmp_path / runner.COMPONENT / ".jobs")
+    jobstore.JOBS_DIR.mkdir(parents=True)
+    monkeypatch.setattr(jobstore, "_jobs", {})
+    monkeypatch.setattr(jobstore, "_dirty", {})
+    return tmp_path / runner.COMPONENT
+
+
+class TestRunNames:
+    @pytest.mark.parametrize("name", ["..", ".", ".jobs", ".hidden"])
+    def test_dotted_run_names_are_rejected(self, name):
+        with pytest.raises(MigrationError, match="dot"):
+            runner.JobSpec(provider="github", token="t", targets=["o/r"], run_name=name).validate()
+
+    def test_run_dir_stays_under_the_outputs_root(self, outputs):
+        path = runner.run_dir(runner.JobSpec(provider="github", run_name="my run"))
+        assert path.parent == outputs.resolve() or path.parent == outputs
+
+    def test_dot_dirs_are_not_runs_over_the_api(self, client, outputs):
+        (outputs / ".jobs").mkdir(parents=True, exist_ok=True)
+        (outputs / ".jobs" / "manifest.json").write_text("{}")
+        assert client.get("/api/archive/.jobs/manifest.json").status_code == 404
+        assert client.get("/api/archive-zip/.jobs").status_code == 404
+        (outputs / "bare").mkdir()                      # no manifest.json: not a run either
+        assert client.get("/api/archive-zip/bare").status_code == 404
+        assert runner.list_runs() == []
+
+    def test_load_from_disk_skips_junk(self, outputs):
+        import jobstore
+        (jobstore.JOBS_DIR / "manifest.json").write_text(json.dumps({"archives": []}))
+        (jobstore.JOBS_DIR / "list.json").write_text("[1]")
+        (jobstore.JOBS_DIR / "bin.json").write_bytes(b"\xff\xfe")
+        good = jobstore.create(runner.JobSpec(provider="github", token="t", targets=["o/r"]))
+        jobstore._jobs.clear()
+        assert jobstore.load_from_disk() == 1 and good in jobstore._jobs

@@ -183,6 +183,7 @@ class JobSpec:
     def validate(self) -> None:
         if self.provider not in PROVIDERS:
             raise MigrationError(f"provider must be one of {sorted(PROVIDERS)}")
+        check_run_name(self.run_name)
         cancel_only = self.provider == "bitbucket-dc" and self.dc_action == "cancel"
         if not self.targets and not cancel_only:
             raise MigrationError("give at least one repository / project")
@@ -232,8 +233,16 @@ def _already_finished(client: GitLabExport, project: str, log) -> bool:
     return False
 
 
+def check_run_name(run_name: str) -> None:
+    """`safe_name` keeps dots, so '..' / '.' / '.jobs' would climb out of the
+    run folder or land in the job store; a leading dot is never a run."""
+    if run_name and safe_name(run_name).startswith("."):
+        raise MigrationError("run_name must not start with a dot")
+
+
 def run_dir(spec: JobSpec) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    check_run_name(spec.run_name)
     label = safe_name(spec.run_name) if spec.run_name else f"{spec.provider}-{stamp}"
     return ensure_outputs(COMPONENT, label)
 
@@ -769,6 +778,8 @@ def list_runs(limit: int = 40) -> List[dict]:
         return []
     runs = []
     for path in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
+        if path.name.startswith("."):       # .jobs is the job store, not a run
+            continue
         manifest = path / "manifest.json"
         if not manifest.is_file():
             continue

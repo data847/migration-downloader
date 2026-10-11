@@ -318,11 +318,20 @@ def load_from_disk() -> int:
     for path in sorted(JOBS_DIR.glob("*.json"))[-KEEP_JOBS:]:
         try:
             job = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
+        # a stray file (e.g. a run's manifest.json) must not crash startup
+        if (not isinstance(job, dict) or job.get("id") != path.stem
+                or not isinstance(job.get("spec"), dict) or not job["spec"].get("provider")):
+            continue
+        job.setdefault("state", "interrupted")
+        job.setdefault("manifest", None)
+        job.setdefault("error", "")
+        job.setdefault("created_utc", "")
+        job.setdefault("updated_utc", "")
         job.setdefault("cancel", False)
-        job.setdefault("log", [])
-        job.setdefault("spec", {})
+        if not isinstance(job.get("log"), list):
+            job["log"] = []
         if job.get("state") == "running":
             job["state"] = "interrupted"
             job["log"].append("")
