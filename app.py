@@ -66,8 +66,10 @@ def _body() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _start(spec: JobSpec) -> str:
+def _start(spec: JobSpec, notes: tuple = ()) -> str:
     job_id = jobstore.create(spec)
+    for note in notes:                  # before the worker starts, so they lead the log
+        jobstore.append(job_id, note)
     threading.Thread(target=_worker, args=(job_id, spec), daemon=True).start()
     return job_id
 
@@ -126,7 +128,10 @@ def create_job():
         spec.validate()
     except MigrationError as exc:
         return jsonify(error=str(exc)), 400
-    return jsonify(id=_start(spec))
+    try:
+        return jsonify(id=_start(spec))
+    except jobstore.RunBusy as exc:
+        return jsonify(error=str(exc)), 409
 
 
 @app.get("/api/jobs")
@@ -232,6 +237,10 @@ def resume_job(job_id: str):
         abort(404)
     if job["state"] == "running":
         return jsonify(error="that run is still going"), 409
+    if job["spec"].get("upload_url_set"):
+        # the presigned URL is a credential and is never stored, so there is nothing to resume with
+        return jsonify(error="this run had GitLab upload to a presigned URL, which is not saved; "
+                             "start a new run with a fresh upload URL"), 400
     if not jobstore.resume_plan(job):
         return jsonify(error="nothing left to resume — every archive is downloaded"), 400
     token = str(_body().get("token") or "").strip()
@@ -240,7 +249,14 @@ def resume_job(job_id: str):
         spec.validate()
     except MigrationError as exc:
         return jsonify(error=str(exc)), 400
-    return jsonify(id=_start(spec))
+    notes = ()
+    if not token and not job["spec"].get("token_from_env"):
+        notes = ("warning: the original run used a pasted token, which is never saved; "
+                 "resuming with the token from .env instead",)
+    try:
+        return jsonify(id=_start(spec, notes))
+    except jobstore.RunBusy as exc:
+        return jsonify(error=str(exc)), 409
 
 
 @app.post("/api/discover")

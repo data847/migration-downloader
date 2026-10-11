@@ -8,6 +8,7 @@ alongside a `manifest.json` describing the run.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tarfile
 import time
@@ -221,6 +222,22 @@ class JobSpec:
                 f"no token supplied and none found in .env ({self.token_env_hint()})")
 
 
+def existing_archive(run_dir: Path, stem: str, ids=()) -> Optional[Path]:
+    """A finished `{stem}[-{id}].tar.gz` in the run dir, else None.
+
+    Archives are named with the migration/export id, which a crash between the
+    download and the manifest write never recorded, so a numeric suffix is
+    matched too (exact pattern, so `acme-api` never claims `acme-api-v2-9.tar.gz`)."""
+    pattern = re.compile(rf"^{re.escape(stem)}(?:-\d+)?\.tar\.gz$")
+    names = [f"{stem}-{i}.tar.gz" for i in ids if i] + [f"{stem}.tar.gz"]
+    try:
+        found = [p for p in run_dir.iterdir() if p.is_file() and p.stat().st_size and pattern.match(p.name)]
+    except OSError:
+        return None
+    found.sort(key=lambda p: (p.name not in names, -p.stat().st_mtime))
+    return found[0] if found else None
+
+
 def _already_finished(client: GitLabExport, project: str, log) -> bool:
     """On resume, an export that is already `finished` needs no fresh POST."""
     try:
@@ -308,6 +325,8 @@ def run_job(
         "extras_failed": sum(1 for e in extras if e["error"]),
         "jobs_failed": sum(1 for j in export_jobs if j.get("error")),
     }
+    if spec.skip_done:
+        _merge_resumed(manifest, dest_dir / "manifest.json")
     manifest["failed"] = manifest["archives_failed"] + manifest["extras_failed"] + manifest["jobs_failed"]
     manifest["issues"] = issues_from_manifest(manifest)
     (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -333,6 +352,37 @@ def run_job(
             log(f"  ! {item['target'] or item['kind']} · {item['step']}: {item['message']}")
     log(f"manifest: {dest_dir / 'manifest.json'}")
     return manifest
+
+
+def _merge_resumed(manifest: dict, path: Path) -> None:
+    """A resume only runs what was outstanding; writing its manifest as-is would
+    drop the earlier archives, their sha256 and the original start time."""
+    try:
+        old = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(old, dict):
+        return
+    fresh = {a["target"]: a for a in manifest["archives"]}
+    merged = []
+    for a in old.get("archives", []):
+        new = fresh.pop(a.get("target"), None)
+        # a retry that failed again must not erase an earlier good download
+        if new and new.get("ok") and a.get("ok") and not new.get("sha256"):
+            new["sha256"] = a.get("sha256", "")
+        merged.append(a if (new is None or (a.get("ok") and not new.get("ok"))) else new)
+    manifest["archives"] = merged + list(fresh.values())
+    manifest["ok"] = sum(1 for a in manifest["archives"] if a.get("ok"))
+    manifest["archives_failed"] = sum(1 for a in manifest["archives"] if a.get("error"))
+    if old.get("started_utc"):
+        manifest["started_utc"] = old["started_utc"]
+    manifest["elapsed_seconds"] = round(manifest["elapsed_seconds"] + float(old.get("elapsed_seconds") or 0), 1)
+    if not manifest["extras"]:
+        manifest["extras"] = old.get("extras", [])
+        manifest["extras_failed"] = sum(1 for e in manifest["extras"] if e.get("error"))
+    if not manifest["export_jobs"]:
+        manifest["export_jobs"] = old.get("export_jobs", [])
+        manifest["jobs_failed"] = sum(1 for j in manifest["export_jobs"] if j.get("error"))
 
 
 # ── issues: what went wrong, in plain terms ──────────────────────────────────
@@ -514,17 +564,29 @@ def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResu
                                                       api_base=client.api_base, token=token,
                                                       owner=rp["owner"], repo=rp["repo"])
             migration_id = spec.known_ids.get(label, "")
+            data = None
             if migration_id:
                 log(f"  reusing migration id {migration_id}")
-            else:
+                try:
+                    data = client.wait(migration_id, interval=spec.poll_interval,
+                                       timeout=spec.timeout, cancelled=cancelled)
+                except MigrationError as exc:
+                    # a failed or deleted migration never recovers, and re-polling it
+                    # would fail forever; any other error (timeout, cancel) is retryable
+                    if "ended in state" not in str(exc) and "HTTP 404" not in str(exc):
+                        raise
+                    log(f"  known migration is unusable ({brief_error(exc)}) — starting a new one")
+                    migration_id = ""
+            if not migration_id:
                 migration_id = client.start(batch)
             result.migration_id = migration_id
-            data = client.wait(
-                migration_id,
-                interval=spec.poll_interval,
-                timeout=spec.timeout,
-                cancelled=cancelled,
-            )
+            if data is None:
+                data = client.wait(
+                    migration_id,
+                    interval=spec.poll_interval,
+                    timeout=spec.timeout,
+                    cancelled=cancelled,
+                )
             result.state = data.get("state", "")
             if fc:
                 for rp in fc["repos"]:
@@ -610,11 +672,11 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
         # (first attempt), fall back to the unsuffixed name.
         stem = safe_name(project)
         known_id = spec.known_ids.get(project, "")
-        precheck_dest = dest_dir / (f"{stem}-{known_id}.tar.gz" if known_id else f"{stem}.tar.gz")
+        precheck_dest = existing_archive(dest_dir, stem, [known_id]) if spec.skip_done else None
         try:
             if cancelled and cancelled():
                 raise MigrationError("cancelled")
-            if spec.skip_done and precheck_dest.is_file() and precheck_dest.stat().st_size:
+            if precheck_dest:
                 # resume: the archive is already on disk, don't re-export it
                 log(f"  already downloaded ({human(precheck_dest.stat().st_size)}) — skipping")
                 result.skipped = True

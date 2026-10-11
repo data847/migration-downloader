@@ -15,6 +15,7 @@ Tokens are never persisted — only the masked form, for display.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -28,7 +29,8 @@ import bootstrap  # noqa: F401  (sets sys.path)
 from datalabs_paths import ensure_outputs, outputs_for
 from migration_api import mask, normalise_gitlab_project, safe_name
 import redact
-from runner import COMPONENT, JobSpec
+from errors import MigrationError
+from runner import COMPONENT, JobSpec, existing_archive
 
 JOBS_DIR = ensure_outputs(COMPONENT, ".jobs")
 FLUSH_SECONDS = 1.0
@@ -37,6 +39,11 @@ KEEP_JOBS = 60
 _lock = threading.RLock()
 _jobs: Dict[str, dict] = {}
 _dirty: Dict[str, float] = {}
+_plan_cache: Dict[str, tuple] = {}
+
+
+class RunBusy(MigrationError):
+    """Another job is already writing to that run folder."""
 
 
 def _path(job_id: str) -> Path:
@@ -66,7 +73,12 @@ def _public_spec(spec: JobSpec) -> dict:
         "delete_archive": spec.delete_archive,
         "description": spec.description,
         "dc_action": spec.dc_action,
-        # upload_url is deliberately not stored: a presigned URL is a credential
+        "dc_job_id": spec.dc_job_id,
+        "for_check": spec.for_check,
+        "upload_method": spec.upload_method,
+        # upload_url is deliberately not stored: a presigned URL is a credential.
+        # The flag lets resume refuse instead of silently downloading instead.
+        "upload_url_set": bool(spec.upload_url),
         "token_hint": mask(spec.resolved_token()),
         "token_from_env": not spec.token,
     }
@@ -75,6 +87,11 @@ def _public_spec(spec: JobSpec) -> dict:
 def create(spec: JobSpec) -> str:
     job_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
     with _lock:
+        if spec.run_name and any(
+                j["state"] == "running" and j["spec"].get("run_name") == spec.run_name
+                for j in _jobs.values()):
+            # two jobs on one run dir would fight over the same .part files and manifest
+            raise RunBusy(f"run '{spec.run_name}' already has a job in progress")
         _jobs[job_id] = {
             "id": job_id,
             "state": "running",
@@ -187,31 +204,73 @@ def _spec_targets(job: dict) -> list:
     return targets
 
 
+_DEAD_MIGRATION = ("ended in state", "HTTP 404")
+
+
+def _batch_members(label: str) -> list:
+    """single_archive records one result whose target is "a, b, c"."""
+    return [t.strip() for t in label.split(",") if t.strip()]
+
+
 def resume_plan(job: dict) -> Optional[dict]:
-    """What is left to do for an interrupted / partial job."""
+    """What is left to do for an interrupted / partial job.
+
+    Cached per job: the listing and every status poll ask for it, and it
+    rescans the whole log and lists the run dir. The key covers everything that
+    changes the answer, including the run dir's mtime (a resumed job finishing
+    an archive there)."""
     if job["state"] not in {"interrupted", "partial", "error", "cancelled"}:
         return None
+    if job.get("spec", {}).get("upload_url_set"):
+        return None
     manifest = job.get("manifest") or {}
+    run = _run_dir_name(job, manifest)
+    try:
+        mtime = os.stat(outputs_for(COMPONENT, run)).st_mtime_ns if run else 0
+    except OSError:
+        mtime = 0
+    key = (job["state"], job.get("updated_utc"), len(job["log"]), mtime)
+    cached = _plan_cache.get(job.get("id", ""))
+    if cached and cached[0] == key:
+        return cached[1]
+    plan = _compute_plan(job, manifest)
+    if job.get("id"):
+        _plan_cache[job["id"]] = (key, plan)
+    return plan
+
+
+def _compute_plan(job: dict, manifest: dict) -> Optional[dict]:
     archives = manifest.get("archives", [])
-    done = {a["target"] for a in archives if a.get("ok")}
-    done |= _already_on_disk(job, manifest)
-    known = {a["target"]: a["migration_id"] for a in archives if a.get("migration_id")}
+    single = bool(job["spec"].get("single_archive"))
+    targets = _spec_targets(job)
+    done_labels = {a["target"] for a in archives if a.get("ok")}
+    # a migration that ended failed / was deleted can never finish; resuming it
+    # would re-poll the dead id forever, so only retryable ids are carried over
+    known = {a["target"]: a["migration_id"] for a in archives
+             if a.get("migration_id") and not any(m in (a.get("error") or "") for m in _DEAD_MIGRATION)}
     # ids also survive in the log when the crash happened before the manifest.
     # runner.py logs "[i/n] <label>" right before each target/batch's own
     # work, so track that marker to attribute a recovered id to the right
     # target instead of always the first one.
-    current = _spec_targets(job)[0] if job["spec"]["targets"] else ""
+    current = targets[0] if job["spec"]["targets"] else ""
     for line in job["log"]:
         marker = re.match(r"^\[\d+/\d+\]\s+(.+)$", line)
         if marker:
             current = marker.group(1)
         elif "migration id = " in line:
-            known.setdefault(current, line.split("migration id = ")[1].split()[0])
-    outstanding = [t for t in _spec_targets(job) if t not in done]
+            known[current] = line.split("migration id = ")[1].split()[0]
+        elif line.lstrip().startswith("ERROR") and any(m in line for m in _DEAD_MIGRATION):
+            known.pop(current, None)
+    known = {k: v for k, v in known.items() if v}
+    done = set(done_labels)
+    for label in done_labels:
+        if single:
+            done |= set(_batch_members(label))
+    done |= _already_on_disk(job, manifest, known)
+    outstanding = [t for t in targets if t not in done]
     if not outstanding:
         return None
-    return {"targets": outstanding, "known_ids": {k: v for k, v in known.items() if v},
-            "run_name": _run_dir_name(job, manifest)}
+    return {"targets": outstanding, "known_ids": known, "run_name": _run_dir_name(job, manifest)}
 
 
 def _run_dir_name(job: dict, manifest: dict) -> str:
@@ -231,12 +290,14 @@ def _run_dir_name(job: dict, manifest: dict) -> str:
     return job.get("spec", {}).get("run_name", "")
 
 
-def _already_on_disk(job: dict, manifest: dict) -> set:
+def _already_on_disk(job: dict, manifest: dict, known: dict) -> set:
     """Targets whose archive is already in the run directory.
 
     A crash between the download and the manifest write leaves a good tarball
     with no record of it; without this check the run would look resumable
-    forever and a resume would re-export work that is already done.
+    forever and a resume would re-export work that is already done. Archives are
+    named `{stem}-{id}.tar.gz` and the id is exactly what that crash lost, so
+    the name is matched with any numeric id.
     """
     run = _run_dir_name(job, manifest)
     if not run:
@@ -244,16 +305,16 @@ def _already_on_disk(job: dict, manifest: dict) -> set:
     run_dir = outputs_for(COMPONENT, run)
     if not run_dir.is_dir():
         return set()
-    names = {p.name for p in run_dir.iterdir() if p.is_file() and p.stat().st_size}
-    ids = {a["target"]: a.get("migration_id") for a in manifest.get("archives", [])}
     settled = set()
+    if job["spec"].get("single_archive"):
+        # the batch archive is `<org|user>-batch-{id}.tar.gz`; only a recovered id can tie it to targets
+        names = [p.name for p in run_dir.iterdir() if p.is_file() and p.stat().st_size]
+        for label, migration_id in known.items():
+            if any(n.endswith(f"-batch-{migration_id}.tar.gz") for n in names):
+                settled |= set(_batch_members(label))
+        return settled
     for target in _spec_targets(job):
-        stem = safe_name(target)
-        migration_id = ids.get(target)
-        candidates = {f"{stem}.tar.gz"}
-        if migration_id:
-            candidates.add(f"{stem}-{migration_id}.tar.gz")
-        if candidates & names:
+        if existing_archive(run_dir, safe_name(target), [known.get(target)]):
             settled.add(target)
     return settled
 
@@ -282,6 +343,9 @@ def spec_for_resume(job: dict, token: str = "") -> JobSpec:
         unlock_repos=s.get("unlock_repos", False),
         delete_archive=s.get("delete_archive", False),
         description=s.get("description", ""),
+        for_check=s.get("for_check", True),
+        upload_method=s.get("upload_method", ""),
+        dc_job_id=s.get("dc_job_id", ""),
         # never start a second Data Center export job on resume; extras re-run
         dc_action="none" if s["provider"] == "bitbucket-dc" else s.get("dc_action", "export"),
         known_ids=plan["known_ids"],
