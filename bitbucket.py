@@ -35,6 +35,10 @@ BITBUCKET_CLOUD_BASE = "https://api.bitbucket.org/2.0"
 PR_STATES = ("OPEN", "MERGED", "DECLINED", "SUPERSEDED")
 
 
+def _q(job_id: str) -> str:
+    return urllib.parse.quote(str(job_id), safe="")
+
+
 def cloud_headers(token: str) -> dict:
     """`email:token` -> Basic; a bare token -> Bearer (access tokens)."""
     import base64
@@ -364,15 +368,15 @@ class BitbucketDCExport:
         return str(job_id)
 
     def status(self, job_id: str) -> dict:
-        return _json_request(f"{self._root}/{job_id}", headers=self._headers)[1]
+        return _json_request(f"{self._root}/{_q(job_id)}", headers=self._headers)[1]
 
     def messages(self, job_id: str) -> list:
-        data = _json_request(f"{self._root}/{job_id}/messages", headers=self._headers)[1]
+        data = _json_request(f"{self._root}/{_q(job_id)}/messages", headers=self._headers)[1]
         return data.get("values", []) if isinstance(data, dict) else []
 
     def cancel(self, job_id: str) -> dict:
-        self.log(f"  POST {self._root}/{job_id}/cancel")
-        return _json_request(f"{self._root}/{job_id}/cancel", method="POST", headers=self._headers)[1]
+        self.log(f"  POST {self._root}/{_q(job_id)}/cancel")
+        return _json_request(f"{self._root}/{_q(job_id)}/cancel", method="POST", headers=self._headers)[1]
 
     def wait(self, job_id: str, *, interval: int = 15, timeout: int = 3600, cancelled=None) -> dict:
         deadline = time.time() + timeout

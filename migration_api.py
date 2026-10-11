@@ -414,7 +414,7 @@ class GitHubMigration:
         return (
             f"{self.api_base}/user/migrations"
             if self.scope == "user"
-            else f"{self.api_base}/orgs/{self.org}/migrations"
+            else f"{self.api_base}/orgs/{urllib.parse.quote(self.org, safe='')}/migrations"
         )
 
     def normalise(self, repo: str) -> str:
@@ -447,7 +447,7 @@ class GitHubMigration:
 
     def _repos_url(self, org: str = "", everything: bool = False) -> str:
         if org:
-            return f"{self.api_base}/orgs/{org.strip('/')}/repos?type=all&sort=updated"
+            return f"{self.api_base}/orgs/{urllib.parse.quote(org.strip('/'), safe='')}/repos?type=all&sort=updated"
         affiliation = "owner,collaborator,organization_member" if everything else "owner,collaborator"
         return f"{self.api_base}/user/repos?affiliation={affiliation}&sort=updated"
 

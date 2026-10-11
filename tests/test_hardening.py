@@ -905,3 +905,47 @@ class TestDownloadAndRedirects:
 
     def test_https_to_http_redirect_is_refused(self):
         assert self._redirect("http://api.github.com/y") is None
+
+
+class TestInputValidation:
+    def spec(self, **kw):
+        base = dict(provider="github", token="t", targets=["o/r"])
+        return runner.JobSpec(**{**base, **kw})
+
+    @pytest.mark.parametrize("kw", [
+        {"org": "../x"}, {"org": "a/b"}, {"api_base": "file:///etc"}, {"api_base": "ftp://x"},
+        {"api_version": "x\r\nHost: evil"}, {"scope": "everything"}, {"upload_method": "DELETE"},
+        {"provider": "gitlab", "upload_url": "file:///x"},
+        {"provider": "bitbucket-dc", "api_base": "https://bb.example", "dc_action": "cancel",
+         "targets": [], "dc_job_id": "../../x"},
+    ])
+    def test_bad_values_are_rejected(self, kw):
+        with pytest.raises(MigrationError):
+            self.spec(**kw).validate()
+
+    def test_good_values_pass(self):
+        self.spec(api_base="https://ghe.example/api/v3", api_version="2022-11-28", org="my-org").validate()
+
+    def test_org_and_dc_job_id_are_url_quoted(self):
+        client = mig.GitHubMigration("t", scope="org", org="a b?x")
+        assert "a%20b%3Fx" in client._root
+        import bitbucket
+        assert bitbucket._q("a/b") == "a%2Fb"
+
+    def test_upload_host_drops_userinfo_and_query(self):
+        assert runner._upload_host("https://user:pw@s3.example.com:9000/b?X-Amz-Signature=abc") == "s3.example.com:9000"
+        assert runner._upload_host("https://s3.example.com/b") == "s3.example.com"
+
+    def test_git_gets_a_double_dash_and_only_http_urls(self, tmp_path):
+        seen = []
+        ctx = supplementary.Ctx(provider="github", target="o/r", token="t", api_base="https://api.github.com",
+                                headers={}, out=tmp_path, log=lambda m: None)
+        real = supplementary.run_git
+        supplementary.run_git = lambda args, **k: seen.append(args) or type("P", (), {"returncode": 0, "stderr": ""})()
+        try:
+            supplementary.mirror(ctx, "https://github.com/o/r.git", "r.git", username="u")
+            with pytest.raises(MigrationError):
+                supplementary.mirror(ctx, "ext::sh -c id", "r2.git", username="u")
+        finally:
+            supplementary.run_git = real
+        assert seen[0][:4] == ["clone", "--mirror", "--", "https://github.com/o/r.git"]

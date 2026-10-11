@@ -33,7 +33,7 @@ from migration_api import (
     brief_error,
     safe_name,
 )
-from safety import require_same_origin, safe_join
+from safety import http_url, require_same_origin, safe_join
 
 Collector = Callable[["Ctx"], List[str]]
 
@@ -213,13 +213,14 @@ def mirror(ctx: Ctx, clone_url: str, rel: str, *, username: str, optional: bool 
     """`git clone --mirror`, or `git remote update` when it's already on disk
     (a resumed run). `optional` treats 'repository not found' as 'none exists'
     (wikis)."""
+    http_url(clone_url)             # git would also take file:// and ssh transports
     dest = ctx.out / rel
     env = git_env(username, ctx.token)
     if (dest / "HEAD").is_file():
         proc = run_git(["remote", "update", "--prune"], env=env, cwd=dest)
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        proc = run_git(["clone", "--mirror", clone_url, str(dest)], env=env)
+        proc = run_git(["clone", "--mirror", "--", clone_url, str(dest)], env=env)
     if proc.returncode != 0:
         err = (proc.stderr or "").strip()
         if optional and ("not found" in err.lower() or "does not exist" in err.lower()):

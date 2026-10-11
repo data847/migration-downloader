@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
 import migration_api as mig
+from safety import http_url
 from migration_api import MigrationError
 
 COLUMNS = ["repo", "section", "key", "value"]
@@ -185,10 +186,11 @@ def gitlab_counts(project: str, *, headers: dict, api_base: str) -> Dict[str, ob
 
 def ls_remote_refs(url: str, user: str, token: str, run: Callable = subprocess.run) -> Dict[str, str]:
     """Branches, tags and PR/MR head refs on the source. The token travels in the environment, never on argv."""
+    http_url(url)
     auth = base64.b64encode(f"{user}:{token}".encode()).decode()
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
            "GIT_CONFIG_KEY_0": "http.extraHeader", "GIT_CONFIG_VALUE_0": f"Authorization: Basic {auth}"}
-    res = run(["git", "ls-remote", "--refs", url], capture_output=True, text=True, env=env, timeout=600)
+    res = run(["git", "ls-remote", "--refs", "--", url], capture_output=True, text=True, env=env, timeout=600)
     if res.returncode != 0:
         msg = (res.stderr or "").strip().splitlines()
         raise MigrationError("git ls-remote failed: " + (msg[0].replace(token, "***") if msg else f"exit {res.returncode}"))

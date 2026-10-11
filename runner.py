@@ -44,7 +44,7 @@ from migration_api import (  # noqa: E402
 
 import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
 import ratelimit  # noqa: E402
-from safety import MIN_FREE_MB, check_disk, require_valid_target, trusted_api_base  # noqa: E402
+from safety import MIN_FREE_MB, check_disk, http_url, require_valid_target, trusted_api_base, valid_target  # noqa: E402
 from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
 from supplementary import REGISTRY, Ctx, resolve_names  # noqa: E402
 
@@ -211,6 +211,22 @@ class JobSpec:
             resolve_names(self.provider, self.extras)   # fail fast on a typo
         if self.upload_url and self.provider != "gitlab":
             raise MigrationError("upload_url only applies to GitLab")
+        if self.upload_url:
+            http_url(self.upload_url)
+        if self.upload_method not in {"", "PUT", "POST"}:
+            raise MigrationError("upload_method must be PUT or POST")
+        if self.scope not in {"auto", "user", "org"}:
+            raise MigrationError("scope must be auto, user or org")
+        if self.org and not (valid_target(self.org) and "/" not in self.org):
+            raise MigrationError("org is not a valid organization name")
+        if self.api_base:
+            parts = urlparse(self.api_base)
+            if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+                raise MigrationError("api_base must be an http(s) URL")
+        if self.api_version and not re.fullmatch(r"[0-9A-Za-z._-]{1,32}", self.api_version):
+            raise MigrationError("api_version looks invalid (expected e.g. 2022-11-28)")
+        if self.dc_job_id and not re.fullmatch(r"[0-9A-Za-z_-]{1,64}", self.dc_job_id):
+            raise MigrationError("dc_job_id looks invalid")
         if self.unlock_repos and not self.lock_repositories:
             raise MigrationError("unlock_repos only makes sense with lock_repositories")
         if not self.token and not trusted_api_base(self.provider, self.api_base):
@@ -236,6 +252,17 @@ def existing_archive(run_dir: Path, stem: str, ids=()) -> Optional[Path]:
         return None
     found.sort(key=lambda p: (p.name not in names, -p.stat().st_mtime))
     return found[0] if found else None
+
+
+def _upload_host(url: str) -> str:
+    """hostname[:port] only: `netloc` would include user:pass@, which then lands in the log and manifest."""
+    parts = urlparse(url)
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    host = parts.hostname or "remote"
+    return f"{host}:{port}" if port else host
 
 
 def _already_finished(client: GitLabExport, project: str, log) -> bool:
@@ -714,7 +741,7 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 result.meta["for_check"] = fc
             if spec.upload_url:
                 # host only: a presigned URL's query string is a credential
-                result.meta["uploaded_to"] = urlparse(spec.upload_url).netloc or "remote"
+                result.meta["uploaded_to"] = _upload_host(spec.upload_url)
                 log(f"  export finished; GitLab uploads it to {result.meta['uploaded_to']}")
                 results.append(result)
                 continue
