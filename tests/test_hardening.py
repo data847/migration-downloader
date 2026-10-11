@@ -850,3 +850,58 @@ class TestRunNames:
         good = jobstore.create(runner.JobSpec(provider="github", token="t", targets=["o/r"]))
         jobstore._jobs.clear()
         assert jobstore.load_from_disk() == 1 and good in jobstore._jobs
+
+
+class TestDownloadAndRedirects:
+    class Stream:
+        def __init__(self, chunks, length=None, fail=None):
+            self.chunks, self.fail = list(chunks), fail
+            self.headers = {"Content-Length": str(length)} if length is not None else {}
+
+        def read(self, n=-1):
+            if not self.chunks and self.fail:
+                raise self.fail
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def run(self, monkeypatch, tmp_path, stream):
+        monkeypatch.setattr(mig, "_request", lambda *a, **k: stream)
+        return mig._download("https://x.example/a", tmp_path / "a.tar.gz", headers={}, log=lambda m: None)
+
+    def test_truncated_body_is_an_error_and_leaves_no_part_file(self, monkeypatch, tmp_path):
+        with pytest.raises(MigrationError, match="truncated"):
+            self.run(monkeypatch, tmp_path, self.Stream([b"abc"], length=10))
+        assert list(tmp_path.iterdir()) == []
+
+    def test_midstream_reset_becomes_migration_error(self, monkeypatch, tmp_path):
+        import http.client
+        for exc in (ConnectionResetError("reset"), http.client.IncompleteRead(b"ab")):
+            with pytest.raises(MigrationError, match="error downloading"):
+                self.run(monkeypatch, tmp_path, self.Stream([b"abc"], fail=exc))
+            assert list(tmp_path.iterdir()) == []
+
+    def test_complete_body_is_renamed_into_place(self, monkeypatch, tmp_path):
+        out = self.run(monkeypatch, tmp_path, self.Stream([b"abc"], length=3))
+        assert out.read_bytes() == b"abc" and not list(tmp_path.glob("*.part"))
+
+    def _redirect(self, new_url, old="https://api.github.com/x"):
+        import urllib.request
+        req = urllib.request.Request(old, headers={"Authorization": "Bearer t", "Cookie": "a=b",
+                                                   "Proxy-Authorization": "Basic x", "Private-Token": "p"})
+        return mig._SafeRedirectHandler().redirect_request(req, None, 302, "Found", {}, new_url)
+
+    def test_cross_origin_redirect_drops_credentials_including_cookies(self):
+        for target in ("https://codeload.example/x", "https://api.github.com:8443/x"):   # host, then port
+            new = self._redirect(target)
+            assert not {"Authorization", "Cookie", "Proxy-authorization", "Private-token"} & set(new.headers)
+
+    def test_same_origin_redirect_keeps_auth(self):
+        assert "Authorization" in self._redirect("https://api.github.com/y").headers
+
+    def test_https_to_http_redirect_is_refused(self):
+        assert self._redirect("http://api.github.com/y") is None

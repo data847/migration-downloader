@@ -15,6 +15,7 @@ Tokens are never written to the log stream.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import json
 import time
@@ -41,7 +42,7 @@ Logger = Callable[[str], None]
 
 import ratelimit  # noqa: E402
 from errors import MigrationError  # noqa: E402,F401  (re-exported for every importer)
-from safety import http_url, require_same_origin  # noqa: E402
+from safety import http_url, require_same_origin, same_origin  # noqa: E402
 
 
 def _noop(_message: str) -> None:
@@ -87,13 +88,18 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     sensitive headers whenever the redirect target isn't the original host.
     """
 
-    _STRIP = ("Authorization", "Accept", "X-Github-Api-Version", "Private-Token")
+    _STRIP = ("Authorization", "Accept", "X-Github-Api-Version", "Private-Token",
+              "Cookie", "Proxy-Authorization")
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if (urllib.parse.urlparse(req.full_url).scheme.lower() == "https"
+                and urllib.parse.urlparse(newurl).scheme.lower() != "https"):
+            return None             # never replay a request in clear text after TLS
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is None:
             return None
-        if urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
+        # scheme + host + port, not just netloc: a different port or scheme is a different origin
+        if not same_origin(req.full_url, newurl):
             for header in self._STRIP:
                 # Request.remove_header() doesn't capitalize its argument the
                 # way add_header() capitalized it when storing the key.
@@ -211,6 +217,7 @@ def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int 
               info: Optional[dict] = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix(dest.suffix + ".part")
+    partial.unlink(missing_ok=True)
     try:
         with _request(url, headers=headers, timeout=timeout) as resp, partial.open("wb") as fh:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -232,6 +239,11 @@ def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int 
                 elif done >= next_mark:
                     log(f"    downloading… {human(done)}")
                     next_mark = done + 25 * 1024 * 1024
+            if total and done != total:
+                raise MigrationError(f"download truncated: got {done} of {total} bytes")
+    except MigrationError:
+        partial.unlink(missing_ok=True)
+        raise
     except urllib.error.HTTPError as exc:
         partial.unlink(missing_ok=True)
         detail = exc.read().decode("utf-8", "replace")[:600]
@@ -239,6 +251,9 @@ def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int 
     except urllib.error.URLError as exc:
         partial.unlink(missing_ok=True)
         raise MigrationError(f"network error downloading archive: {exc.reason}") from None
+    except (OSError, http.client.HTTPException) as exc:     # reset / timeout / IncompleteRead mid-stream, disk full
+        partial.unlink(missing_ok=True)
+        raise MigrationError(f"error downloading archive: {type(exc).__name__}: {exc}") from None
     partial.replace(dest)
     return dest
 
