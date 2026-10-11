@@ -25,6 +25,49 @@ The one manual step, straight from the document. Create a PAT with:
 | GitHub, personal repos | `repo` + `user` |
 | GitHub, org repos | `repo` + `admin:org` — and you must be an org **Owner** or hold the [Migrator role](https://docs.github.com/en/migrations/ado/granting-the-migrator-role) |
 | GitLab | `api` + `write_repository` (a *legacy* token on GitLab.com) |
+| Bitbucket Cloud | an API token with `read:repository:bitbucket`, `read:pullrequest:bitbucket`, `read:pipeline:bitbucket`, `admin:repository:bitbucket`, `read:webhook:bitbucket`, `read:snippet:bitbucket` (details below) |
+| Bitbucket Data Center | an HTTP access token: read access to the repos for browsing and `archive`; **system admin** for the export job |
+
+The scopes above cover the export plus everything the extras collect; GitHub and
+GitLab need a few more for the extras (see [Extras](#extras-what-the-archives-leave-out)).
+
+### Bitbucket tokens
+
+Bitbucket Cloud has no export archive, so everything it does is read-only API
+calls, and the scopes decide which collectors work:
+
+| Scope (Cloud API token) | Used by |
+|---|---|
+| `read:repository:bitbucket` | the repo picker, `repo-metadata`, `refs`, `commits`, `commit-statuses`, `commit-diffstat`, `commit-patches`, `branching-model`, `downloads`, `forks` |
+| `read:pullrequest:bitbucket` | `pullrequests`, `pr-diffs` |
+| `read:pipeline:bitbucket` | `pipelines`, `pipeline-logs` |
+| `admin:repository:bitbucket` | `branch-restrictions` and the pipelines config (Bitbucket gates both behind admin) |
+| `read:webhook:bitbucket` | `hooks` (repo and workspace) |
+| `read:snippet:bitbucket` | `snippets` |
+
+A missing scope only fails its own collectors; the rest of the run carries on and
+the failure is listed under the run's issues. App passwords no longer work
+(removed July 2026).
+
+Which kind of token to paste:
+
+| Token | Made at | Paste into the token box as |
+|---|---|---|
+| API token (belongs to you) | id.atlassian.com → Security → API tokens | `email@example.com:API_TOKEN` |
+| Repository / project / workspace access token | Bitbucket → Repository (or Workspace) settings → Access tokens | the token alone |
+| Data Center HTTP access token | Data Center → Profile → Personal access tokens | the token alone, plus the server's base URL |
+
+An **access token only reaches its own repo, project or workspace**: `snippets` and
+workspace-level `hooks` will report a 403 with one. Use an API token for those.
+You can check which format a token is with
+`curl -u 'EMAIL:TOKEN' https://api.bitbucket.org/2.0/user` (API token) or
+`curl -H 'Authorization: Bearer TOKEN' https://api.bitbucket.org/2.0/repositories/WORKSPACE/REPO`
+(access token).
+
+These scope names and the access-token limits come from Atlassian's documentation
+(read through a summary, not the pages themselves); they have not been checked
+against a live Bitbucket account, so treat a 403 as "check the scope" first. The Data Center
+export permission (system admin) is likewise unverified.
 
 Then either paste it into the UI (used for that run only, never stored), or put
 it in an env file so you never paste it again:
@@ -84,12 +127,26 @@ select-all and private/archived badges:
 
 | | GitHub | GitLab |
 |---|---|---|
-| Owners | **Browse orgs** → `/user/orgs`; picking one loads its repos | **Browse groups** → groups you hold Maintainer+ in |
-| Repos | user scope: repos you own or collaborate on; org scope: the org's repos | projects you could export, newest activity first |
+| Owners | — (one list covers them) | **Browse groups** → groups you hold Maintainer+ in |
+| Repos | one list: repos you own or collaborate on plus every org repo you can reach (`/user/repos?affiliation=owner,collaborator,organization_member`) | projects you could export, newest activity first |
 
-Selected entries are appended to the target list in the exact form the API
-wants — `owner/repo` for user scope, bare names for org scope,
-`group/subgroup/project` for GitLab. GitLab discovery filters to Maintainer
+GitHub has no user/org switch any more: targets are always `owner/repo`, and
+the default `--scope auto` decides per repo. Repos owned by the token's own
+login go through `/user/migrations`; every other owner's go through that org's
+`/orgs/{org}/migrations`, one group per owner (so `--single-archive` bundles
+within an owner, never across). `--scope user` / `--scope org --org X` still
+force the old behaviour, and org scope still takes bare names.
+
+Bitbucket has the same picker. Cloud lists every repo the token's user is a
+member of (`/repositories?role=member`) as `workspace/repo`; Data Center lists
+what the token can read (`/rest/api/1.0/repos`) as `PROJECT/slug` and needs its
+base URL typed first. Token format for the box: an API token is
+`email@example.com:API_TOKEN`; a repository, project or workspace access token
+is pasted on its own; a Data Center HTTP access token is pasted on its own.
+Leave the box blank to use `BITBUCKET_TOKEN` / `BITBUCKET_DC_TOKEN` from `.env`.
+
+Selected entries are appended to the target list as `owner/repo`
+(GitHub) or `group/subgroup/project` (GitLab). GitLab discovery filters to Maintainer
 (access level 40) or above, since that is the floor for exporting a project, so
 the list holds no rows that would 403 on initiate. Typing targets by hand still
 works; the picker only fills the box.
@@ -140,13 +197,19 @@ docker compose up -d           # http://127.0.0.1:8765
 docker compose logs -f
 ```
 
-The image is `python:3.12-slim`, runs as non-root uid 10001, and carries no
-secrets — both invariants arrive as mounts, declared in `docker-compose.yml`:
+The image is `python:3.12-slim`, runs as non-root uid 10001 (override with
+`MD_UID` / `MD_GID`, or `chown 10001 ../outputs`, so it can write the outputs
+mount), serves with waitress, and carries no secrets — both invariants arrive as mounts, declared in `docker-compose.yml`:
 
 | Host | Container | |
 |---|---|---|
 | `../outputs` | `/data/outputs` | archives, manifests, job records |
 | `../.env` | `/app/secrets/.env` | read-only |
+
+`./docker-build.sh` refuses to continue if `../.env` is missing or is a
+directory (Docker creates a root-owned directory for a missing bind-mount
+source). The compose file publishes the port on `127.0.0.1` only: the UI has no
+login and can use the tokens in `.env`.
 
 `DATALABS_OUTPUTS_DIR` and `DATALABS_ENV_FILE` point at those paths, so job
 records land on the host and survive `docker compose down`. Standalone (outside
@@ -165,6 +228,16 @@ The CLI works in the container too:
 docker exec migration-downloader python cli.py github --scope org --org TEST_ORG guava
 ```
 
+## Access control
+
+The UI has no login. It only answers requests whose `Host` / `Origin` is
+`localhost`, `127.0.0.1` or `::1` (set `MD_ALLOWED_HOSTS=name1,name2` to add
+hosts, e.g. behind a reverse proxy that does its own auth), and every POST must
+be `application/json`. The token stored in `.env` is only ever sent to the
+provider's default host; to use it against GitHub Enterprise or a self-hosted
+GitLab / Bitbucket, list the host in `MD_TRUSTED_API_HOSTS=ghe.example.com`, or
+paste a token in the form.
+
 ## CLI
 
 ```bash
@@ -175,6 +248,147 @@ docker exec migration-downloader python cli.py github --scope org --org TEST_ORG
 ```
 
 Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
+
+## `for-check.csv` (for Garmr)
+
+Next to every archive the run also writes `<archive>.for-check.csv` (for example `acme-widgets-42.tar.gz` and
+`acme-widgets-42.for-check.csv`): facts the archive cannot tell about itself, so a checker can verify it is complete
+without a token or network. Long format, columns `repo,section,key,value`; a blank value means unknown, never a guess.
+
+| Section | Contents |
+|---|---|
+| `meta` | provider, host, scope, org, migration/export id, final state, API version, start/finish time, archive name, bytes, SHA-256, `Content-Length` the server reported, request options |
+| `requested_repo` / `export_repo` | repos asked for, and (GitHub) the repos `GET .../migrations/:id/repositories` says the export contains |
+| `counts_before` / `counts_after` | PRs/MRs, issues, labels, milestones, releases, branches, tags, commits on the default branch, issue/review/commit comments, collaborators, default branch, taken just before the export started and just after it finished (GitHub: one GraphQL call plus REST counts; GitLab: `X-Total` headers and `?statistics=true`) |
+| `ref_before` / `ref_after` | branches, tags and PR/MR head refs on the source with their shas, from `git ls-remote --refs` (the token goes in the environment, never on the command line) |
+| `file` / `file_summary` | every entry in the downloaded archive outside `<repo>.git/objects/` with its size, plus the entry count and bytes of the objects |
+| `error` | anything that could not be collected; collection failures never fail the download |
+
+Disable with `--no-for-check` (CLI) or `for_check=false` in the job spec. Counts are two snapshots because things change while
+an export runs; a checker should only fail when the archive holds fewer than the lower of the two.
+## Extras: what the archives leave out
+
+`--extras` runs read-only collectors after the export flow and writes them
+under `<run>/extras/<target>/`. **The web UI runs every collector by default**
+(`everything`) when you press Start; the CLI runs only what you ask for.
+Names go in a comma list;
+`all` runs every light collector, `everything` adds the heavy ones (wikis,
+CI logs). `--list-extras` prints the names per provider. A
+collector that fails (403, feature disabled) is recorded in `manifest.json`
+under `extras` and the rest carry on. `--max-items` is how many items each
+listing collects (default `0` = no limit); a listing cut at a limit you set is
+reported as an issue, never silently.
+
+In the web UI, the word "download" in the page header opens a dialog where
+extras can be unticked for the next runs (the choice and the item limit are
+remembered in the browser). Leaving everything ticked is the default.
+
+| Provider | Light collectors | Heavy (name them or `everything`) |
+|---|---|---|
+| `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `branch-protection` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `wiki` `actions-logs` |
+| `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `hooks` | `wiki` `job-traces` `job-artifacts` `relations-export` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `commit-statuses` `commit-diffstat` `pullrequests` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `forks` | `commit-patches` `pr-diffs` `pipeline-logs` |
+| `bitbucket-dc` | | `archive` |
+
+Not collected on purpose: issue/PR/commit comments, discussions, activity and
+tasks.
+
+Extra token needs beyond the export scopes: GitHub `admin:repo_hook` (or
+`read:repo_hook`), `security_events`, `read:project`, `read:packages`; GitLab
+Maintainer on the project (for `hooks`). Bitbucket's scopes and token formats are
+in [Bitbucket tokens](#bitbucket-tokens) (put the token in `BITBUCKET_TOKEN`).
+
+`wiki` shells out to `git` (the image installs it). Credentials are passed
+through git's environment config, never the URL or argv.
+
+Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo --extras all`
+is extras-only. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
+token `BITBUCKET_DC_TOKEN`) starts and monitors the server-side export job
+(`--dc-action export|preview|cancel|none`, `--dc-job-id` for cancel); the
+resulting `.tar` is written to the server's shared home, not downloaded here.
+
+In the web UI, one **Bitbucket** button covers both products, the way GitLab
+covers gitlab.com and self-hosted: host `bitbucket.org` is Cloud (extras only),
+and `Data Center (self-hosted)` takes a base URL plus an export-job selector
+(start, preview, cancel or none). A run's extras and export jobs show in
+their own results card. The repo/org browser is GitHub and GitLab only.
+
+Additional export options:
+
+- GitHub: `--exclude metadata,git_data,attachments,releases,owner_projects`,
+  `--org-metadata-only`; after a successful download `--unlock-repos` (with
+  `--lock-repositories`) and `--delete-archive` (irreversible, off by default).
+- GitLab: `--upload-url`/`--upload-method`/`--description` make GitLab push the
+  export to a URL itself (nothing is downloaded; only the host is logged).
+
+## Downloading a run
+
+**Download everything (.zip)** returns a zip of zips: one `<target>.zip` per
+target holding its archive, its `.for-check.csv` and its `extras/` files, plus
+`run-files.zip` (manifest and anything else at the top of the run). Runs with
+only extras (Bitbucket Cloud) download the same way. The zip is built in a
+temp file one target at a time, so it needs roughly the run's size in free
+temp space; the request fails with a clear message if that is missing, and the
+temp file is removed once the download ends or the browser disconnects.
+
+## Issues
+
+A run that did not go cleanly no longer says "partial". It shows **N issues**
+as a button (in the run header and the run list); clicking it lists each thing
+that went wrong: the target, the step, the host's own message, and in plain
+words what usually causes it (missing org Owner role, SSO not authorized, a
+feature switched off, a rate limit...). The same list is in `manifest.json`
+under `issues`, also for runs recorded before this existed. A listing cut off
+by the item limit shows up here too.
+
+## Rate limits and retries
+
+Every API call goes through one place that waits instead of failing: a `429`
+waits `Retry-After`; a `403` that says the hourly budget or a secondary limit
+is spent waits for the reset; `5xx` and dropped connections back off and retry
+a few times. When a response says the budget is almost used, the next call to
+that host pauses first. Waits are logged in the run and can be cancelled. A
+`POST` (starting a migration) is never repeated after a `5xx` or a dropped
+connection, because that could start a second one; it is only retried when the
+host clearly did nothing (`429`, rate-limit `403`). A genuine permission `403`
+is reported straight away.
+
+## Paging
+
+Listings follow the `Link: rel="next"` header the host sends, not a guessed
+`?page=N` (Dependabot and secret-scanning alerts only take cursors, so
+`page=2` would repeat page 1). The repo picker loads one page at a time as you
+scroll, so there is no cap on how many repos it can list, and keeps loading
+while a filter is active so a match on a later page is not missed. Counts show
+a `+` until everything is loaded. Organizations that enforce SAML SSO only
+appear once the token is authorized for them; when GitHub says results are
+hidden for that reason, the picker says so.
+
+## Secrets in collected data
+
+Extras are scrubbed before they are written: JSON fields named like secrets
+(`secret`, `token`, `password`, `api_key`, ...) are blanked, which includes the
+leaked value in a secret-scanning alert, and strings go through the same
+patterns as the run log (tokens, `Authorization` headers, URLs with
+credentials, Slack/Discord/Teams webhook URLs, private-key blocks). CI logs
+(Actions log zips, GitLab job traces, Bitbucket pipeline logs) are scrubbed
+after download. Source diffs, patches and build artifacts are repository
+content and are left as they are.
+
+## Safety checks
+
+- Repository names are validated before anything runs (letters, digits and
+  `. _ - ~` separated by `/`; no `..`, spaces, `;` or `?`).
+- A pagination link is only followed on the host the listing started from, so
+  the token cannot be sent elsewhere; only `http(s)` URLs are ever opened.
+- A file name that comes from an API response cannot write outside its target
+  folder (symlinks included).
+- A run refuses to start with under 512 MB free; the download zip checks its
+  own space first; scrubbing a zip is skipped past 256 MB uncompressed.
+- `--delete-archive` only deletes from GitHub after the downloaded file is
+  exactly the size GitHub announced and opens as a tarball; otherwise it keeps
+  the remote copy and says why.
+- The run zip leaves out symlinks and unfinished `.part` files.
 
 ## Invariants (DataLabs workspace)
 
@@ -201,3 +415,14 @@ Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
 - `--api-base` targets GitHub Enterprise or a self-hosted GitLab.
 - Downloads stream to `<name>.tar.gz.part` and are renamed on completion, so a
   killed run never leaves a truncated file that looks finished.
+
+## Tests
+
+```bash
+python3 -m pytest tests          # offline: any real network call fails the test
+```
+
+`tests/conftest.py` blocks the network and replaces sleeping with a no-op.
+`tests/test_packaging.py` fails if a module is missing from the Dockerfile
+`COPY` line, which would otherwise only show up as an ImportError in the
+container.

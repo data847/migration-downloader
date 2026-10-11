@@ -4,7 +4,11 @@ services:
     image: migration-downloader:latest
     container_name: migration-downloader
     ports:
-      - "8765:8765"
+      # loopback only: the UI has no login and can use the tokens in .env
+      - "127.0.0.1:8765:8765"
+    # must be able to write ../outputs: either chown it to 10001 or export
+    # MD_UID=$(id -u) MD_GID=$(id -g) before `docker compose up`
+    user: "${MD_UID:-10001}:${MD_GID:-10001}"
     volumes:
       # invariant #2 — archives, manifests and job records land in the one
       # outputs root on the host, not inside the container

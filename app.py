@@ -19,19 +19,22 @@ import os
 import sys
 import threading
 import traceback
-import zipfile
 from pathlib import Path
+from urllib.parse import urlparse
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 
 import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # noqa: E402
-from migration_api import GitHubMigration, GitLabExport, MigrationError, mask  # noqa: E402
-from runner import COMPONENT, JobSpec, list_runs, run_job  # noqa: E402
-
+from migration_api import GitHubMigration, GitLabExport, MigrationError, brief_error, mask  # noqa: E402
+from runner import COMPONENT, JobSpec, issues_from_manifest, list_runs, run_job  # noqa: E402
+from supplementary import HEAVY, REGISTRY  # noqa: E402
+import bitbucket  # noqa: E402
+import bundle  # noqa: E402
 import jobstore  # noqa: E402
 import redact  # noqa: E402
+from safety import request_host_allowed, trusted_api_base  # noqa: E402
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -40,8 +43,33 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 atexit.register(jobstore.flush_all)
 
 
-def _start(spec: JobSpec) -> str:
+@app.before_request
+def _guard():
+    """The UI has no login, so anything that can reach the port could drive it.
+    Pin it to local Host/Origin (DNS rebinding) and to real JSON bodies: a
+    cross-origin form or text/plain fetch is a "simple" request that skips the
+    CORS preflight, and application/json is not."""
+    if not request_host_allowed(request.host):
+        return jsonify(error="host not allowed (set MD_ALLOWED_HOSTS to add one)"), 403
+    origin = request.headers.get("Origin")
+    if origin and origin != "null" and not request_host_allowed(urlparse(origin).netloc):
+        return jsonify(error="cross-origin request refused"), 403
+    if origin == "null":
+        return jsonify(error="cross-origin request refused"), 403
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and request.mimetype != "application/json":
+        return jsonify(error="Content-Type must be application/json"), 415
+    return None
+
+
+def _body() -> dict:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _start(spec: JobSpec, notes: tuple = ()) -> str:
     job_id = jobstore.create(spec)
+    for note in notes:                  # before the worker starts, so they lead the log
+        jobstore.append(job_id, note)
     threading.Thread(target=_worker, args=(job_id, spec), daemon=True).start()
     return job_id
 
@@ -65,12 +93,19 @@ def _run_root(run: str) -> Path:
     """Resolve `<outputs>/migration-downloader/<run>`, refusing path escapes."""
     root = outputs_for(COMPONENT).resolve()
     path = (root / run).resolve()
-    if root != path.parent or not path.is_dir():
+    # dot-dirs (.jobs holds raw job records) are never runs; a real run has a manifest
+    if (run.startswith(".") or root != path.parent or not path.is_dir()
+            or not (path / "manifest.json").is_file()):
         abort(404)
     return path
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
+
+
+def _env_hint(provider: str) -> str:
+    token = JobSpec(provider=provider).resolved_token()
+    return mask(token) if token else ""
 
 
 @app.get("/")
@@ -81,17 +116,22 @@ def index():
         outputs_dir=str(outputs_for(COMPONENT)),
         github_env=mask(github_token()) if github_token() else "",
         gitlab_env=mask(gitlab_token()) if gitlab_token() else "",
+        bitbucket_env=_env_hint("bitbucket"),
+        bitbucket_dc_env=_env_hint("bitbucket-dc"),
     )
 
 
 @app.post("/api/jobs")
 def create_job():
-    spec = JobSpec.from_form(request.get_json(force=True, silent=True) or {})
     try:
+        spec = JobSpec.from_form(_body())
         spec.validate()
     except MigrationError as exc:
         return jsonify(error=str(exc)), 400
-    return jsonify(id=_start(spec))
+    try:
+        return jsonify(id=_start(spec))
+    except jobstore.RunBusy as exc:
+        return jsonify(error=str(exc)), 409
 
 
 @app.get("/api/jobs")
@@ -101,18 +141,30 @@ def jobs():
 
 @app.get("/api/jobs/<job_id>")
 def job_status(job_id: str):
-    since = max(0, int(request.args.get("since", 0)))
+    try:
+        since = max(0, int(request.args.get("since", 0)))
+    except (TypeError, ValueError):
+        return jsonify(error="since must be an integer"), 400
     job = jobstore.get(job_id)
     if job is None:
         abort(404)
+    manifest = job["manifest"]
+    issues = []
+    if manifest:
+        issues = manifest.get("issues")
+        if issues is None:
+            issues = issues_from_manifest(manifest)
+    # server error bodies and a user:pw@ api_base can carry secrets, and none of
+    # these fields went through the log scrubber
     return jsonify(
         id=job["id"],
         state=job["state"],
-        error=job["error"],
-        manifest=job["manifest"],
-        spec=job["spec"],
+        error=redact.scrub(job["error"] or ""),
+        issues=redact.scrub_obj(issues),
+        manifest=redact.scrub_obj(manifest),
+        spec=redact.scrub_spec(job["spec"]),
         created_utc=job["created_utc"],
-        lines=job["log"][since:],
+        lines=redact.scrub_lines(job["log"][since:]),
         total_lines=len(job["log"]),
         resumable=bool(jobstore.resume_plan(job)),
     )
@@ -132,8 +184,10 @@ def job_log(job_id: str):
         abort(404)
     spec = job.get("spec", {})
     manifest = job.get("manifest") or {}
-    host = spec.get("api_base") or (
-        "https://api.github.com" if spec.get("provider") == "github" else "https://gitlab.com")
+    host = spec.get("api_base") or {
+        "github": "https://api.github.com",
+        "bitbucket": "https://api.bitbucket.org/2.0",
+    }.get(spec.get("provider"), "https://gitlab.com")
     header = [
         "# migration-downloader run log",
         f"# run id     : {job['id']}",
@@ -144,7 +198,9 @@ def job_log(job_id: str):
         + (f" ({spec.get('scope')} scope)" if spec.get("provider") == "github" else ""),
         f"# host       : {host}",
         f"# targets    : {len(spec.get('targets', []))}",
-        f"# archives   : {manifest.get('ok', 0)} ok, {manifest.get('failed', 0)} failed",
+        f"# archives   : {manifest.get('ok', 0)} ok, "
+        f"{manifest.get('archives_failed', manifest.get('failed', 0))} failed",
+        f"# extras     : {manifest.get('extras_failed', 0)} collector run(s) failed",
         f"# token      : {spec.get('token_hint', '')}"
         + (" (from .env)" if spec.get("token_from_env") else ""),
         "#",
@@ -181,47 +237,88 @@ def resume_job(job_id: str):
         abort(404)
     if job["state"] == "running":
         return jsonify(error="that run is still going"), 409
+    if job["spec"].get("upload_url_set"):
+        # the presigned URL is a credential and is never stored, so there is nothing to resume with
+        return jsonify(error="this run had GitLab upload to a presigned URL, which is not saved; "
+                             "start a new run with a fresh upload URL"), 400
     if not jobstore.resume_plan(job):
         return jsonify(error="nothing left to resume — every archive is downloaded"), 400
-    token = (request.get_json(force=True, silent=True) or {}).get("token", "")
+    token = str(_body().get("token") or "").strip()
     spec = jobstore.spec_for_resume(job, token=token)
     try:
         spec.validate()
     except MigrationError as exc:
         return jsonify(error=str(exc)), 400
-    return jsonify(id=_start(spec))
+    notes = ()
+    if not token and not job["spec"].get("token_from_env"):
+        notes = ("warning: the original run used a pasted token, which is never saved; "
+                 "resuming with the token from .env instead",)
+    try:
+        return jsonify(id=_start(spec, notes))
+    except jobstore.RunBusy as exc:
+        return jsonify(error=str(exc)), 409
 
 
 @app.post("/api/discover")
 def discover():
-    """List what the token can see: orgs/groups, or repos/projects.
+    """One page of what the token can see: orgs/groups, or repos/projects.
+
+    The picker asks for page 1, 2, 3... as the user scrolls, so there is no
+    ceiling on how many repos can be listed. The page number is an integer the
+    server turns into a URL itself; the browser never supplies one.
 
     POST, not GET, so the PAT never travels in a URL or a server access log.
     `api_base` is honoured throughout, so this works against GitHub Enterprise
     and a self-hosted GitLab exactly as it does against the public hosts.
     """
-    data = request.get_json(force=True, silent=True) or {}
+    data = _body()
     provider = (data.get("provider") or "github").strip().lower()
     kind = (data.get("kind") or "repos").strip().lower()       # repos | owners
-    scope = (data.get("scope") or "user").strip().lower()
+    scope = (data.get("scope") or "auto").strip().lower()
     owner = (data.get("owner") or "").strip()                  # org / group
     api_base = (data.get("api_base") or "").strip()
-    token = (data.get("token") or "").strip() or (
-        github_token() if provider == "github" else gitlab_token())
+    try:
+        page = max(1, int(data.get("page") or 1))
+    except (TypeError, ValueError):
+        return jsonify(error="page must be a number"), 400
+    token = (data.get("token") or "").strip()
+    if not token and not trusted_api_base(provider, api_base):
+        return jsonify(error="paste a token to use a custom API base: the .env token is only "
+                             "sent to the default host"), 400
+    token = token or JobSpec(provider=provider).resolved_token()
     if not token:
         return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
     try:
-        if provider == "github":
-            client = GitHubMigration(token, scope=scope, org=owner or "x",
+        if provider == "bitbucket":
+            result = bitbucket.cloud_repos_page(token, page)
+        elif provider == "bitbucket-dc":
+            result = bitbucket.dc_repos_page(token, api_base, page)
+        elif provider == "github":
+            client = GitHubMigration(token, scope="org" if scope == "org" else "user",
+                                     org=owner or "x",
                                      api_base=api_base or "https://api.github.com")
-            items = client.list_orgs() if kind == "owners" else client.list_repos(
-                org=owner if scope == "org" else "")
+            if kind == "owners":
+                result = client.orgs_page(page)
+            else:
+                result = client.repos_page(page, org=owner if scope == "org" else "",
+                                           everything=scope == "auto")
         else:
             client = GitLabExport(token, api_base=api_base or "https://gitlab.com")
-            items = client.list_groups() if kind == "owners" else client.list_projects(group=owner)
+            result = (client.groups_page(page) if kind == "owners"
+                      else client.projects_page(page, group=owner))
     except MigrationError as exc:
-        return jsonify(error=str(exc).splitlines()[0]), 400
-    return jsonify(items=items, count=len(items))
+        return jsonify(error=brief_error(exc).splitlines()[0]), 400
+    return jsonify(items=result["items"], count=len(result["items"]), page=page,
+                   has_more=result["has_more"], notes=result["notes"])
+
+
+@app.get("/api/extras")
+def extras():
+    """Collector names per provider (light first), for the Download options dialog."""
+    return jsonify(extras={
+        provider: [{"name": name, "heavy": name in HEAVY.get(provider, set())}
+                   for name in sorted(names, key=lambda n: (n in HEAVY.get(provider, set()), n))]
+        for provider, names in REGISTRY.items()})
 
 
 @app.get("/api/runs")
@@ -239,18 +336,31 @@ def archive(run: str, name: str):
 
 @app.get("/api/archive-zip/<run>")
 def archive_zip(run: str):
-    """Every archive in a run as one .zip (stored, not re-compressed)."""
+    """The whole run as a zip of zips: one zip per target (archive, for-check CSV
+    and extras) plus run-files.zip. Built in a temp file, removed once sent."""
     path = _run_root(run)
-    members = sorted(p for p in path.iterdir() if p.is_file() and not p.name.endswith(".part"))
-    if not members:
-        abort(404)
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as zf:
-        for member in members:
-            zf.write(member, arcname=member.name)
-    buffer.seek(0)
-    return send_file(buffer, mimetype="application/zip", as_attachment=True,
-                     download_name=f"{run}.zip")
+    try:
+        built = bundle.build(path)
+    except MigrationError as exc:
+        status = 404 if "nothing to download" in str(exc) else 507
+        return jsonify(error=brief_error(exc)), status
+    size = built.stat().st_size
+
+    def stream():
+        # a generator's `finally` runs when it is exhausted *and* when the client
+        # disconnects (the server closes it); `send_file`'s close hook does not
+        # fire for direct-passthrough responses, which would leak the temp file
+        try:
+            with built.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    yield chunk
+        finally:
+            built.unlink(missing_ok=True)
+
+    response = Response(stream(), mimetype="application/zip")
+    response.headers.set("Content-Disposition", "attachment", filename=f"{run}.zip")
+    response.headers["Content-Length"] = str(size)
+    return response
 
 
 def main() -> int:
@@ -266,6 +376,15 @@ def main() -> int:
     print(f"outputs dir : {outputs_for(COMPONENT)}")
     if restored:
         print(f"restored {restored} job record(s) from disk")
+    if not args.debug:
+        try:
+            from waitress import serve
+        except ImportError:         # bare checkout without the requirements installed
+            serve = None
+        if serve:
+            # one process on purpose: job state lives in this process's memory
+            serve(app, host=args.host, port=args.port, threads=8)
+            return 0
     # use_reloader off: the reloader's second process would double every job
     app.run(host=args.host, port=args.port, debug=args.debug,
             threaded=True, use_reloader=False)
