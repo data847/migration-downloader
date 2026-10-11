@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import io
 import os
 import sys
 import threading

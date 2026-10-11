@@ -760,3 +760,13 @@ class TestWeb:
         assert "<th>Repository</th><th>Files</th><th>Result</th>" in html
         assert "function groupExtras(" in html and "${failed} failed" in html
         assert "reasonOf(" in html and "pill-btn bad" in html
+
+
+class TestJobLogEndpoint:
+    def test_log_download_works_and_is_redacted(self, client):
+        import jobstore
+        job_id = jobstore.create(runner.JobSpec(provider="github", token="t", targets=["o/r"]))
+        jobstore.append(job_id, "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+        reply = client.get(f"/api/jobs/{job_id}/log")
+        assert reply.status_code == 200 and reply.mimetype == "text/plain"
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in reply.get_data(as_text=True)
