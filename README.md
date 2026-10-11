@@ -197,13 +197,19 @@ docker compose up -d           # http://127.0.0.1:8765
 docker compose logs -f
 ```
 
-The image is `python:3.12-slim`, runs as non-root uid 10001, and carries no
-secrets — both invariants arrive as mounts, declared in `docker-compose.yml`:
+The image is `python:3.12-slim`, runs as non-root uid 10001 (override with
+`MD_UID` / `MD_GID`, or `chown 10001 ../outputs`, so it can write the outputs
+mount), serves with waitress, and carries no secrets — both invariants arrive as mounts, declared in `docker-compose.yml`:
 
 | Host | Container | |
 |---|---|---|
 | `../outputs` | `/data/outputs` | archives, manifests, job records |
 | `../.env` | `/app/secrets/.env` | read-only |
+
+`./docker-build.sh` refuses to continue if `../.env` is missing or is a
+directory (Docker creates a root-owned directory for a missing bind-mount
+source). The compose file publishes the port on `127.0.0.1` only: the UI has no
+login and can use the tokens in `.env`.
 
 `DATALABS_OUTPUTS_DIR` and `DATALABS_ENV_FILE` point at those paths, so job
 records land on the host and survive `docker compose down`. Standalone (outside
@@ -221,6 +227,16 @@ The CLI works in the container too:
 ```bash
 docker exec migration-downloader python cli.py github --scope org --org TEST_ORG guava
 ```
+
+## Access control
+
+The UI has no login. It only answers requests whose `Host` / `Origin` is
+`localhost`, `127.0.0.1` or `::1` (set `MD_ALLOWED_HOSTS=name1,name2` to add
+hosts, e.g. behind a reverse proxy that does its own auth), and every POST must
+be `application/json`. The token stored in `.env` is only ever sent to the
+provider's default host; to use it against GitHub Enterprise or a self-hosted
+GitLab / Bitbucket, list the host in `MD_TRUSTED_API_HOSTS=ghe.example.com`, or
+paste a token in the form.
 
 ## CLI
 

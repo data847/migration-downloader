@@ -376,6 +376,15 @@ def main() -> int:
     print(f"outputs dir : {outputs_for(COMPONENT)}")
     if restored:
         print(f"restored {restored} job record(s) from disk")
+    if not args.debug:
+        try:
+            from waitress import serve
+        except ImportError:         # bare checkout without the requirements installed
+            serve = None
+        if serve:
+            # one process on purpose: job state lives in this process's memory
+            serve(app, host=args.host, port=args.port, threads=8)
+            return 0
     # use_reloader off: the reloader's second process would double every job
     app.run(host=args.host, port=args.port, debug=args.debug,
             threaded=True, use_reloader=False)

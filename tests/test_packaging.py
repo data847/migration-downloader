@@ -60,3 +60,17 @@ def test_readme_names_the_bitbucket_scope_for_every_cloud_collector():
 
 def test_git_is_installed_in_the_image_for_wiki_clones_and_for_check():
     assert re.search(r"apt-get install[^\n]*\bgit\b", (ROOT / "Dockerfile").read_text().replace("\\\n", " "))
+
+
+def test_compose_publishes_the_port_on_loopback_only():
+    compose = (ROOT / "docker-compose.yml").read_text()
+    assert '"127.0.0.1:8765:8765"' in compose and '"8765:8765"' not in compose
+
+
+def test_the_production_server_is_a_requirement():
+    assert re.search(r"^waitress==", (ROOT / "requirements.txt").read_text(), re.M)
+
+
+def test_docker_build_guards_the_bind_mount_sources():
+    script = (ROOT / "docker-build.sh").read_text()
+    assert "-d ../.env" in script and "../outputs" in script
