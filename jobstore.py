@@ -171,7 +171,24 @@ def resume_plan(job: dict) -> Optional[dict]:
     if not outstanding:
         return None
     return {"targets": outstanding, "known_ids": {k: v for k, v in known.items() if v},
-            "run_name": manifest.get("output_dir", "").split("/")[-1] or job["spec"]["run_name"]}
+            "run_name": _run_dir_name(job, manifest)}
+
+
+def _run_dir_name(job: dict, manifest: dict) -> str:
+    """The actual generated output-folder name, even if the manifest was
+    never written (crash before completion) and `run_name` was left blank.
+
+    `runner.run_job` logs `output dir : <path>` immediately after choosing
+    the folder name, before any target work starts, so it survives in the
+    job log the same way a migration id does (see the loop below).
+    """
+    run = manifest.get("output_dir", "").split("/")[-1]
+    if run:
+        return run
+    for line in job.get("log", []):
+        if line.startswith("output dir : "):
+            return line.split("output dir : ", 1)[1].strip().rsplit("/", 1)[-1]
+    return job.get("spec", {}).get("run_name", "")
 
 
 def _already_on_disk(job: dict, manifest: dict) -> set:
@@ -181,8 +198,7 @@ def _already_on_disk(job: dict, manifest: dict) -> set:
     with no record of it; without this check the run would look resumable
     forever and a resume would re-export work that is already done.
     """
-    run = (manifest.get("output_dir", "").split("/")[-1]
-           or job.get("spec", {}).get("run_name", ""))
+    run = _run_dir_name(job, manifest)
     if not run:
         return set()
     run_dir = outputs_for(COMPONENT, run)
