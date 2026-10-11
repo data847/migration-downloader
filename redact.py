@@ -37,7 +37,7 @@ _PATTERNS = [
     (re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9\-_]{20,}\b"), "<redacted-api-key>"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "<redacted-jwt>"),
     # header and query-parameter carriers
-    (re.compile(r"(?i)\b(authorization|private-token|x-api-key)\s*[:=]\s*\S+"), r"\1: <redacted>"),
+    (re.compile(r"(?i)\b(authorization|private-token|x-api-key)\s*[:=]\s*(?:bearer\s+)?\S+"), r"\1: <redacted>"),
     (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer <redacted>"),
     (re.compile(r"(?i)\b((?:private_|access_|api_)?token|key|password|secret)=[^&\s\"']+"),
      r"\1=<redacted>"),
