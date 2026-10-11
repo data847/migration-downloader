@@ -11,13 +11,18 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# git backs the `wiki` extras
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
 # vendor/datalabs_paths.py is the workspace's single definition of the three
 # invariants; bootstrap.py prefers the real workspace copy on the host and this
 # vendored one inside the image, so the container needs no repo-root mount.
-COPY bootstrap.py migration_api.py runner.py jobstore.py redact.py app.py cli.py ./
+COPY bootstrap.py errors.py ratelimit.py safety.py bundle.py migration_api.py supplementary.py bitbucket.py for_check.py runner.py jobstore.py redact.py app.py cli.py ./
 COPY vendor/ ./vendor/
 COPY templates/ ./templates/
 
