@@ -8,6 +8,7 @@
   ./.venv/bin/python cli.py github --file github_repos.txt
   ./.venv/bin/python cli.py github org/repo --extras all            # + wikis, CI, alerts, hooks…
   ./.venv/bin/python cli.py bitbucket ws/repo --extras all          # Cloud: extras only
+  ./.venv/bin/python cli.py github org/repo --per-repo-bundles      # + standalone <target>.zip per repo
   ./.venv/bin/python cli.py bitbucket-dc PROJ/repo --api-base https://bb.example.com
 """
 
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import bootstrap  # noqa: F401  (sets sys.path)
 
+import bundle  # noqa: E402
 from migration_api import MigrationError  # noqa: E402
 from runner import PROVIDERS, JobSpec, run_job  # noqa: E402
 from supplementary import HEAVY, REGISTRY  # noqa: E402
@@ -43,6 +45,9 @@ def main(argv=None) -> int:
     p.add_argument("--no-checksum", action="store_true")
     p.add_argument("--no-for-check", action="store_true",
                    help="do not write <archive>.for-check.csv (source-side counts/refs/file list for Garmr)")
+    p.add_argument("--per-repo-bundles", action="store_true",
+                   help="after the run, also write each target's standalone <target>.zip (archive + "
+                        "for-check + extras) and run-files.zip into the run folder; originals untouched")
     p.add_argument("--extras", default="",
                    help="comma list of supplementary collectors, or all (light ones) / everything; "
                         "see --list-extras")
@@ -108,7 +113,18 @@ def main(argv=None) -> int:
     except MigrationError as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         return 2
-    return 0 if manifest["failed"] == 0 else 1
+    code = 0 if manifest["failed"] == 0 else 1
+    if args.per_repo_bundles:
+        print("")
+        print("per-repo bundles:")
+        try:
+            _written, _same, conflicts = bundle.write_all(Path(manifest["output_dir"]), log=print)
+        except (MigrationError, OSError) as exc:
+            print(f"ERROR {exc}", file=sys.stderr)
+            return 2
+        if conflicts:
+            return code or 1
+    return code
 
 
 if __name__ == "__main__":

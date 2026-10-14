@@ -331,6 +331,24 @@ temp file one target at a time, so it needs roughly the run's size in free
 temp space; the request fails with a clear message if that is missing, and the
 temp file is removed once the download ends or the browser disconnects.
 
+**Per-repo bundles.** Each `<target>.zip` can also be had on its own, and
+`run-files.zip` separately. They are built by the same code as the inner zips
+of the combined download, so each file is byte-for-byte that inner zip: the
+original `.tar.gz` stored unmodified (same hash), its `.for-check.csv` and
+`extras/<dir>/...`, so it can be handed straight to Garmr.
+
+- UI: **Download bundle** beside each finished archive, and a **run-files.zip**
+  button in the Archives card (extras-only runs list their bundles in the
+  Extras card). Endpoint: `GET /api/archive-bundle/<run>/<name>`; `name` must be
+  one the run really contains, anything else is a 404.
+- CLI: `--per-repo-bundles` writes the standalone zips into the run folder,
+  beside the archives, after the run. Originals are never touched. Each file is
+  built to a hidden `.part` file and renamed into place after a disk-space
+  check. An existing identical file is left as it is; a different one is never
+  overwritten (it is reported and the exit code is 1, delete it to rebuild).
+  The generated zips are not swept into `run-files.zip` or the combined
+  download on later runs.
+
 ## Issues
 
 A run that did not go cleanly no longer says "partial". It shows **N issues**

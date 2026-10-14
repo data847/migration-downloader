@@ -344,6 +344,11 @@ def archive_zip(run: str):
     except MigrationError as exc:
         status = 404 if "nothing to download" in str(exc) else 507
         return jsonify(error=brief_error(exc)), status
+    return _send_temp(built, f"{run}.zip")
+
+
+def _send_temp(built: Path, filename: str) -> Response:
+    """Stream a temp file as a zip download and remove it afterwards."""
     size = built.stat().st_size
 
     def stream():
@@ -358,9 +363,31 @@ def archive_zip(run: str):
             built.unlink(missing_ok=True)
 
     response = Response(stream(), mimetype="application/zip")
-    response.headers.set("Content-Disposition", "attachment", filename=f"{run}.zip")
+    response.headers.set("Content-Disposition", "attachment", filename=filename)
     response.headers["Content-Length"] = str(size)
     return response
+
+
+@app.get("/api/archive-bundle/<run>")
+def archive_bundles(run: str):
+    """Names of the standalone per-repo bundles (and run-files.zip) for a run."""
+    path = _run_root(run)
+    return jsonify(bundles=bundle.names(path), by_archive=bundle.by_archive(path))
+
+
+@app.get("/api/archive-bundle/<run>/<name>")
+def archive_bundle(run: str, name: str):
+    """One target's bundle on its own: byte-for-byte the `<target>.zip` that sits
+    inside the combined download. `name` must be one the run's plan produced, so it
+    can never be used to reach another file."""
+    path = _run_root(run)
+    if name not in bundle.names(path):
+        abort(404)
+    try:
+        built = bundle.build_one(path, name)
+    except MigrationError as exc:
+        return jsonify(error=brief_error(exc)), 507
+    return _send_temp(built, name)
 
 
 def main() -> int:

@@ -331,6 +331,7 @@ to whatever is in flight.</pre>
     <div class="card" id="extras-card" hidden>
       <h2>Extras &amp; export jobs
         <span class="acts">
+          <span id="bundle-links"></span>
           <a class="ghost hot" id="zip2" href="#" hidden>⬇ Download everything (.zip)</a>
         </span>
       </h2>
@@ -345,6 +346,7 @@ to whatever is in flight.</pre>
     <div class="card" id="results-card" hidden>
       <h2>Archives
         <span class="acts">
+          <a class="ghost" id="runfiles" href="#" hidden title="manifest and other top-level run files">⬇ run-files.zip</a>
           <a class="ghost hot" id="zip" href="#" hidden>⬇ Download everything (.zip)</a>
         </span>
       </h2>
@@ -586,7 +588,20 @@ function renderExtrasResults(manifest){
   const run = (manifest.output_dir || '').split('/').pop();
   $('zip2').hidden = !rows.length && !(manifest.archives || []).some(a => a.ok);
   $('zip2').href = `/api/archive-zip/${encodeURIComponent(run)}`;
+  loadBundles(run, manifest);
+  $('bundle-links').innerHTML = bundleInfo.bundles.map(n =>
+    `<a class="ghost" href="/api/archive-bundle/${encodeURIComponent(run)}/${encodeURIComponent(n)}">⬇ ${esc(n)}</a> `).join('');
   $('extras-where').textContent = (manifest.output_dir || '') + '/extras/';
+}
+/* standalone per-repo bundles: fetched once per run and finished-archive count */
+let bundleInfo = {key: '', by_archive: {}, bundles: []};
+function loadBundles(run, manifest){
+  const key = run + ':' + (manifest.archives || []).filter(a => a.ok).length;
+  if(bundleInfo.key === key) return;
+  bundleInfo = {key, by_archive: {}, bundles: []};
+  fetch(`/api/archive-bundle/${encodeURIComponent(run)}`).then(r => r.ok ? r.json() : null).then(d => {
+    if(d && bundleInfo.key === key){ bundleInfo = {key, ...d}; renderResults(manifest); }
+  }).catch(() => {});
 }
 function renderResults(manifest){
   renderExtrasResults(manifest);
@@ -597,10 +612,17 @@ function renderResults(manifest){
   const any = manifest.archives.some(a => a.ok);
   $('zip').hidden = !any;
   $('zip').href = `/api/archive-zip/${encodeURIComponent(run)}`;
+  if(any) loadBundles(run, manifest);
+  $('runfiles').hidden = !bundleInfo.bundles.includes('run-files.zip');
+  $('runfiles').href = `/api/archive-bundle/${encodeURIComponent(run)}/run-files.zip`;
   $('results').innerHTML = manifest.archives.map(a => {
     const file = a.path ? a.path.split('/').pop() : '';
     const dl = a.ok
       ? `<a class="ghost" href="/api/archive/${encodeURIComponent(run)}/${encodeURIComponent(file)}">⬇ Download</a>`
+      : '';
+    const bname = bundleInfo.by_archive[file];
+    const bdl = a.ok && bname
+      ? ` <a class="ghost" title="${esc(bname)}: archive + for-check + extras, standalone" href="/api/archive-bundle/${encodeURIComponent(run)}/${encodeURIComponent(bname)}">⬇ Download bundle</a>`
       : '';
     const status = a.ok
       ? `<span class="mono">${esc(file)}</span>`
@@ -608,7 +630,7 @@ function renderResults(manifest){
     return `<tr><td class="mono">${esc(a.target)}<div style="color:var(--muted)">${status}</div></td>
       <td class="mono">${esc(a.migration_id || '—')}</td><td>${esc(a.size || '—')}</td>
       <td class="mono">${a.sha256 ? esc(a.sha256.slice(0,12)) + '…' : '—'}</td>
-      <td style="text-align:right">${dl}</td></tr>`;
+      <td style="text-align:right">${dl}${bdl}</td></tr>`;
   }).join('');
 }
 
