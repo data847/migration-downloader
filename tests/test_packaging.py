@@ -50,12 +50,16 @@ def test_readme_names_the_bitbucket_scope_for_every_cloud_collector():
     import supplementary
 
     text = (ROOT / "README.md").read_text()
-    section = text[text.index("### Bitbucket tokens"): text.index("Which kind of token to paste")]
+    section = text[text.index("### Bitbucket Cloud: what each step needs"): text.index("### Bitbucket Data Center")]
     missing = [n for n in supplementary.REGISTRY["bitbucket"] if f"`{n}`" not in section]
     assert not missing, f"add these to the Bitbucket scope table in the README: {missing}"
-    for scope in ("read:repository:bitbucket", "read:pullrequest:bitbucket", "read:pipeline:bitbucket",
-                  "admin:repository:bitbucket", "read:webhook:bitbucket", "read:snippet:bitbucket"):
-        assert scope in text.split("## Step 1: the token")[1].split("### Bitbucket tokens")[0]
+    full_set = text.split("## Step 1: the token")[1].split("### GitHub: what each step needs")[0]
+    # read:workspace and read:user are what Browse workspaces needs; leaving them out of the list made Browse 403
+    for scope in ("read:user:bitbucket", "read:workspace:bitbucket", "read:repository:bitbucket",
+                  "read:pullrequest:bitbucket", "read:pipeline:bitbucket", "admin:repository:bitbucket",
+                  "read:webhook:bitbucket", "read:snippet:bitbucket"):
+        assert scope in full_set, f"{scope} missing from the full-set row"
+        assert scope in section, f"{scope} missing from the Bitbucket Cloud step table"
 
 
 def test_git_is_installed_in_the_image_for_wiki_clones_and_for_check():

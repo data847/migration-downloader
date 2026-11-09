@@ -18,36 +18,123 @@ for org scope, exactly as the document specifies; both are overridable.
 
 ## Step 1: the token
 
-The one manual step, straight from the document. Create a PAT with:
+The one manual step. In short, create the token with **every** permission in the
+"Full set" row for your platform; the tables after it say which step needs what,
+so a 403 or 404 can be traced to the one permission that is missing. A missing
+permission only fails the steps that need it: the rest of the run carries on and
+each failure is listed under the run's issues.
 
-| | Scopes |
-|---|---|
-| GitHub, personal repos | `repo` + `user` |
-| GitHub, org repos | `repo` + `admin:org` — and you must be an org **Owner** or hold the [Migrator role](https://docs.github.com/en/migrations/ado/granting-the-migrator-role) |
-| GitLab | `api` + `write_repository` (a *legacy* token on GitLab.com) |
-| Bitbucket Cloud | an API token with `read:repository:bitbucket`, `read:pullrequest:bitbucket`, `read:pipeline:bitbucket`, `admin:repository:bitbucket`, `read:webhook:bitbucket`, `read:snippet:bitbucket` (details below) |
-| Bitbucket Data Center | an HTTP access token: read access to the repos for browsing and `archive`; **system admin** for the export job |
+| Platform | Full set (tick all of these) | Account role |
+|---|---|---|
+| GitHub, repos you own | classic PAT: `repo`, `user`, `read:org`, `admin:repo_hook` (or `read:repo_hook`), `security_events`, `read:project`, `read:packages` | owner of the repos |
+| GitHub, repos of an organization | classic PAT: `repo`, `admin:org`, `user`, `admin:repo_hook` (or `read:repo_hook`), `security_events`, `read:project`, `read:packages`; authorize it for the org if the org uses SAML SSO (Settings → Tokens → Configure SSO) | org **Owner**, or the [Migrator role](https://docs.github.com/en/migrations/ado/granting-the-migrator-role) |
+| GitLab | personal access token: `api` (it includes `read_api` and `read_repository`) | **Maintainer** or Owner on each project |
+| Bitbucket Cloud | API token with scopes, 8 scopes: `read:user:bitbucket`, `read:workspace:bitbucket`, `read:repository:bitbucket`, `read:pullrequest:bitbucket`, `read:pipeline:bitbucket`, `admin:repository:bitbucket`, `read:webhook:bitbucket`, `read:snippet:bitbucket` | member of the workspace; **admin** on the repos for branch restrictions, pipelines config and webhooks; workspace admin for workspace webhooks |
+| Bitbucket Data Center | HTTP access token with **Repository read** (Project read for a whole project) | **system admin** for the export job |
 
-The scopes above cover the export plus everything the extras collect; GitHub and
-GitLab need a few more for the extras (see [Extras](#extras-what-the-archives-leave-out)).
+A GitHub repository owned by **someone else's personal account** cannot be
+exported at all, whatever the scopes: GitHub only lets an account export its own
+repositories (`/user/migrations`), and a personal account has no
+`/orgs/<name>/migrations`, so the export answers 404. Either the owner exports
+with their own token, the owner moves the repositories into an organization
+where you are Owner or Migrator, or you collect them with collaborator access
+using `collab-exporter` (no GitHub export archive, the same content rebuilt from
+the API).
 
-### Bitbucket tokens
+The GitLab upload document also asks for `write_repository`; nothing in this tool
+writes to a repository, so `api` alone is enough here. GitLab.com legacy tokens
+and the newer fine-grained ones both work as long as they carry `api`.
+
+### GitHub: what each step needs
+
+| Step | Calls | Classic PAT scope | Role |
+|---|---|---|---|
+| Sign-in check | `GET /user` | any | — |
+| Browse: your repos and the repos shared with you | `GET /user/repos?affiliation=owner,collaborator,organization_member` | `repo` (private repos are hidden without it) | read access |
+| Browse: the organization list | `GET /user/orgs` | `read:org` (or `admin:org`, which includes it) | member |
+| Browse: one organization's repos | `GET /orgs/<org>/repos` | `repo` | member |
+| Export your own repos | `POST /user/migrations`, `GET /user/migrations/<id>`, `GET …/archive` | `repo` + `user` | owner of the repos |
+| Export an organization's repos | `POST /orgs/<org>/migrations`, `GET /orgs/<org>/migrations/<id>`, `GET …/archive` | `repo` + `admin:org` (+ SSO authorization) | org Owner or Migrator |
+| `--unlock-repos`, `--delete-archive` | `DELETE …/migrations/<id>/repos/<repo>/lock`, `DELETE …/migrations/<id>/archive` | same as the export | same as the export |
+| `for-check.csv` counts | `POST /graphql`, `GET /repos/<o>/<r>/issues/comments`, `…/pulls/comments`, `…/comments` | `repo` | read access |
+| `for-check.csv` collaborators count | `GET /repos/<o>/<r>/collaborators` | `repo` | **push** access (without it the count is blank and the reason is in the `error` section) |
+| `for-check.csv` refs | `git ls-remote` | `repo` | read access |
+| Extras `repo-metadata`, `releases`, `wiki` | `GET /repos/<o>/<r>`, `…/releases`, `git clone` of the wiki | `repo` | read access |
+| Extras `actions`, `actions-logs`, `actions-artifacts` | `GET …/actions/runs`, `…/runs/<id>/jobs`, `…/runs/<id>/logs`, `…/actions/artifacts` | `repo` | read access |
+| Extras `hooks` | `GET …/hooks` | `admin:repo_hook` or `read:repo_hook` | **admin** on the repo |
+| Extras `branch-protection` | `GET …/branches?protected=true`, `…/branches/<b>/protection` | `repo` | **admin** on the repo |
+| Extras `dependabot-alerts`, `code-scanning`, `secret-scanning` | `GET …/dependabot/alerts`, `…/code-scanning/alerts`, `…/code-scanning/analyses`, `…/secret-scanning/alerts` | `security_events` (and `repo`) | write access for Dependabot and code scanning, admin (or security manager) for secret scanning; the feature must be on in the repo |
+| Extras `projects-v2` | `POST /graphql` (`projectsV2`) | `read:project` | can see the projects |
+| Extras `packages` | `GET /orgs/<org>/packages` or `/users/<owner>/packages` | `read:packages` | can see the packages |
+
+### GitLab: what each step needs
+
+| Step | Calls | Token scope | Role on the project |
+|---|---|---|---|
+| Sign-in check | `GET /api/v4/user` | `read_api` | — |
+| Browse groups, subgroups and their projects | `GET /groups?min_access_level=40`, `…/groups/<id>/subgroups`, `…/groups/<id>/projects`, `GET /projects?owned=true` | `read_api` | Maintainer (the list only shows Maintainer and above) |
+| Export (start, poll, download) | `POST /projects/<id>/export`, `GET …/export`, `GET …/export/download` | `api` | **Maintainer** |
+| `for-check.csv` | `GET /projects/<id>?statistics=true` and counts; `git ls-remote` | `read_api`, `read_repository` | Reporter |
+| Extras `repo-archive`, `wiki-pages`, `releases` | `GET …/repository/archive.tar.gz`, `…/wikis`, `…/releases` | `read_api` | Reporter |
+| Extras `wiki` | `git clone` of the wiki | `read_repository` | Reporter |
+| Extras `pipelines`, `job-traces`, `job-artifacts` | `GET …/pipelines`, `…/pipelines/<id>/jobs`, `…/jobs`, `…/jobs/<id>/trace`, `…/jobs/<id>/artifacts` | `read_api` | Reporter (Developer when the project hides pipelines from Reporters) |
+| Extras `hooks` | `GET …/hooks` | `read_api` | **Maintainer** |
+| Extras `relations-export` | `POST …/export_relations`, status, download | `api` | **Maintainer** |
+
+Self-hosted GitLab also needs project export switched on by an administrator
+(*Admin → Settings → General → Import and export settings*).
+
+### Bitbucket Cloud: what each step needs
 
 Bitbucket Cloud has no export archive, so everything it does is read-only API
-calls, and the scopes decide which collectors work:
+calls. The scope for every call below is taken from Bitbucket's own API
+specification (`swagger.v3.json`, the `x-atlassian-oauth2-scopes` of each
+endpoint), checked November 2026.
 
-| Scope (Cloud API token) | Used by |
-|---|---|
-| `read:repository:bitbucket` | the repo picker, `repo-metadata`, `refs`, `commits`, `commit-statuses`, `commit-diffstat`, `commit-patches`, `branching-model`, `downloads`, `forks` |
-| `read:pullrequest:bitbucket` | `pullrequests`, `pr-diffs` |
-| `read:pipeline:bitbucket` | `pipelines`, `pipeline-logs` |
-| `admin:repository:bitbucket` | `branch-restrictions` and the pipelines config (Bitbucket gates both behind admin) |
-| `read:webhook:bitbucket` | `hooks` (repo and workspace) |
-| `read:snippet:bitbucket` | `snippets` |
+| Step | Calls | API token scope | Role |
+|---|---|---|---|
+| Browse: the workspace list | `GET /2.0/user/workspaces` | `read:workspace:bitbucket` | workspace member |
+| Browse: which workspace is your personal one | `GET /2.0/user` | `read:user:bitbucket` | — |
+| Browse: the repos in a workspace | `GET /2.0/repositories/<workspace>` | `read:repository:bitbucket` | read access |
+| `repo-metadata`, `refs`, `commits`, `commit-statuses`, `commit-diffstat`, `commit-patches`, `branching-model`, `downloads`, `forks` | `GET /2.0/repositories/<ws>/<repo>` and `…/refs`, `…/commits`, `…/commit/<sha>/statuses`, `…/diffstat/<sha>`, `…/patch/<sha>`, `…/branching-model`, `…/downloads`, `…/forks` | `read:repository:bitbucket` | read access |
+| `pullrequests`, `pr-diffs` | `GET …/pullrequests`, `…/pullrequests/<id>`, `…/commits`, `…/statuses`, `…/diff`, `…/patch`, `…/diffstat` | `read:pullrequest:bitbucket` | read access |
+| `pipelines`, `pipeline-logs`, pipeline variables | `GET …/pipelines`, `…/pipelines/<id>/steps`, `…/steps/<id>/log`, `…/pipelines_config/variables` | `read:pipeline:bitbucket` | read access |
+| Pipelines config | `GET …/pipelines_config` | `admin:repository:bitbucket` | **admin** on the repo |
+| `branch-restrictions` | `GET …/branch-restrictions` | `admin:repository:bitbucket` | **admin** on the repo |
+| `hooks` (repo) | `GET …/hooks` | `read:webhook:bitbucket` | **admin** on the repo |
+| `hooks` (workspace) | `GET /2.0/workspaces/<ws>/hooks` | `read:webhook:bitbucket` | **workspace admin** |
+| `snippets` | `GET /2.0/snippets/<ws>`, `…/<id>/files/<path>`, `…/<id>/commits` | `read:snippet:bitbucket` | workspace member |
 
-A missing scope only fails its own collectors; the rest of the run carries on and
-the failure is listed under the run's issues. App passwords no longer work
-(removed July 2026).
+A 403 that says "Your credentials lack one or more required privilege scopes"
+means the scope in this table is missing from the token. Scopes cannot be added
+to an existing Bitbucket API token: create a new one with all 8. App passwords
+no longer work (removed July 2026).
+
+### Bitbucket Data Center: what each step needs
+
+| Step | Calls | Permission |
+|---|---|---|
+| Browse | `GET /rest/api/1.0/repos` | Repository read (lists what the token can read) |
+| Project lookup | `GET /rest/api/1.0/projects/<key>` | Project read |
+| `archive` | repository archive download | Repository read |
+| Export job (start, preview, status, messages, cancel) | `POST /rest/api/1.0/migration/exports`, `…/preview`, `GET …/<job>`, `…/<job>/messages`, `POST …/<job>/cancel` | **system admin** (from Atlassian's documentation; not yet tried against a live server) |
+
+### Bitbucket: making the token and pasting it
+
+Making a Bitbucket Cloud API token:
+
+1. Open id.atlassian.com → **Security** → **Create and manage API tokens**.
+2. **Create API token with scopes**, give it a name and an expiry date.
+3. Choose the app **Bitbucket**.
+4. Tick all 8 scopes: `read:user:bitbucket`, `read:workspace:bitbucket`,
+   `read:repository:bitbucket`, `read:pullrequest:bitbucket`,
+   `read:pipeline:bitbucket`, `admin:repository:bitbucket`,
+   `read:webhook:bitbucket`, `read:snippet:bitbucket`.
+5. Create it and copy it (it is shown once).
+6. Paste it into the token box as `your-atlassian-email@example.com:THE_TOKEN`.
+7. Check it: **Browse workspaces…** lists your workspaces. A 403 there means
+   `read:workspace:bitbucket` (or `read:user:bitbucket`) is missing: make a new
+   token with all 8.
 
 Which kind of token to paste:
 
@@ -64,10 +151,9 @@ You can check which format a token is with
 `curl -H 'Authorization: Bearer TOKEN' https://api.bitbucket.org/2.0/repositories/WORKSPACE/REPO`
 (access token).
 
-These scope names and the access-token limits come from Atlassian's documentation
-(read through a summary, not the pages themselves); they have not been checked
-against a live Bitbucket account, so treat a 403 as "check the scope" first. The Data Center
-export permission (system admin) is likewise unverified.
+An access token (repository, project or workspace) uses the same scope names,
+ticked when it is created. If **Browse workspaces…** fails with one, type the
+targets as `workspace/repo` instead of browsing.
 
 Then either paste it into the UI (used for that run only, never stored), or put
 it in an env file so you never paste it again:
@@ -308,10 +394,8 @@ remembered in the browser). Leaving everything ticked is the default.
 Not collected on purpose: issue/PR/commit comments, discussions, activity and
 tasks.
 
-Extra token needs beyond the export scopes: GitHub `admin:repo_hook` (or
-`read:repo_hook`), `security_events`, `read:project`, `read:packages`; GitLab
-Maintainer on the project (for `hooks`). Bitbucket's scopes and token formats are
-in [Bitbucket tokens](#bitbucket-tokens) (put the token in `BITBUCKET_TOKEN`).
+The permission each collector needs is listed per step in
+[Step 1: the token](#step-1-the-token) (put a Bitbucket token in `BITBUCKET_TOKEN`).
 
 `wiki` shells out to `git` (the image installs it). Credentials are passed
 through git's environment config, never the URL or argv.
@@ -326,7 +410,7 @@ In the web UI, one **Bitbucket** button covers both products, the way GitLab
 covers gitlab.com and self-hosted: host `bitbucket.org` is Cloud (extras only),
 and `Data Center (self-hosted)` takes a base URL plus an export-job selector
 (start, preview, cancel or none). A run's extras and export jobs show in
-their own results card. The repo/org browser is GitHub and GitLab only.
+their own results card.
 
 Additional export options:
 
