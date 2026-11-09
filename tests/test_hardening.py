@@ -101,6 +101,75 @@ class TestRateLimit:
             mig._json_request("https://api.github.com/orgs/o/migrations", method="POST", headers={}, payload={})
         assert len(calls) == 1
 
+    def test_an_error_body_that_times_out_is_still_a_migration_error(self, opener):
+        class StalledBody(urllib.error.HTTPError):
+            def read(self, *a):
+                raise TimeoutError("The read operation timed out")
+        calls = opener(StalledBody("https://api.bitbucket.org/2.0/x", 400, "bad", {}, io.BytesIO(b"")))
+        with pytest.raises(MigrationError, match="HTTP 400"):
+            mig._json_request("https://api.bitbucket.org/2.0/x", headers={})
+        assert len(calls) == 1
+
+    def test_a_429_without_retry_after_waits_out_a_rolling_hour(self, opener):
+        """Bitbucket's 429 names no wait; giving up after ~7 minutes lost every remaining item."""
+        calls = opener(http_error(429))
+        with pytest.raises(MigrationError):
+            mig._json_request("https://api.bitbucket.org/2.0/x", headers={})
+        assert len(calls) == ratelimit.BLIND_429_ATTEMPTS
+        assert sum(opener.waits) > 3600
+
+    def test_a_429_without_retry_after_then_success(self, opener):
+        calls = opener(http_error(429), http_error(429), FakeResp(b'{"ok": 3}'))
+        assert mig._json_request("https://api.bitbucket.org/2.0/x", headers={})[1] == {"ok": 3}
+        assert opener.waits == [60, 120]
+
+    def test_bitbucket_temporarily_unavailable_404_is_retried(self, opener):
+        body = '{"errorMessage": "Site temporarily unavailable", "errorCode": "OTHER"}'
+        calls = opener(http_error(404, body=body), FakeResp(b'{"values": []}'))
+        assert mig._json_request("https://api.bitbucket.org/2.0/x", headers={})[1] == {"values": []}
+        assert len(calls) == 2
+
+    def test_an_ordinary_404_is_not_retried(self, opener):
+        calls = opener(http_error(404, body='{"type": "error", "error": {"message": "Repository not found"}}'))
+        with pytest.raises(MigrationError, match="HTTP 404"):
+            mig._json_request("https://api.bitbucket.org/2.0/x", headers={})
+        assert len(calls) == 1
+
+    def test_near_limit_header_paces_the_next_calls(self, opener, monkeypatch):
+        ratelimit.forget()
+        slept = []
+        monkeypatch.setattr(ratelimit, "_unit_sleep", lambda: slept.append(1))
+        opener(FakeResp(b"{}", headers={"X-RateLimit-NearLimit": "true"}))
+        mig._json_request("https://api.bitbucket.org/2.0/a", headers={})
+        assert slept == []
+        mig._json_request("https://api.bitbucket.org/2.0/b", headers={})
+        assert len(slept) == ratelimit.NEAR_LIMIT_PACE
+        ratelimit.forget()
+
+    def test_a_download_that_breaks_off_is_retried(self, opener, tmp_path):
+        class Broken(FakeResp):
+            def read(self, n=-1):
+                raise ConnectionResetError("reset")
+        class Chunked(FakeResp):
+            def __init__(self):
+                super().__init__(b"")
+                self.parts = [b"diff --git a b", b""]
+            def read(self, n=-1):
+                return self.parts.pop(0)
+        calls = opener(Broken(), Chunked())
+        dest = mig._download("https://api.bitbucket.org/2.0/x/diff", tmp_path / "1.diff", headers={}, log=lambda m: None)
+        assert dest.read_bytes() == b"diff --git a b" and len(calls) == 2
+
+    def test_a_download_that_keeps_breaking_gives_up_as_migration_error(self, opener, tmp_path):
+        class Broken(FakeResp):
+            def read(self, n=-1):
+                raise TimeoutError("timed out")
+        calls = opener(Broken())
+        with pytest.raises(MigrationError, match="timed out"):
+            mig._download("https://api.bitbucket.org/2.0/x/diff", tmp_path / "1.diff", headers={}, log=lambda m: None)
+        assert len(calls) == ratelimit.TRANSIENT_ATTEMPTS + 1
+        assert not list(tmp_path.iterdir())
+
     def test_429_waits_retry_after_then_succeeds(self, opener):
         calls = opener(http_error(429, {"Retry-After": "7"}), FakeResp(b'{"ok": 1}'))
         assert mig._json_request("https://api.github.com/x", headers={})[1] == {"ok": 1}

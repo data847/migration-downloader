@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import io
+import json
 import os
 import sys
 import threading
@@ -83,10 +84,39 @@ def _worker(job_id: str, spec: JobSpec) -> None:
         jobstore.update(job_id, manifest=manifest, state=state)
     except MigrationError as exc:
         log(f"ERROR {exc}")
-        jobstore.update(job_id, state="error", error=str(exc))
+        jobstore.update(job_id, state="error", error=str(exc), manifest=_checkpointed_manifest(job_id))
     except Exception:  # unexpected — traceback into the log, not the console
         log(traceback.format_exc())
-        jobstore.update(job_id, state="error", error="unexpected failure; see log")
+        jobstore.update(job_id, state="error", error="unexpected failure; see log",
+                        manifest=_checkpointed_manifest(job_id))
+
+
+def _checkpointed_manifest(job_id: str) -> dict:
+    """What a run that died had already recorded: the runner writes manifest.json after every target, so its
+    counts, issues and files survive the crash (and a resume skips what is in it)."""
+    job = jobstore.get(job_id) or {}
+    run = jobstore._run_dir_name(job, {})
+    if not run:
+        return {}
+    try:
+        data = json.loads((outputs_for(COMPONENT, run) / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _header_counts(manifest: dict) -> list:
+    """The counts lines of a downloaded log. With no manifest the counts are unknown, not zero."""
+    if not manifest:
+        return ["# archives   : unknown (the run did not record a manifest; see the log below)",
+                "# extras     : unknown"]
+    unfinished = "" if manifest.get("complete", True) else "  (run did not finish: counts up to the last repo)"
+    return [
+        f"# archives   : {manifest.get('ok', 0)} ok, "
+        f"{manifest.get('archives_failed', manifest.get('failed', 0))} failed{unfinished}",
+        f"# extras     : {manifest.get('extras_failed', 0)} collector run(s) failed, "
+        f"{manifest.get('extras_incomplete', 0)} incomplete (some items missing){unfinished}",
+    ]
 
 
 def _run_root(run: str) -> Path:
@@ -198,9 +228,7 @@ def job_log(job_id: str):
         + (f" ({spec.get('scope')} scope)" if spec.get("provider") == "github" else ""),
         f"# host       : {host}",
         f"# targets    : {len(spec.get('targets', []))}",
-        f"# archives   : {manifest.get('ok', 0)} ok, "
-        f"{manifest.get('archives_failed', manifest.get('failed', 0))} failed",
-        f"# extras     : {manifest.get('extras_failed', 0)} collector run(s) failed",
+        *_header_counts(manifest),
         f"# token      : {spec.get('token_hint', '')}"
         + (" (from .env)" if spec.get("token_from_env") else ""),
         "#",

@@ -288,6 +288,11 @@ Every run's state and full log are written to
   what happens here. Press **Resume this run** and it polls the *same*
   migration id (step 2 skipped), reuses the same output folder, and skips any
   archive already downloaded. Nothing is re-exported needlessly.
+- Extras runs write `manifest.json` after every repository, so a run that
+  crashes or is killed keeps the record of every repository it finished. A
+  resume skips each (repository, collector) that finished cleanly and whose
+  files are still on disk, and runs again only what failed, was incomplete or
+  never started.
 - The **Runs** table lists every run with its state; **View** reopens any log.
 
 ## Docker
@@ -388,7 +393,7 @@ remembered in the browser). Leaving everything ticked is the default.
 |---|---|---|
 | `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `branch-protection` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `wiki` `actions-logs` |
 | `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `hooks` | `wiki` `job-traces` `job-artifacts` `relations-export` |
-| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `commit-statuses` `commit-diffstat` `pullrequests` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `forks` | `commit-patches` `pr-diffs` `pipeline-logs` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `pullrequests` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `forks` | `commit-statuses` `commit-diffstat` `commit-patches` `pr-diffs` `pipeline-logs` |
 | `bitbucket-dc` | | `archive` |
 
 Not collected on purpose: issue/PR/commit comments, discussions, activity and
@@ -458,6 +463,13 @@ feature switched off, a rate limit...). The same list is in `manifest.json`
 under `issues`, also for runs recorded before this existed. A listing cut off
 by the item limit shows up here too.
 
+A collector that ran but could not fetch some of its items (one commit's
+statuses, one PR's diff, one pipeline log) is listed as **incomplete**, with
+how many items are missing and the first failure. The rest of its data is kept,
+and the run counts as partial rather than clean. The same counts are in
+`manifest.json` (`item_errors` and `item_error_examples` per collector,
+`extras_incomplete` for the run).
+
 ## Rate limits and retries
 
 Every API call goes through one place that waits instead of failing: a `429`
@@ -469,6 +481,22 @@ that host pauses first. Waits are logged in the run and can be cancelled. A
 connection, because that could start a second one; it is only retried when the
 host clearly did nothing (`429`, rate-limit `403`). A genuine permission `403`
 is reported straight away.
+
+A timeout or dropped connection while a response is being read is retried the
+same way for reads, and a file download that breaks off (timeout, reset, short
+body) starts again a few times; a full disk is not retried.
+
+Bitbucket Cloud has a rolling hourly budget (about 1,000 calls) and its `429`
+names no wait, so the tool backs off 1, 2, 4, 8 and then 10 minutes at a time,
+about 95 minutes in all, before giving up on a call: long enough for the hour to
+roll over. When Bitbucket answers `X-RateLimit-NearLimit: true`, calls to it are
+spaced 4 seconds apart until it stops saying so. A Bitbucket `404` whose body
+says "Site temporarily unavailable" is treated as an outage and retried.
+
+The per-commit collectors (`commit-statuses`, `commit-diffstat`,
+`commit-patches`) make one call per commit each, so on a long history they take
+hours under that budget. They are heavy (left out of `all`), and the run log says
+up front what they cost when they are selected.
 
 ## Paging
 

@@ -14,6 +14,7 @@ Tokens are never written to the log stream.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import io
@@ -110,6 +111,15 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_SafeRedirectHandler)
 
 
+def _error_body(exc: urllib.error.HTTPError) -> bytes:
+    """An error response's body. Reading it can time out or drop like any other read; the status code alone is then
+    the message, instead of a TimeoutError escaping from inside the error handler."""
+    try:
+        return exc.read() or b""
+    except (OSError, http.client.HTTPException, ValueError):
+        return b""
+
+
 def _request(
     url: str,
     *,
@@ -137,8 +147,8 @@ def _request(
             resp = _opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
             raw = b""
-            if exc.code == 403:             # the body says whether it was a limit
-                raw = exc.read()
+            if exc.code in (403, 404):      # the body says whether it was a limit or a passing outage
+                raw = _error_body(exc)
             transient = exc.code >= 500
             delay = None if (transient and not safe_to_repeat) else ratelimit.delay_for(
                 exc.code, exc.headers, raw.decode("utf-8", "replace")[:400], attempt)
@@ -180,7 +190,7 @@ def _read_json(url: str, method: str, headers: dict, payload, timeout: int):
                 hdrs = {k.lower(): v for k, v in resp.headers.items()}
             break
         except urllib.error.HTTPError as exc:  # surface GitHub/GitLab's own message
-            detail = exc.read().decode("utf-8", "replace")[:600]
+            detail = _error_body(exc).decode("utf-8", "replace")[:600]
             raise MigrationError(f"HTTP {exc.code} {method} {url}\n{detail}") from None
         except urllib.error.URLError as exc:
             raise MigrationError(f"network error {method} {url}: {exc.reason}") from None
@@ -228,8 +238,31 @@ def _json_page(url: str, *, headers: dict, timeout: int = 60):
     return data, next_link(hdrs.get("link")), hdrs
 
 
+class _Retryable(MigrationError):
+    """A download that broke off (timeout, reset, short body): worth starting again, like a dropped connection."""
+
+
 def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int = 120,
               info: Optional[dict] = None) -> Path:
+    """Stream to `<dest>.part`, then rename. A timeout, reset or short body is retried from the start a few times
+    (a GET is safe to repeat); a full disk or an HTTP error is not."""
+    attempt = 0
+    while True:
+        try:
+            return _download_once(url, dest, headers=headers, log=log, timeout=timeout, info=info)
+        except _Retryable as exc:
+            delay = ratelimit.delay_for_network(attempt)
+            if delay is None:
+                raise MigrationError(str(exc)) from None
+            try:
+                ratelimit.wait(delay, f"{exc}; retrying the download")
+            except ratelimit.Cancelled:
+                raise MigrationError("cancelled while retrying a download") from None
+            attempt += 1
+
+
+def _download_once(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int,
+                   info: Optional[dict]) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix(dest.suffix + ".part")
     partial.unlink(missing_ok=True)
@@ -255,20 +288,23 @@ def _download(url: str, dest: Path, *, headers: dict, log: Logger, timeout: int 
                     log(f"    downloading… {human(done)}")
                     next_mark = done + 25 * 1024 * 1024
             if total and done != total:
-                raise MigrationError(f"download truncated: got {done} of {total} bytes")
+                raise _Retryable(f"download truncated: got {done} of {total} bytes")
     except MigrationError:
         partial.unlink(missing_ok=True)
         raise
     except urllib.error.HTTPError as exc:
         partial.unlink(missing_ok=True)
-        detail = exc.read().decode("utf-8", "replace")[:600]
-        raise MigrationError(f"HTTP {exc.code} downloading archive\n{detail}") from None
+        detail = _error_body(exc).decode("utf-8", "replace")[:600]
+        raise MigrationError(f"HTTP {exc.code} downloading {url}\n{detail}") from None
     except urllib.error.URLError as exc:
         partial.unlink(missing_ok=True)
-        raise MigrationError(f"network error downloading archive: {exc.reason}") from None
+        raise MigrationError(f"network error downloading {url}: {exc.reason}") from None
     except (OSError, http.client.HTTPException) as exc:     # reset / timeout / IncompleteRead mid-stream, disk full
         partial.unlink(missing_ok=True)
-        raise MigrationError(f"error downloading archive: {type(exc).__name__}: {exc}") from None
+        message = f"error downloading {url}: {type(exc).__name__}: {exc}"
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            raise MigrationError(message) from None
+        raise _Retryable(message) from None
     partial.replace(dest)
     return dest
 
