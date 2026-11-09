@@ -296,6 +296,48 @@ class BitbucketCloud(unittest.TestCase):
             for state in bitbucket.PR_STATES:
                 self.assertIn(f"state={state}", url)
 
+    def test_pullrequests_survive_bitbucket_page_size_limit(self):
+        """Bitbucket answers 400 'Invalid pagelen' above 50 on pull requests; that lost every PR of a real run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, provider="bitbucket", target="ws/repo", api_base="https://api.bitbucket.org/2.0")
+            calls = []
+
+            def fake(url, *, method="GET", headers=None, payload=None, timeout=60):
+                calls.append(url)
+                size = int(url.split("pagelen=")[1].split("&")[0]) if "pagelen=" in url else 10
+                if size > 50:
+                    raise MigrationError(f"HTTP 400 GET {url} — Invalid pagelen")
+                if "/pullrequests?" in url:
+                    return 200, {"values": [{"id": 1}, {"id": 2}]}
+                return 200, {"values": [{"hash": "c1"}], "id": 1}
+
+            with patch_http(fake):
+                supplementary.REGISTRY["bitbucket"]["pullrequests"](ctx)
+            prs = json.loads((ctx.out / "pullrequests.json").read_text())
+            self.assertEqual([p["id"] for p in prs], [1, 2])
+            details = json.loads((ctx.out / "pullrequest-details.json").read_text())
+            self.assertEqual(details["1"]["commits"]["values"], [{"hash": "c1"}])
+            self.assertNotIn("error", details["1"]["commits"])
+
+    def test_paging_steps_down_on_invalid_pagelen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, provider="bitbucket", target="ws/repo", api_base="https://api.bitbucket.org/2.0")
+            seen = []
+
+            def fake(url, *, method="GET", headers=None, payload=None, timeout=60):
+                seen.append(url)
+                if "pagelen=100" in url or "pagelen=50" in url:
+                    raise MigrationError(f"HTTP 400 GET {url} — Invalid pagelen")
+                return 200, {"values": [{"name": "main"}]}
+
+            with patch_http(fake):
+                self.assertEqual(bitbucket.cloud_paged(ctx, "https://api.bitbucket.org/2.0/repositories/ws/repo/refs"),
+                                 [{"name": "main"}])
+            self.assertIn("pagelen=25", seen[-1])
+            with patch_http(FakeHttp({})):  # any other error is still raised
+                with self.assertRaises(MigrationError):
+                    bitbucket.cloud_paged(ctx, "https://api.bitbucket.org/2.0/repositories/ws/repo/refs")
+
     def test_workspace_level_collectors_run_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             shared = {}

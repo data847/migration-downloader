@@ -33,6 +33,7 @@ import supplementary
 
 BITBUCKET_CLOUD_BASE = "https://api.bitbucket.org/2.0"
 PR_STATES = ("OPEN", "MERGED", "DECLINED", "SUPERSEDED")
+PR_PAGELEN = 50  # the pull request listings answer 400 "Invalid pagelen" above 50
 
 
 def _q(job_id: str) -> str:
@@ -59,9 +60,20 @@ def cloud_paged(ctx, url: str, *, pagelen: int = 100) -> list:
     items: list = []
     sep = "&" if "?" in url else "?"
     nxt = f"{url}{sep}pagelen={pagelen}"
+    first = True
     while nxt:
         ctx.check_cancelled()
-        data, _link, _hdrs = supplementary._json_page(nxt, headers=ctx.headers)
+        try:
+            data, _link, _hdrs = supplementary._json_page(nxt, headers=ctx.headers)
+        except MigrationError as exc:
+            # Each listing has its own page-size ceiling and answers 400 "Invalid pagelen" above it. Only the first page
+            # carries our pagelen; later pages follow Bitbucket's own next links.
+            if first and pagelen > 10 and "invalid pagelen" in str(exc).lower():
+                pagelen //= 2
+                nxt = f"{url}{sep}pagelen={pagelen}"
+                continue
+            raise
+        first = False
         values = data.get("values", []) if isinstance(data, dict) else []
         items.extend(values)
         follow = data.get("next") if isinstance(data, dict) else None
@@ -140,8 +152,16 @@ def _prs(ctx: Ctx) -> list:
     cached = ctx.shared.setdefault("bb_prs", {})
     if ctx.target not in cached:
         states = "&".join(f"state={s}" for s in PR_STATES)
-        cached[ctx.target] = cloud_paged(ctx, bb_url(ctx, f"/pullrequests?{states}"))
+        cached[ctx.target] = cloud_paged(ctx, bb_url(ctx, f"/pullrequests?{states}"), pagelen=PR_PAGELEN)
     return cached[ctx.target]
+
+
+def _paged_or_error(ctx: Ctx, url: str) -> dict:
+    """Every page of a per-PR listing, shaped like one page ({"values": [...]}); a failure is recorded, not raised."""
+    try:
+        return {"values": cloud_paged(ctx, url, pagelen=PR_PAGELEN)}
+    except MigrationError as exc:
+        return {"error": brief_error(exc)}
 
 
 @collector("bitbucket", "pullrequests")
@@ -154,8 +174,8 @@ def bb_pullrequests(ctx):
         pid = pr["id"]
         detail[str(pid)] = {
             "pullrequest": try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}")),
-            "commits": try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}/commits?pagelen=100")),
-            "statuses": try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}/statuses?pagelen=100")),
+            "commits": _paged_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/commits")),
+            "statuses": _paged_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/statuses")),
         }
     return [ctx.save_json("pullrequests", prs), ctx.save_json("pullrequest-details", detail)]
 
@@ -173,7 +193,7 @@ def bb_pr_diffs(ctx):
             except MigrationError as exc:
                 ctx.log(f"    PR {pid} {kind}: {brief_error(exc)}")
         written.append(ctx.save_json(f"pr-diffs/{pid}-diffstat",
-                                     try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}/diffstat?pagelen=100"))))
+                                     _paged_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/diffstat"))))
     return written
 
 
