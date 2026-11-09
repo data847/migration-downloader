@@ -128,6 +128,8 @@ class JobSpec:
     # bitbucket data center export job
     dc_action: str = "export"         # export | preview | cancel | none
     dc_job_id: str = ""               # for cancel
+    # bitbucket cloud: the full git history by git clone --mirror, packed as the repo's archive
+    mirror: bool = True
 
     @classmethod
     def from_form(cls, data: dict) -> "JobSpec":
@@ -162,6 +164,7 @@ class JobSpec:
             description=(data.get("description") or "").strip(),
             dc_action=(data.get("dc_action") or "export").strip().lower(),
             dc_job_id=(data.get("dc_job_id") or "").strip(),
+            mirror=str(data.get("mirror", "1")).lower() not in {"0", "false", "off", "no"},
         )
 
     def resolved_token(self) -> str:
@@ -199,8 +202,8 @@ class JobSpec:
                     _parse_owner_repo(target)     # every target must say who owns it
         for target in self.targets:
             require_valid_target(_strip_url(target))
-        if self.provider == "bitbucket" and not self.extras:
-            raise MigrationError("Bitbucket Cloud has no export archive; pass extras (e.g. all, pullrequests)")
+        if self.provider == "bitbucket" and not self.extras and not self.mirror:
+            raise MigrationError("Bitbucket Cloud has no export archive: keep the git mirror on, or pass extras (e.g. all, pullrequests)")
         if self.provider == "bitbucket-dc":
             if not self.api_base:
                 raise MigrationError("Bitbucket Data Center needs --api-base (its base URL)")
@@ -322,6 +325,8 @@ def run_job(
         results = _run_gitlab(spec, token, dest_dir, log, cancelled)
     elif spec.provider == "bitbucket-dc":
         export_jobs = _run_bitbucket_dc(spec, token, dest_dir, log, cancelled)
+    elif spec.provider == "bitbucket" and spec.mirror:
+        results = _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled)
 
     manifest_path = dest_dir / "manifest.json"
     previous = _load_manifest(manifest_path) if spec.skip_done else None
@@ -802,6 +807,38 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
             result.meta["content_length"] = client.download_info.get("content_length", "")
             result.path = dest
             result.bytes = dest.stat().st_size
+            log(f"  saved {dest.name} ({human(result.bytes)})")
+        except MigrationError as exc:
+            result.error = brief_error(exc)
+            log(f"  ERROR {result.error}")
+        results.append(result)
+    return results
+
+
+def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+    """Bitbucket Cloud: each repo's full git history by `git clone --mirror` with the run's token, packed as
+    <workspace>-<repo>.tar.gz (holding <repo>.git/) and recorded as the target's archive, so the bundle ships it
+    together with that repo's extras."""
+    api_base = spec.api_base or BITBUCKET_CLOUD_BASE
+    results: List[ArchiveResult] = []
+    for index, raw in enumerate(spec.targets, 1):
+        target = _strip_url(raw).strip("/")
+        result = ArchiveResult(target=target, meta={"kind": "git-mirror"})
+        log("")
+        log(f"[{index}/{len(spec.targets)}] {target}: git mirror")
+        stem = safe_name(target)
+        try:
+            if cancelled and cancelled():
+                raise MigrationError("cancelled")
+            done = existing_archive(dest_dir, stem) if spec.skip_done else None
+            if done:
+                log(f"  already cloned ({human(done.stat().st_size)}) — skipping")
+                result.skipped, result.path, result.bytes = True, done, done.stat().st_size
+                results.append(result)
+                continue
+            check_disk(dest_dir, MIN_FREE_MB, what=f"the mirror of {target}")
+            dest = bitbucket.mirror_archive(target, token, api_base, dest_dir, log)
+            result.path, result.bytes, result.state = dest, dest.stat().st_size, "mirrored"
             log(f"  saved {dest.name} ({human(result.bytes)})")
         except MigrationError as exc:
             result.error = brief_error(exc)

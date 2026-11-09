@@ -231,7 +231,7 @@ def outputs(tmp_path, monkeypatch):
 
 
 def bb_spec(**kw):
-    base = dict(provider="bitbucket", token="me@x.com:tok", targets=["ws/a", "ws/b"], run_name="bbrun",
+    base = dict(provider="bitbucket", mirror=False, token="me@x.com:tok", targets=["ws/a", "ws/b"], run_name="bbrun",
                 extras=["refs", "commit-statuses"])
     return runner.JobSpec(**{**base, **kw})
 

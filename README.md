@@ -86,13 +86,16 @@ Self-hosted GitLab also needs project export switched on by an administrator
 
 ### Bitbucket Cloud: what each step needs
 
-Bitbucket Cloud has no export archive, so everything it does is read-only API
-calls. The scope for every call below is taken from Bitbucket's own API
-specification (`swagger.v3.json`, the `x-atlassian-oauth2-scopes` of each
-endpoint), checked November 2026.
+Bitbucket Cloud has no export archive. The repository itself comes from
+`git clone --mirror`, done for every repo of every Bitbucket Cloud run (the UI has
+no switch for it; only the CLI's `--no-mirror` skips it), and everything else is
+read-only API calls. The scope for every call below
+is taken from Bitbucket's own API specification (`swagger.v3.json`, the
+`x-atlassian-oauth2-scopes` of each endpoint), checked November 2026.
 
 | Step | Calls | API token scope | Role |
 |---|---|---|---|
+| Git mirror: the full history (every branch, tag and note) | `git clone --mirror https://bitbucket.org/<ws>/<repo>.git` with the same token: an API token (`email:token`) as user `x-bitbucket-api-token-auth`, an access token as `x-token-auth`; passed through git's environment, never the URL | `read:repository:bitbucket` | read access |
 | Browse: the workspace list | `GET /2.0/user/workspaces` | `read:workspace:bitbucket` | workspace member |
 | Browse: which workspace is your personal one | `GET /2.0/user` | `read:user:bitbucket` | — |
 | Browse: the repos in a workspace | `GET /2.0/repositories/<workspace>` | `read:repository:bitbucket` | read access |
@@ -406,7 +409,15 @@ The permission each collector needs is listed per step in
 through git's environment config, never the URL or argv.
 
 Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo --extras all`
-is extras-only. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
+clones each repo with `git clone --mirror` (same token) and packs it as
+`<workspace>-<repo>.tar.gz` holding `<repo>.git/`, recorded as that repo's
+archive: the download bundle then puts it in one `<workspace>-<repo>.zip` with
+its `extras/<workspace>-<repo>/` metadata (pull requests, refs, commits …), and
+Squirrel pairs the two by that name. A repo git cannot read fails on its own
+(with a hint about `read:repository`); a resumed run (`--skip-done`) does not
+clone a repo whose archive is already there. Pull request refs
+(`refs/pull-requests/*`) are not in a Cloud mirror; the `pullrequests` extra
+keeps the PR data. `--no-mirror` makes the run extras-only, as before. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
 token `BITBUCKET_DC_TOKEN`) starts and monitors the server-side export job
 (`--dc-action export|preview|cancel|none`, `--dc-job-id` for cancel); the
 resulting `.tar` is written to the server's shared home, not downloaded here.

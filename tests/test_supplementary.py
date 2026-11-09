@@ -391,7 +391,7 @@ class SpecValidation(unittest.TestCase):
 
     def test_bitbucket_cloud_requires_extras(self):
         with self.assertRaises(MigrationError):
-            self._spec(provider="bitbucket").validate()
+            self._spec(provider="bitbucket", mirror=False).validate()
         self._spec(provider="bitbucket", extras=["refs"]).validate()
 
     def test_unknown_extra_fails_fast(self):
@@ -515,7 +515,7 @@ class ErrorReporting(unittest.TestCase):
     def test_manifest_separates_archive_and_extras_failures(self):
         import runner
         with tempfile.TemporaryDirectory() as tmp:
-            spec = JobSpec(provider="bitbucket", token="t", targets=["ws/r"], extras=["refs"])
+            spec = JobSpec(provider="bitbucket", token="t", targets=["ws/r"], mirror=False, extras=["refs"])
             fake = FakeHttp({"/refs": MigrationError("HTTP 403 x")})
             with patch_http(fake), \
                     mock.patch("runner.run_dir", return_value=Path(tmp)):
