@@ -273,9 +273,11 @@ def discover():
     """
     data = _body()
     provider = (data.get("provider") or "github").strip().lower()
-    kind = (data.get("kind") or "repos").strip().lower()       # repos | owners
+    kind = (data.get("kind") or "repos").strip().lower()       # repos | owners | workspaces
     scope = (data.get("scope") or "auto").strip().lower()
-    owner = (data.get("owner") or "").strip()                  # org / group
+    owner = (data.get("owner") or "").strip()                  # org / group / workspace
+    # Browse workspaces: what `owner` is (org, workspace, group or the personal account); empty for the older pickers
+    owner_kind = (data.get("owner_kind") or "").strip().lower()
     api_base = (data.get("api_base") or "").strip()
     try:
         page = max(1, int(data.get("page") or 1))
@@ -290,22 +292,39 @@ def discover():
         return jsonify(error=f"no {provider} token supplied and none found in .env"), 400
     try:
         if provider == "bitbucket":
-            result = bitbucket.cloud_repos_page(token, page)
+            if kind == "workspaces":
+                result = bitbucket.cloud_workspaces_page(token, page)
+            else:
+                result = bitbucket.cloud_repos_page(token, page, workspace=owner)
         elif provider == "bitbucket-dc":
             result = bitbucket.dc_repos_page(token, api_base, page)
         elif provider == "github":
             client = GitHubMigration(token, scope="org" if scope == "org" else "user",
                                      org=owner or "x",
                                      api_base=api_base or "https://api.github.com")
-            if kind == "owners":
+            if kind == "workspaces":
+                result = client.owners_page()
+            elif owner_kind == "personal":
+                result = client.repos_page(page, personal=True)
+            elif owner_kind == "org" and owner:
+                result = client.repos_page(page, org=owner, full_names=True)
+            elif kind == "owners":
                 result = client.orgs_page(page)
             else:
                 result = client.repos_page(page, org=owner if scope == "org" else "",
                                            everything=scope == "auto")
         else:
             client = GitLabExport(token, api_base=api_base or "https://gitlab.com")
-            result = (client.groups_page(page) if kind == "owners"
-                      else client.projects_page(page, group=owner))
+            if kind == "workspaces":
+                result = client.workspaces_page()
+            elif owner_kind == "personal":
+                result = client.personal_projects_page(page)
+            elif owner_kind == "group" and owner:
+                result = client.group_page(owner, page)
+            elif kind == "owners":
+                result = client.groups_page(page)
+            else:
+                result = client.projects_page(page, group=owner)
     except MigrationError as exc:
         return jsonify(error=brief_error(exc).splitlines()[0]), 400
     return jsonify(items=result["items"], count=len(result["items"]), page=page,

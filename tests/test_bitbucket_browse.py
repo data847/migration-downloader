@@ -27,22 +27,23 @@ CLOUD = {"values": [
 ], "next": "https://api.bitbucket.org/2.0/repositories?page=2"}
 
 
-def test_cloud_lists_member_repos_as_workspace_slash_repo(monkeypatch):
+def test_cloud_lists_a_workspaces_repos_as_workspace_slash_repo(monkeypatch):
     seen = serve(monkeypatch, CLOUD)
-    result = bitbucket.cloud_repos_page("me@x.com:tok", page=3)
+    result = bitbucket.cloud_repos_page("me@x.com:tok", page=3, workspace="acme")
     assert [i["target"] for i in result["items"]] == ["acme/api", "other/site"]
     assert result["items"][0] == {"target": "acme/api", "label": "acme/api", "private": True, "archived": False,
                                   "size_kb": 20, "updated": "2026-09-30"}
     assert result["items"][1]["private"] is False
     assert result["has_more"] is True
     url, headers = seen[0]
-    assert "role=member" in url and "page=3" in url and "pagelen=100" in url
+    # inside one workspace: Bitbucket retired the cross-workspace /2.0/repositories?role=member (CHANGE-2770)
+    assert "/2.0/repositories/acme?" in url and "role=member" not in url and "page=3" in url and "pagelen=100" in url
     assert headers["Authorization"] == "Basic " + base64.b64encode(b"me@x.com:tok").decode()
 
 
 def test_cloud_accepts_a_bare_access_token_and_knows_the_last_page(monkeypatch):
     seen = serve(monkeypatch, {"values": [{"full_name": "a/b"}]})
-    result = bitbucket.cloud_repos_page("ACCESSTOKEN")
+    result = bitbucket.cloud_repos_page("ACCESSTOKEN", workspace="a")
     assert result["has_more"] is False
     assert seen[0][1]["Authorization"] == "Bearer ACCESSTOKEN"
 

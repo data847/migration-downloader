@@ -137,8 +137,23 @@ login go through `/user/migrations`; every other owner's go through that org's
 within an owner, never across). `--scope user` / `--scope org --org X` still
 force the old behaviour, and org scope still takes bare names.
 
-Bitbucket has the same picker. Cloud lists every repo the token's user is a
-member of (`/repositories?role=member`) as `workspace/repo`; Data Center lists
+**Browse workspaces** (GitHub: "Browse orgs & personal…", Bitbucket Cloud:
+"Browse workspaces…", GitLab: "Browse groups & personal…") shows one list of
+what the token belongs to: the GitHub organizations, the Bitbucket workspaces
+or the GitLab top-level groups, by name, with your **personal** account last.
+Click one to see its repos and tick them; **‹ Back** returns to the list, and
+what is ticked stays ticked while you move between workspaces. A GitLab group
+also lists its **subgroups**, each of which opens in turn (projects directly in
+the group are shown, filtered to the ones you may export, Maintainer or above).
+GitHub org repos are added as `org/repo`, personal ones as `you/repo`.
+
+Bitbucket Cloud retired its cross-workspace APIs (CHANGE-2770), so the old
+"every repo you are a member of" call (`/2.0/repositories?role=member`) now
+answers 404. Its picker therefore always starts from the workspaces
+(`/2.0/user/workspaces`, the one cross-workspace endpoint Atlassian keeps; the
+older `/2.0/user/permissions/workspaces` is tried if that one is missing) and
+lists the repos inside the workspace you open (`/2.0/repositories/<workspace>`),
+as `workspace/repo`. Data Center lists
 what the token can read (`/rest/api/1.0/repos`) as `PROJECT/slug` and needs its
 base URL typed first. Token format for the box: an API token is
 `email@example.com:API_TOKEN`; a repository, project or workspace access token
