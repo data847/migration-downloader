@@ -43,6 +43,7 @@ from migration_api import (  # noqa: E402
 )
 
 import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
+import redact  # noqa: E402
 import ratelimit  # noqa: E402
 from safety import MIN_FREE_MB, check_disk, http_url, require_valid_target, trusted_api_base, valid_target  # noqa: E402
 from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
@@ -853,6 +854,9 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
                 record["files"] = REGISTRY[spec.provider][name](ctx)
             except MigrationError as exc:
                 record["error"] = brief_error(exc)
+                log(f"    ERROR {record['error']}")
+            except Exception as exc:  # one collector's surprise must not stop the other collectors and targets
+                record["error"] = redact.scrub(f"{type(exc).__name__}: {exc}")[:600]
                 log(f"    ERROR {record['error']}")
             if ctx.truncated:
                 record["truncated"] = list(ctx.truncated)

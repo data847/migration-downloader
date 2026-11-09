@@ -71,7 +71,36 @@ def opener(monkeypatch):
 # ── rate limits and retries ──────────────────────────────────────────────────
 
 
+class SlowResp(FakeResp):
+    """The response arrived but its body timed out (Bitbucket diffstat on a real run)."""
+
+    def read(self):
+        raise TimeoutError("The read operation timed out")
+
+
 class TestRateLimit:
+    def test_a_body_read_timeout_on_get_is_retried(self, opener):
+        calls = opener(SlowResp(), FakeResp(b'{"ok": 1}'))
+        assert mig._json_request("https://api.bitbucket.org/2.0/x", headers={})[1] == {"ok": 1}
+        assert len(calls) == 2 and len(opener.waits) == 1
+
+    def test_a_timeout_that_keeps_happening_becomes_a_migration_error(self, opener):
+        calls = opener(SlowResp())
+        with pytest.raises(MigrationError, match="timed out"):
+            mig._json_request("https://api.bitbucket.org/2.0/x", headers={})
+        assert len(calls) == ratelimit.TRANSIENT_ATTEMPTS + 1
+
+    def test_a_connect_timeout_on_get_is_retried(self, opener):
+        calls = opener(TimeoutError("timed out"), FakeResp(b'{"ok": 2}'))
+        assert mig._json_request("https://api.github.com/x", headers={})[1] == {"ok": 2}
+        assert len(calls) == 2
+
+    def test_a_post_that_times_out_is_not_repeated(self, opener):
+        calls = opener(SlowResp(), FakeResp(b'{"id": 1}'))
+        with pytest.raises(MigrationError, match="timed out"):
+            mig._json_request("https://api.github.com/orgs/o/migrations", method="POST", headers={}, payload={})
+        assert len(calls) == 1
+
     def test_429_waits_retry_after_then_succeeds(self, opener):
         calls = opener(http_error(429, {"Retry-After": "7"}), FakeResp(b'{"ok": 1}'))
         assert mig._json_request("https://api.github.com/x", headers={})[1] == {"ok": 1}

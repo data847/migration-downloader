@@ -170,16 +170,31 @@ def _read_json(url: str, method: str, headers: dict, payload, timeout: int):
     body = json.dumps(payload).encode() if payload is not None else None
     if body is not None:
         headers = {**headers, "Content-Type": "application/json"}
-    try:
-        with _request(url, method=method, headers=headers, body=body, timeout=timeout) as resp:
-            raw = resp.read()
-            status = resp.status
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-    except urllib.error.HTTPError as exc:  # surface GitHub/GitLab's own message
-        detail = exc.read().decode("utf-8", "replace")[:600]
-        raise MigrationError(f"HTTP {exc.code} {method} {url}\n{detail}") from None
-    except urllib.error.URLError as exc:
-        raise MigrationError(f"network error {method} {url}: {exc.reason}") from None
+    safe_to_repeat = method in {"GET", "HEAD", "DELETE"}
+    attempt = 0
+    while True:
+        try:
+            with _request(url, method=method, headers=headers, body=body, timeout=timeout) as resp:
+                raw = resp.read()
+                status = resp.status
+                hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            break
+        except urllib.error.HTTPError as exc:  # surface GitHub/GitLab's own message
+            detail = exc.read().decode("utf-8", "replace")[:600]
+            raise MigrationError(f"HTTP {exc.code} {method} {url}\n{detail}") from None
+        except urllib.error.URLError as exc:
+            raise MigrationError(f"network error {method} {url}: {exc.reason}") from None
+        except (OSError, http.client.HTTPException) as exc:
+            # A timeout or a dropped connection while the response is read arrives as TimeoutError, ConnectionError or
+            # IncompleteRead, not URLError. A GET is repeated a few times; a POST never is (it could start a second export).
+            delay = ratelimit.delay_for_network(attempt) if safe_to_repeat else None
+            if delay is None:
+                raise MigrationError(f"network error {method} {url}: {exc or type(exc).__name__}") from None
+            try:
+                ratelimit.wait(delay, f"network error talking to {urllib.parse.urlparse(url).netloc} ({exc})")
+            except ratelimit.Cancelled:
+                raise MigrationError("cancelled while retrying") from None
+            attempt += 1
     if not raw.strip():
         return status, {}, hdrs
     try:
