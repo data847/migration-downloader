@@ -94,6 +94,15 @@ class Ctx:
     shared: dict = field(default_factory=dict)   # once-per-run state (groups, workspaces)
     cancelled: Optional[Callable[[], bool]] = None
     truncated: list = field(default_factory=list)   # listings cut short by max_items
+    item_errors: list = field(default_factory=list)  # per-item failures inside a collector that otherwise ran
+
+    def item_error(self, what: str, exc) -> dict:
+        """Record one item that could not be fetched (one commit's statuses, one PR diff...). The collector carries on,
+        but the run reports it as incomplete instead of silently succeeding."""
+        message = brief_error(exc) if isinstance(exc, Exception) else str(exc)
+        self.item_errors.append({"what": what, "error": message})
+        self.log(f"    {what}: {message}")
+        return {"error": message}
 
     def truncate(self, what: str) -> None:
         note = f"{what.split('?')[0].rsplit('/', 1)[-1] or what} limited to {self.max_items} items"
@@ -113,8 +122,17 @@ class Ctx:
             raise MigrationError("cancelled")
 
 
+def require_json(data, url: str):
+    """A JSON endpoint that answered with something else (a maintenance or proxy page) is an error, not an empty
+    result: `_read_json` wraps such a body as {"raw": ...}."""
+    if isinstance(data, dict) and set(data) == {"raw"}:
+        snippet = " ".join(str(data["raw"]).split())[:160]
+        raise MigrationError(f"expected JSON from {url.split('?')[0]}, got: {snippet}")
+    return data
+
+
 def get_json(url: str, headers: dict):
-    return _json_request(url, headers=headers)[1]
+    return require_json(_json_request(url, headers=headers)[1], url)
 
 
 def paged_all(ctx: Ctx, url: str, *, key: str = "", per_page: int = 100) -> list:
@@ -131,6 +149,7 @@ def paged_all(ctx: Ctx, url: str, *, key: str = "", per_page: int = 100) -> list
     while nxt:
         ctx.check_cancelled()
         data, link, _hdrs = _json_page(nxt, headers=ctx.headers)
+        require_json(data, nxt)
         batch = data.get(key, []) if key and isinstance(data, dict) else data
         if not isinstance(batch, list):
             break
@@ -156,12 +175,14 @@ def fetch_file(ctx: Ctx, url: str, rel: str, *, headers: Optional[dict] = None,
     return rel
 
 
-def try_json(ctx: Ctx, url: str):
-    """Per-item calls (one branch, one run) shouldn't sink the whole collector."""
+def try_json(ctx: Ctx, url: str, what: str = ""):
+    """Per-item calls (one branch, one run) shouldn't sink the whole collector, but each failure is counted."""
     try:
         return get_json(url, ctx.headers)
     except MigrationError as exc:
-        return {"error": brief_error(exc)}
+        if "cancelled" in str(exc):
+            raise
+        return ctx.item_error(what or url.split("?")[0].replace(ctx.api_base, "").lstrip("/"), exc)
 
 
 def feature_off(exc: MigrationError) -> bool:
@@ -289,8 +310,11 @@ def gh_actions_logs(ctx):
         try:
             written.append(fetch_file(ctx, gh_url(ctx, f"/actions/runs/{run_id}/logs"),
                                       f"actions-logs/run-{run_id}.zip", scrub="zip"))
-        except MigrationError as exc:   # logs expire after 90 days -> 410
-            ctx.log(f"    run {run_id}: {brief_error(exc)}")
+        except MigrationError as exc:   # logs expire after 90 days -> 410, which is expected, not a failure
+            if "HTTP 410" in str(exc):
+                ctx.log(f"    run {run_id}: logs expired")
+            else:
+                ctx.item_error(f"run {run_id} logs", exc)
     return written
 
 
@@ -455,7 +479,7 @@ def gl_job_traces(ctx):
             written.append(fetch_file(ctx, gl_url(ctx, f"/jobs/{job_id}/trace"), f"job-traces/{job_id}.log",
                                       scrub="text"))
         except MigrationError as exc:
-            ctx.log(f"    job {job_id}: {brief_error(exc)}")
+            ctx.item_error(f"job {job_id} trace", exc)
     return written
 
 
@@ -469,7 +493,7 @@ def gl_job_artifacts(ctx):
                                       f"job-artifacts/{job_id}.zip"))
         except MigrationError as exc:
             if "HTTP 404" not in str(exc):
-                ctx.log(f"    job {job_id}: {brief_error(exc)}")
+                ctx.item_error(f"job {job_id} artifacts", exc)
     return written
 
 

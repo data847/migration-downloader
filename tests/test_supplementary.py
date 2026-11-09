@@ -439,6 +439,21 @@ class RunExtras(unittest.TestCase):
             self.assertEqual(by_name["releases"]["files"], ["releases.json"])
             self.assertTrue((Path(tmp) / "extras" / "acme-widgets" / "releases.json").is_file())
 
+    def test_an_unexpected_error_fails_one_collector_not_the_run(self):
+        """A socket timeout escaped as TimeoutError and stopped a real 22-repo run at the second repo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = JobSpec(provider="github", token="t", targets=["acme/one", "acme/two"], extras=["hooks", "releases"])
+            fake = FakeHttp({"acme/one/hooks": TimeoutError("The read operation timed out"), "/hooks": [],
+                             "/releases": [{"id": 1}]})
+            logs = []
+            with patch_http(fake), mock.patch("runner._github_login", return_value="someone"):
+                records = _run_extras(spec, "t", Path(tmp), logs.append, None)
+            got = {(r["target"], r["extra"]): r["error"] for r in records}
+            self.assertIn("timed out", got[("acme/one", "hooks")])
+            self.assertEqual(got[("acme/one", "releases")], "")
+            self.assertEqual(got[("acme/two", "hooks")], "")
+            self.assertEqual(got[("acme/two", "releases")], "")
+
     def test_cancel_stops_further_collectors(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = JobSpec(provider="github", token="t", targets=["acme/widgets"], extras=["hooks"])

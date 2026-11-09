@@ -74,15 +74,46 @@ def cloud_paged(ctx, url: str, *, pagelen: int = 100) -> list:
                 continue
             raise
         first = False
+        supplementary.require_json(data, nxt)
         values = data.get("values", []) if isinstance(data, dict) else []
         items.extend(values)
         follow = data.get("next") if isinstance(data, dict) else None
+        if not follow and values and isinstance(data, dict):
+            follow = _numbered_next(url, sep, data, pagelen)
         if ctx.max_items and len(items) >= ctx.max_items:
             if follow or len(items) > ctx.max_items:
                 ctx.truncate(url)
             return items[:ctx.max_items]
         nxt = require_same_origin(url, follow) if follow else None
     return items
+
+
+def _numbered_next(url: str, sep: str, data: dict, pagelen: int):
+    """Some listings (Pipelines) answer page/size/pagelen but no `next` link; without this the listing would stop
+    quietly after its first page."""
+    try:
+        page, size, per = int(data.get("page") or 0), int(data.get("size") or 0), int(data.get("pagelen") or pagelen)
+    except (TypeError, ValueError):
+        return None
+    if page and size and per and page * per < size:
+        return f"{url}{sep}pagelen={per}&page={page + 1}"
+    return None
+
+
+def _all_or_error(ctx: Ctx, url: str, what: str, pagelen: int = 100) -> dict:
+    """Every page of a per-item listing, shaped like one page ({"values": [...]}). A failure is counted as a
+    missing item (the run reports it) instead of sinking the collector."""
+    try:
+        return {"values": cloud_paged(ctx, url, pagelen=pagelen)}
+    except MigrationError as exc:
+        if "cancelled" in str(exc):
+            raise
+        return ctx.item_error(what, exc)
+
+
+def _seg(value) -> str:
+    """One path segment. Pipeline and step UUIDs come as {...}; braces are not safe in a URL path unencoded."""
+    return urllib.parse.quote(str(value), safe="")
 
 
 def bb_url(ctx: Ctx, suffix: str = "") -> str:
@@ -118,21 +149,23 @@ def _commit_hashes(ctx: Ctx) -> list:
     return [c["hash"] for c in cloud_paged(ctx, bb_url(ctx, "/commits"))]
 
 
-@collector("bitbucket", "commit-statuses")
+# One call per commit each: on a long history these take hours under Bitbucket's hourly limit, so they are heavy
+# (left out of `all`, run by `everything` or by name) and the run says up front what they cost.
+@collector("bitbucket", "commit-statuses", heavy=True)
 def bb_commit_statuses(ctx):
     out = {}
     for sha in _commit_hashes(ctx):
         ctx.check_cancelled()
-        out[sha] = try_json(ctx, bb_url(ctx, f"/commit/{sha}/statuses?pagelen=100"))
+        out[sha] = _all_or_error(ctx, bb_url(ctx, f"/commit/{_seg(sha)}/statuses"), f"commit {sha[:10]} statuses")
     return [ctx.save_json("commit-statuses", out)]
 
 
-@collector("bitbucket", "commit-diffstat")
+@collector("bitbucket", "commit-diffstat", heavy=True)
 def bb_commit_diffstat(ctx):
     out = {}
     for sha in _commit_hashes(ctx):
         ctx.check_cancelled()
-        out[sha] = try_json(ctx, bb_url(ctx, f"/diffstat/{sha}?pagelen=100"))
+        out[sha] = _all_or_error(ctx, bb_url(ctx, f"/diffstat/{_seg(sha)}"), f"commit {sha[:10]} diffstat")
     return [ctx.save_json("commit-diffstat", out)]
 
 
@@ -142,26 +175,30 @@ def bb_commit_patches(ctx):
     for sha in _commit_hashes(ctx):
         ctx.check_cancelled()
         try:
-            written.append(fetch_file(ctx, bb_url(ctx, f"/patch/{sha}"), f"commit-patches/{sha}.patch"))
+            written.append(fetch_file(ctx, bb_url(ctx, f"/patch/{_seg(sha)}"), f"commit-patches/{sha}.patch"))
         except MigrationError as exc:
-            ctx.log(f"    {sha[:10]}: {brief_error(exc)}")
+            ctx.item_error(f"commit {sha[:10]} patch", exc)
     return written
 
 
 def _prs(ctx: Ctx) -> list:
     cached = ctx.shared.setdefault("bb_prs", {})
     if ctx.target not in cached:
-        states = "&".join(f"state={s}" for s in PR_STATES)
-        cached[ctx.target] = cloud_paged(ctx, bb_url(ctx, f"/pullrequests?{states}"), pagelen=PR_PAGELEN)
+        try:
+            cached[ctx.target] = cloud_paged(ctx, _pr_list_url(ctx, PR_STATES), pagelen=PR_PAGELEN)
+        except MigrationError as exc:
+            # SUPERSEDED is the newest state; if a Bitbucket ever refuses it, losing every PR would be far worse than
+            # missing the superseded ones
+            text = str(exc).lower()
+            if "http 400" not in text or "pagelen" in text:
+                raise
+            ctx.log("    the PR listing refused state=SUPERSEDED; listing the other states")
+            cached[ctx.target] = cloud_paged(ctx, _pr_list_url(ctx, PR_STATES[:-1]), pagelen=PR_PAGELEN)
     return cached[ctx.target]
 
 
-def _paged_or_error(ctx: Ctx, url: str) -> dict:
-    """Every page of a per-PR listing, shaped like one page ({"values": [...]}); a failure is recorded, not raised."""
-    try:
-        return {"values": cloud_paged(ctx, url, pagelen=PR_PAGELEN)}
-    except MigrationError as exc:
-        return {"error": brief_error(exc)}
+def _pr_list_url(ctx: Ctx, states) -> str:
+    return bb_url(ctx, "/pullrequests?" + "&".join(f"state={s}" for s in states))
 
 
 @collector("bitbucket", "pullrequests")
@@ -173,9 +210,11 @@ def bb_pullrequests(ctx):
         ctx.check_cancelled()
         pid = pr["id"]
         detail[str(pid)] = {
-            "pullrequest": try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}")),
-            "commits": _paged_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/commits")),
-            "statuses": _paged_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/statuses")),
+            "pullrequest": try_json(ctx, bb_url(ctx, f"/pullrequests/{pid}"), f"PR {pid}"),
+            "commits": _all_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/commits"), f"PR {pid} commits",
+                                     PR_PAGELEN),
+            "statuses": _all_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/statuses"), f"PR {pid} statuses",
+                                      PR_PAGELEN),
         }
     return [ctx.save_json("pullrequests", prs), ctx.save_json("pullrequest-details", detail)]
 
@@ -191,9 +230,10 @@ def bb_pr_diffs(ctx):
                 written.append(fetch_file(ctx, bb_url(ctx, f"/pullrequests/{pid}/{kind}"),
                                           f"pr-diffs/{pid}.{kind}"))
             except MigrationError as exc:
-                ctx.log(f"    PR {pid} {kind}: {brief_error(exc)}")
+                ctx.item_error(f"PR {pid} {kind}", exc)
         written.append(ctx.save_json(f"pr-diffs/{pid}-diffstat",
-                                     _paged_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/diffstat"))))
+                                     _all_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/diffstat"),
+                                                   f"PR {pid} diffstat", PR_PAGELEN)))
     return written
 
 
@@ -217,71 +257,105 @@ def bb_downloads(ctx):
 def bb_snippets(ctx):
     """Workspace-level, so once per workspace however many repos are targeted."""
     ws = bb_workspace(ctx)
-    done = ctx.shared.setdefault("bb_snippets", set())
-    if ws in done:
+    done = ctx.shared.setdefault("bb_snippets", {})
+    if ws in done:      # workspace-level: collected (or failed) once, with the first repo of the workspace
+        if done[ws]:
+            ctx.log(f"    workspace {ws}: snippets failed earlier in this run ({done[ws]}); not retried")
         return []
-    base = f"{ctx.api_base}/snippets/{ws}"
-    snippets = cloud_paged(ctx, base)
+    base = f"{ctx.api_base}/snippets/{_seg(ws)}"
+    try:
+        snippets = cloud_paged(ctx, base)
+    except MigrationError as exc:
+        done[ws] = brief_error(exc)
+        raise
+    done[ws] = ""
     detail = {}
     for snip in snippets:
+        ctx.check_cancelled()
         sid = snip["id"]
+        # the listing carries no file names; the snippet itself does
+        full = try_json(ctx, f"{base}/{_seg(sid)}", f"snippet {sid}")
         files = {}
-        for fname in (snip.get("files") or {}):
+        for fname in ((full.get("files") if isinstance(full, dict) else None) or {}):
             try:
                 files[fname] = fetch_file(
-                    ctx, f"{base}/{sid}/files/{urllib.parse.quote(fname, safe='')}",
-                    f"snippets-{safe_name(ws)}/{sid}/{safe_name(fname)}")
+                    ctx, f"{base}/{_seg(sid)}/files/{urllib.parse.quote(fname, safe='')}",
+                    f"snippets-{safe_name(ws)}/{safe_name(sid)}/{safe_name(fname)}")
             except MigrationError as exc:
-                files[fname] = {"error": brief_error(exc)}
-        detail[sid] = {"commits": try_json(ctx, f"{base}/{sid}/commits"), "files": files}
-    done.add(ws)
+                files[fname] = ctx.item_error(f"snippet {sid} file {fname}", exc)
+        detail[sid] = {"snippet": full,
+                       "commits": _all_or_error(ctx, f"{base}/{_seg(sid)}/commits", f"snippet {sid} commits"),
+                       "files": files}
     return [ctx.save_json(f"snippets-{safe_name(ws)}", snippets),
             ctx.save_json(f"snippet-details-{safe_name(ws)}", detail)]
 
 
 @collector("bitbucket", "hooks")
 def bb_hooks(ctx):
-    written = [ctx.save_json("hooks", cloud_paged(ctx, bb_url(ctx, "/hooks")))]
+    """Repo webhooks need repo admin, workspace webhooks need workspace admin: one failing never skips the other."""
+    written = []
+    try:
+        written.append(ctx.save_json("hooks", cloud_paged(ctx, bb_url(ctx, "/hooks"))))
+    except MigrationError as exc:
+        if "cancelled" in str(exc):
+            raise
+        ctx.item_error("repository webhooks", exc)
     ws = bb_workspace(ctx)
     done = ctx.shared.setdefault("bb_ws_hooks", set())
     if ws not in done:
-        written.append(ctx.save_json(f"workspace-hooks-{safe_name(ws)}", cloud_paged(ctx, 
-            f"{ctx.api_base}/workspaces/{ws}/hooks")))
-        done.add(ws)
+        done.add(ws)    # once per workspace, failed or not: it would fail the same way for every repo
+        try:
+            written.append(ctx.save_json(f"workspace-hooks-{safe_name(ws)}",
+                                         cloud_paged(ctx, f"{ctx.api_base}/workspaces/{_seg(ws)}/hooks")))
+        except MigrationError as exc:
+            if "cancelled" in str(exc):
+                raise
+            ctx.item_error(f"workspace {ws} webhooks", exc)
     return written
+
+
+def _pipeline_steps(ctx: Ctx, pipelines: list) -> dict:
+    steps = {}
+    for pipe in pipelines:
+        ctx.check_cancelled()
+        steps[pipe["uuid"]] = _all_or_error(ctx, bb_url(ctx, f"/pipelines/{_seg(pipe['uuid'])}/steps"),
+                                            f"pipeline {pipe.get('build_number', pipe['uuid'])} steps")
+    ctx.shared.setdefault("bb_steps", {})[ctx.target] = steps
+    return steps
 
 
 @collector("bitbucket", "pipelines")
 def bb_pipelines(ctx):
-    pipelines = cloud_paged(ctx, bb_url(ctx, "/pipelines/?sort=-created_on"))
-    steps = {}
-    for pipe in pipelines:
-        ctx.check_cancelled()
-        steps[pipe["uuid"]] = try_json(ctx, bb_url(ctx, f"/pipelines/{pipe['uuid']}/steps/?pagelen=100"))
-    ctx.shared.setdefault("bb_steps", {})[ctx.target] = steps
+    pipelines = cloud_paged(ctx, bb_url(ctx, "/pipelines?sort=-created_on"))
+    steps = _pipeline_steps(ctx, pipelines)
     return [
-        ctx.save_json("pipelines-config", try_json(ctx, bb_url(ctx, "/pipelines_config"))),
+        ctx.save_json("pipelines-config", try_json(ctx, bb_url(ctx, "/pipelines_config"), "pipelines config")),
         ctx.save_json("pipelines", pipelines),
         ctx.save_json("pipeline-steps", steps),
         # variable names only: secured values are never returned
-        ctx.save_json("pipeline-variables", try_json(ctx, bb_url(ctx, "/pipelines_config/variables"))),
+        ctx.save_json("pipeline-variables", _all_or_error(ctx, bb_url(ctx, "/pipelines_config/variables"),
+                                                          "pipeline variables")),
     ]
 
 
 @collector("bitbucket", "pipeline-logs", heavy=True)
 def bb_pipeline_logs(ctx):
-    steps = ctx.shared.get("bb_steps", {}).get(ctx.target, {})
+    steps = ctx.shared.get("bb_steps", {}).get(ctx.target)
+    if steps is None:   # run on its own, or `pipelines` failed or was skipped on a resume: find the steps here
+        steps = _pipeline_steps(ctx, cloud_paged(ctx, bb_url(ctx, "/pipelines?sort=-created_on")))
     written = []
     for pipe_uuid, listing in steps.items():
         for step in (listing.get("values", []) if isinstance(listing, dict) else []):
             ctx.check_cancelled()
             try:
                 written.append(fetch_file(
-                    ctx, bb_url(ctx, f"/pipelines/{pipe_uuid}/steps/{step['uuid']}/log"),
+                    ctx, bb_url(ctx, f"/pipelines/{_seg(pipe_uuid)}/steps/{_seg(step['uuid'])}/log"),
                     f"pipeline-logs/{safe_name(pipe_uuid)}-{safe_name(step['uuid'])}.log",
                     scrub="text"))
             except MigrationError as exc:
-                ctx.log(f"    step {step['uuid']}: {brief_error(exc)}")
+                if "HTTP 404" in str(exc):      # a step that never ran (skipped, not started) has no log
+                    continue
+                ctx.item_error(f"pipeline step {step['uuid']} log", exc)
     return written
 
 
@@ -473,7 +547,8 @@ class BitbucketDCExport:
         key, _sep, slug = target.strip("/").partition("/")
         url = (f"{self.api_base}/rest/api/1.0/projects/{urllib.parse.quote(key)}"
                f"/repos/{urllib.parse.quote(slug)}/archive?format=zip")
-        return _download(url, dest, headers=self._headers, log=self.log)
+        # a zip, not JSON: some Data Center versions answer 406 to Accept: application/json here
+        return _download(url, dest, headers={**self._headers, "Accept": "*/*"}, log=self.log)
 
 
 @collector("bitbucket-dc", "archive", heavy=True)

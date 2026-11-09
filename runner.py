@@ -43,6 +43,7 @@ from migration_api import (  # noqa: E402
 )
 
 import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
+import redact  # noqa: E402
 import ratelimit  # noqa: E402
 from safety import MIN_FREE_MB, check_disk, http_url, require_valid_target, trusted_api_base, valid_target  # noqa: E402
 from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
@@ -322,7 +323,24 @@ def run_job(
     elif spec.provider == "bitbucket-dc":
         export_jobs = _run_bitbucket_dc(spec, token, dest_dir, log, cancelled)
 
-    extras = _run_extras(spec, token, dest_dir, log, cancelled) if spec.extras else []
+    manifest_path = dest_dir / "manifest.json"
+    previous = _load_manifest(manifest_path) if spec.skip_done else None
+
+    def assemble(extras_so_far: List[dict], complete: bool) -> dict:
+        m = _manifest(spec, started, dest_dir, results, export_jobs, extras_so_far)
+        if previous:
+            _merge_resumed(m, previous)
+        m["complete"] = complete
+        _finish_counts(m)
+        return m
+
+    def checkpoint(extras_so_far: List[dict]) -> None:
+        # after every target, so a crash or kill keeps what was collected and a resume can skip it
+        _write_manifest(manifest_path, assemble(extras_so_far, complete=False))
+
+    extras = (_run_extras(spec, token, dest_dir, log, cancelled, checkpoint=checkpoint,
+                          previous=(previous or {}).get("extras", []))
+              if spec.extras else [])
 
     if spec.verify_checksum:
         for r in results:
@@ -335,28 +353,8 @@ def run_job(
         if spec.for_check and info and r.path and r.path.exists():
             _write_for_check(info, r, log)
 
-    manifest = {
-        "component": COMPONENT,
-        "provider": spec.provider,
-        "scope": spec.scope if spec.provider == "github" else "project",
-        "org": spec.org,
-        "api_base": spec.api_base,
-        "started_utc": datetime.fromtimestamp(started, timezone.utc).isoformat(),
-        "elapsed_seconds": round(time.time() - started, 1),
-        "output_dir": str(dest_dir),
-        "archives": [r.as_dict() for r in results],
-        "export_jobs": export_jobs,
-        "extras": extras,
-        "ok": sum(1 for r in results if r.as_dict()["ok"]),
-        "archives_failed": sum(1 for r in results if r.error),
-        "extras_failed": sum(1 for e in extras if e["error"]),
-        "jobs_failed": sum(1 for j in export_jobs if j.get("error")),
-    }
-    if spec.skip_done:
-        _merge_resumed(manifest, dest_dir / "manifest.json")
-    manifest["failed"] = manifest["archives_failed"] + manifest["extras_failed"] + manifest["jobs_failed"]
-    manifest["issues"] = issues_from_manifest(manifest)
-    (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest = assemble(extras, complete=True)
+    _write_manifest(manifest_path, manifest)
 
     log("")
     log(f"done: {manifest['ok']} archive(s) downloaded, {manifest['archives_failed']} failed")
@@ -368,11 +366,13 @@ def run_job(
         else:
             log(f"  ✗ {r.target}: {r.error}")
     if extras:
-        good = sum(1 for e in extras if not e["error"])
-        log(f"extras: {good}/{len(extras)} collector run(s) succeeded")
+        good = sum(1 for e in extras if not e["error"] and not e.get("item_errors"))
+        log(f"extras: {good}/{len(extras)} collector run(s) complete")
         for e in extras:
             if e["error"]:
                 log(f"  ✗ {e['target']} · {e['extra']}: {e['error']}")
+            elif e.get("item_errors"):
+                log(f"  ◐ {e['target']} · {e['extra']}: {e['item_errors']} item(s) could not be fetched")
     if manifest["issues"]:
         log(f"issues: {len(manifest['issues'])}")
         for item in manifest["issues"]:
@@ -381,15 +381,52 @@ def run_job(
     return manifest
 
 
-def _merge_resumed(manifest: dict, path: Path) -> None:
-    """A resume only runs what was outstanding; writing its manifest as-is would
-    drop the earlier archives, their sha256 and the original start time."""
+def _manifest(spec: JobSpec, started: float, dest_dir: Path, results: List[ArchiveResult], export_jobs: List[dict],
+              extras: List[dict]) -> dict:
+    return {
+        "component": COMPONENT,
+        "provider": spec.provider,
+        "scope": spec.scope if spec.provider == "github" else "project",
+        "org": spec.org,
+        "api_base": spec.api_base,
+        "started_utc": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+        "elapsed_seconds": round(time.time() - started, 1),
+        "output_dir": str(dest_dir),
+        "archives": [r.as_dict() for r in results],
+        "export_jobs": export_jobs,
+        "extras": list(extras),
+        "ok": sum(1 for r in results if r.as_dict()["ok"]),
+        "archives_failed": sum(1 for r in results if r.error),
+        "jobs_failed": sum(1 for j in export_jobs if j.get("error")),
+    }
+
+
+def _finish_counts(m: dict) -> None:
+    extras = m.get("extras", [])
+    m["extras_failed"] = sum(1 for e in extras if e.get("error"))
+    # a collector that ran but lost some of its items (one commit's statuses, one PR diff) makes the run partial too
+    m["extras_incomplete"] = sum(1 for e in extras if not e.get("error") and e.get("item_errors"))
+    m["failed"] = m["archives_failed"] + m["extras_failed"] + m["extras_incomplete"] + m["jobs_failed"]
+    m["issues"] = issues_from_manifest(m)
+
+
+def _write_manifest(path: Path, manifest: dict) -> None:
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(json.dumps(manifest, indent=2))
+    tmp.replace(path)
+
+
+def _load_manifest(path: Path) -> Optional[dict]:
     try:
         old = json.loads(path.read_text())
     except (OSError, ValueError):
-        return
-    if not isinstance(old, dict):
-        return
+        return None
+    return old if isinstance(old, dict) else None
+
+
+def _merge_resumed(manifest: dict, old: dict) -> None:
+    """A resume only runs what was outstanding; writing its manifest as-is would
+    drop the earlier archives, their sha256 and the original start time."""
     fresh = {a["target"]: a for a in manifest["archives"]}
     merged = []
     for a in old.get("archives", []):
@@ -404,9 +441,10 @@ def _merge_resumed(manifest: dict, path: Path) -> None:
     if old.get("started_utc"):
         manifest["started_utc"] = old["started_utc"]
     manifest["elapsed_seconds"] = round(manifest["elapsed_seconds"] + float(old.get("elapsed_seconds") or 0), 1)
-    if not manifest["extras"]:
-        manifest["extras"] = old.get("extras", [])
-        manifest["extras_failed"] = sum(1 for e in manifest["extras"] if e.get("error"))
+    # extras: the new run's record for a (target, collector) replaces the old one; the rest are kept
+    fresh_extras = {(e.get("target"), e.get("extra")) for e in manifest["extras"]}
+    manifest["extras"] = [e for e in old.get("extras", [])
+                          if (e.get("target"), e.get("extra")) not in fresh_extras] + manifest["extras"]
     if not manifest["export_jobs"]:
         manifest["export_jobs"] = old.get("export_jobs", [])
         manifest["jobs_failed"] = sum(1 for j in manifest["export_jobs"] if j.get("error"))
@@ -416,6 +454,15 @@ def _merge_resumed(manifest: dict, path: Path) -> None:
 
 _HINTS = [
     # (all of these must appear in the lower-cased message, hint)
+    (("http 401", "api.bitbucket.org"), "Bitbucket rejected the token. A personal API token (id.atlassian.com) must "
+                                        "be pasted as your-atlassian-email:token; only repository, project or "
+                                        "workspace access tokens are pasted on their own. Also check it has not "
+                                        "expired."),
+    (("http 403", "api.bitbucket.org", "privilege scopes"),
+     "The Bitbucket token is missing a scope this step needs. See the README's Bitbucket Cloud table; scopes cannot "
+     "be added to an existing token, so create a new one with all 8."),
+    (("http 555", "api.bitbucket.org"), "Bitbucket gave up computing this diff or patch (too large or too slow). "
+                                        "The other items were collected."),
     (("http 401",), "The host rejected the token. Check it is pasted in full, has not expired or been revoked, "
                     "and belongs to this host."),
     (("http 422", "/user/migrations"), "/user/migrations cannot export an org's repos. Use scope auto (the "
@@ -472,6 +519,11 @@ def issues_from_manifest(manifest: dict) -> List[dict]:
     for e in manifest.get("extras", []):
         if e.get("error"):
             add("extra", e.get("target", ""), e.get("extra", ""), e["error"])
+        elif e.get("item_errors"):
+            examples = e.get("item_error_examples") or []
+            first = f" First: {examples[0]['what']}: {examples[0]['error']}" if examples else ""
+            add("incomplete", e.get("target", ""), e.get("extra", ""),
+                f"{e['item_errors']} item(s) could not be fetched; the rest were collected.{first}")
         for note in e.get("truncated", []):
             add("limit", e.get("target", ""), e.get("extra", ""), note)
     return out
@@ -821,8 +873,21 @@ def _extras_org(spec, target: str, login: str) -> str:
     return ""
 
 
-def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
+def _already_collected(previous: dict, target: str, name: str, out: Path) -> Optional[dict]:
+    """On a resume, a (target, collector) that finished cleanly last time and whose files are all still on disk."""
+    rec = previous.get((target, name))
+    if not rec or rec.get("error") or rec.get("item_errors") or rec.get("truncated"):
+        return None
+    if not all((out / f).is_file() for f in rec.get("files", [])):
+        return None
+    return rec
+
+
+def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous=()) -> List[dict]:
     names = resolve_names(spec.provider, spec.extras)
+    done_before = {(e.get("target"), e.get("extra")): e for e in previous} if spec.skip_done else {}
+    if spec.provider == "bitbucket":
+        _warn_per_commit_cost(names, log)
     headers, api_base, normalise = _extras_context(spec, token, log)
     shared: dict = {}
     records: List[dict] = []
@@ -844,8 +909,14 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
                   org=_extras_org(spec, target, login),
                   scope=spec.scope, max_items=spec.max_items, shared=shared, cancelled=cancelled)
         for name in names:
+            earlier = _already_collected(done_before, target, name, out.resolve())
+            if earlier:
+                log(f"  {name}: already collected, skipped")
+                records.append(earlier)
+                continue
             record = {"target": target, "extra": name, "files": [], "error": ""}
             ctx.truncated.clear()
+            ctx.item_errors.clear()
             log(f"  {name} …")
             try:
                 if cancelled and cancelled():
@@ -854,10 +925,33 @@ def _run_extras(spec, token, dest_dir, log, cancelled) -> List[dict]:
             except MigrationError as exc:
                 record["error"] = brief_error(exc)
                 log(f"    ERROR {record['error']}")
+            except Exception as exc:  # one collector's surprise must not stop the other collectors and targets
+                record["error"] = redact.scrub(f"{type(exc).__name__}: {exc}")[:600]
+                log(f"    ERROR {record['error']}")
             if ctx.truncated:
                 record["truncated"] = list(ctx.truncated)
+            if ctx.item_errors:
+                record["item_errors"] = len(ctx.item_errors)
+                record["item_error_examples"] = [dict(e) for e in ctx.item_errors[:5]]
+                log(f"    {len(ctx.item_errors)} item(s) could not be fetched")
             records.append(record)
+        if checkpoint:
+            checkpoint(records)
     return records
+
+
+# collectors that make one call per commit, and roughly how many calls Bitbucket allows an hour
+PER_COMMIT = ("commit-statuses", "commit-diffstat", "commit-patches")
+BITBUCKET_CALLS_PER_HOUR = 1000
+
+
+def _warn_per_commit_cost(names: List[str], log) -> None:
+    chosen = [n for n in names if n in PER_COMMIT]
+    if chosen:
+        log(f"note: {', '.join(chosen)} make one API call per commit, per collector. Bitbucket allows about "
+            f"{BITBUCKET_CALLS_PER_HOUR} calls an hour, so a repo with 5,000 commits needs about "
+            f"{5000 * len(chosen) // BITBUCKET_CALLS_PER_HOUR} hours for these alone; the run waits out the limit "
+            f"rather than failing. Untick them for a faster run.")
 
 
 def list_runs(limit: int = 40) -> List[dict]:
