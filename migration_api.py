@@ -451,12 +451,28 @@ class GitHubMigration:
         affiliation = "owner,collaborator,organization_member" if everything else "owner,collaborator"
         return f"{self.api_base}/user/repos?affiliation={affiliation}&sort=updated"
 
-    def repos_page(self, page: int = 1, *, org: str = "", everything: bool = False) -> dict:
-        """One page of repos for the lazy-loading picker, plus anything the user should know."""
-        batch, more, hdrs = fetch_page(self._repos_url(org, everything), headers=self._headers, page=page)
+    def repos_page(self, page: int = 1, *, org: str = "", everything: bool = False, personal: bool = False,
+                   full_names: bool = False) -> dict:
+        """One page of repos for the lazy-loading picker, plus anything the user should know.
+
+        `personal`: only the repos the token's user owns (the "personal" row of Browse workspaces).
+        `full_names`: an org's repos as owner/repo (Browse workspaces feeds the auto-scope list), not bare names.
+        """
+        url = f"{self.api_base}/user/repos?affiliation=owner&sort=updated" if personal else self._repos_url(org, everything)
+        batch, more, hdrs = fetch_page(url, headers=self._headers, page=page)
         notes = [SSO_NOTE] if hdrs.get("x-github-sso", "").startswith("partial-results") else []
-        return {"items": [self._repo_row(r, bare=bool(org)) for r in batch if r.get("name")],
+        return {"items": [self._repo_row(r, bare=bool(org) and not full_names and not personal) for r in batch if r.get("name")],
                 "has_more": more, "notes": notes}
+
+    def owners_page(self) -> dict:
+        """Browse workspaces: the token's orgs (by name) and then the user's own account, in one list."""
+        orgs = paged(f"{self.api_base}/user/orgs", headers=self._headers)
+        items = [{"name": o["login"], "label": o["login"], "kind": "org", "description": o.get("description") or ""}
+                 for o in sorted(orgs, key=lambda o: (o.get("login") or "").lower()) if o.get("login")]
+        login = self.whoami()
+        if login and login != "?":
+            items.append({"name": login, "label": login, "kind": "personal", "description": "your own repositories"})
+        return {"items": items, "has_more": False, "notes": []}
 
     def orgs_page(self, page: int = 1) -> dict:
         batch, more, _hdrs = fetch_page(f"{self.api_base}/user/orgs", headers=self._headers, page=page)
@@ -637,6 +653,49 @@ class GitLabExport:
 
     def projects_page(self, page: int = 1, group: str = "") -> dict:
         batch, more, _hdrs = fetch_page(self._projects_url(group), headers=self._headers, page=page)
+        return {"items": [self._project_row(p) for p in batch if p.get("path_with_namespace")],
+                "has_more": more, "notes": []}
+
+    # -- Browse workspaces: top-level groups, then a group's subgroups and its own projects ----------------------------------
+    @staticmethod
+    def _group_ident(group: str) -> str:
+        group = group.strip("/")
+        return group if group.isdigit() else urllib.parse.quote(group, safe="")
+
+    def workspaces_page(self) -> dict:
+        """The top-level groups the token's user belongs to (a subgroup is reached by opening its group), then the personal
+        namespace. Groups are listed at any membership level so a Maintainer of a subgroup can still reach it."""
+        groups = paged(f"{self.api_base}/api/v4/groups?top_level_only=true&all_available=false&order_by=name",
+                       headers=self._headers)
+        items = [{"name": g["full_path"], "label": g.get("name") or g["full_path"], "kind": "group",
+                  "description": g.get("description") or ""}
+                 for g in sorted(groups, key=lambda g: (g.get("full_path") or "").lower()) if g.get("full_path")]
+        login = self.whoami()
+        if login and login != "?":
+            items.append({"name": login, "label": login, "kind": "personal", "description": "your own projects"})
+        return {"items": items, "has_more": False, "notes": []}
+
+    def group_page(self, group: str, page: int = 1) -> dict:
+        """Inside one group: its subgroups (page 1 only, each opens in turn) and the projects directly in it that the token may
+        export (Maintainer or above)."""
+        ident = self._group_ident(group)
+        items: list = []
+        if page == 1:
+            subs = paged(f"{self.api_base}/api/v4/groups/{ident}/subgroups?all_available=false&order_by=name",
+                         headers=self._headers)
+            items = [{"name": s["full_path"], "label": s.get("name") or s["full_path"], "kind": "group",
+                      "description": s.get("description") or ""} for s in subs if s.get("full_path")]
+        batch, more, _hdrs = fetch_page(
+            f"{self.api_base}/api/v4/groups/{ident}/projects?include_subgroups=false"
+            f"&min_access_level={self.MIN_ACCESS_LEVEL}&order_by=last_activity_at",
+            headers=self._headers, page=page)
+        items += [self._project_row(p) for p in batch if p.get("path_with_namespace")]
+        return {"items": items, "has_more": more, "notes": []}
+
+    def personal_projects_page(self, page: int = 1) -> dict:
+        """The projects in the user's own namespace."""
+        batch, more, _hdrs = fetch_page(f"{self.api_base}/api/v4/projects?owned=true&order_by=last_activity_at",
+                                        headers=self._headers, page=page)
         return {"items": [self._project_row(p) for p in batch if p.get("path_with_namespace")],
                 "has_more": more, "notes": []}
 

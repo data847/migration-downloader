@@ -163,6 +163,9 @@
   .picker .tog:hover{color:var(--accent)}
   .picker .tog[aria-expanded=true]{transform:rotate(90deg)}
   .picker .grp-body .item{padding-left:52px}
+  .picker .nav-row{cursor:pointer}
+  .picker .nav-row .go{color:var(--muted);flex:none}
+  .picker .nav-row:hover .go{color:var(--accent)}
   .picker footer{padding:12px 18px;border-top:1px solid var(--line);display:flex;
     justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
   .picker .note{color:var(--muted);font-size:12.5px;padding:14px 18px}
@@ -235,6 +238,7 @@
       <textarea id="targets" placeholder="google/guava"></textarea>
       <div class="inline-act">
         <button class="ghost hot" type="button" id="pick-repos">Browse &amp; select…</button>
+        <button class="ghost hot" type="button" id="pick-ws">Browse workspaces…</button>
         <button class="ghost" type="button" id="clear-targets">Clear</button>
       </div>
       <div class="hint" id="targets-hint"></div>
@@ -378,6 +382,7 @@ to whatever is in flight.</pre>
 <div class="backdrop" id="backdrop" hidden>
   <div class="picker" role="dialog" aria-modal="true" aria-labelledby="picker-title">
     <header>
+      <button class="ghost" type="button" id="picker-back" hidden>‹ Back</button>
       <strong id="picker-title">Select</strong>
       <button class="ghost" type="button" id="picker-close">Close</button>
     </header>
@@ -450,6 +455,8 @@ const KEY = 'md.jobId';
 let provider = 'github', host = 'cloud';
 let jobId = null, since = 0, timer = null;
 let pickerMode = 'repos', pickerItems = [];
+// Browse workspaces: the workspace / org / group being looked into, and the way back (GitLab subgroups go deeper)
+let pickerOwner = null, pickerNav = [];
 let pickerSel = new Set(), pickerOpen = new Set();   // ticked repos / expanded owners
 let pickerPage = 0, pickerMore = false, pickerLoading = false, pickerGen = 0, pickerError = '';
 let pickerNotes = new Set();
@@ -495,6 +502,10 @@ function syncVisibility(){
     ? 'Enterprise API root — usually <code>https://&lt;host&gt;/api/v3</code>.'
     : 'Instance root, no <code>/api/v4</code> — that is appended for you.';
   $('pick-repos').textContent = gh2 || bbAny ? 'Browse & select repos…' : 'Browse & select projects…';
+  // Bitbucket Cloud can no longer list repos across workspaces (CHANGE-2770): its Browse & select opens the workspaces
+  $('pick-repos').hidden = bb;
+  $('pick-ws').hidden = dc;
+  $('pick-ws').textContent = gh2 ? 'Browse orgs & personal…' : bb ? 'Browse workspaces…' : 'Browse groups & personal…';
   const env = ENV[provider];
   $('token-hint').innerHTML = env
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
@@ -826,23 +837,33 @@ function discoverBody(kind){
   return { provider, scope: 'auto', kind,
     token: $('token').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
-    owner: provider === 'gitlab' ? $('group').value.trim() : '' };
+    owner: pickerOwner ? pickerOwner.name : (provider === 'gitlab' ? $('group').value.trim() : ''),
+    owner_kind: pickerOwner ? pickerOwner.kind : '' };
 }
-async function openPicker(mode){
+const WS_KIND = { org: 'organization', workspace: 'workspace', group: 'group', personal: 'personal' };
+async function openPicker(mode, owner = null, keepSelection = false){
   pickerMode = mode;
-  const isOwners = mode === 'owners';
-  const noun = provider === 'github'
+  pickerOwner = mode === 'repos' ? owner : null;
+  const isOwners = mode === 'owners' || mode === 'workspaces';
+  const noun = mode === 'workspaces'
+    ? (provider === 'github' ? 'an organization or your personal account'
+      : provider === 'bitbucket' ? 'a workspace' : 'a group or your personal namespace')
+    : pickerOwner
+    ? `${provider === 'gitlab' ? 'projects' : 'repositories'} in ${pickerOwner.label || pickerOwner.name}${pickerOwner.kind === 'personal' ? ' (personal)' : ''}`
+    : provider === 'github'
     ? (isOwners ? 'organizations' : 'repositories (yours and your orgs\')')
     : provider === 'bitbucket' ? 'repositories (every workspace you belong to)'
     : provider === 'bitbucket-dc' ? 'repositories (the ones this token can read)'
     : (isOwners ? 'groups' : ($('group').value.trim() ? `projects in ${$('group').value.trim()}` : 'your projects'));
   $('picker-title').textContent = `Select ${noun}`;
-  $('picker-add').hidden = isOwners;
+  $('picker-add').hidden = mode === 'owners' || (mode === 'workspaces' && !pickerSel.size && !keepSelection);
   $('picker-all').hidden = isOwners;
   $('picker-none').hidden = isOwners;
+  $('picker-back').hidden = !(mode === 'repos' && pickerOwner);
   $('picker-sso').hidden = provider !== 'github';
   $('picker-search').value = '';
-  pickerSel = new Set(); pickerOpen = new Set();
+  if(!keepSelection) pickerSel = new Set();      // moving between workspaces keeps what is ticked
+  pickerOpen = new Set();
   pickerItems = []; pickerPage = 0; pickerMore = true; pickerLoading = false;
   pickerNotes = new Set(); pickerError = '';
   pickerGen += 1;
@@ -909,6 +930,38 @@ function renderPickerRows(){
     !q || (i.label || i.name || '').toLowerCase().includes(q));
   if(!shown.length){
     $('picker-list').innerHTML = '<div class="note">nothing matches that filter</div>';
+    updateCount();
+    return;
+  }
+  if(pickerMode === 'workspaces'){
+    $('picker-list').innerHTML = shown.map(i => `<div class="item nav-row" role="button" tabindex="0">
+      <span class="name">${esc(i.label || i.name)}${i.label && i.label !== i.name ? ` <span class="meta">${esc(i.name)}</span>` : ''}</span>
+      <span class="pill">${esc(WS_KIND[i.kind] || i.kind || '')}</span><span class="go">›</span></div>`).join('');
+    $('picker-list').querySelectorAll('.nav-row').forEach((el, n) => {
+      const go = () => { pickerNav = [shown[n]]; openPicker('repos', shown[n], true); };
+      el.onclick = go;
+      el.onkeydown = e => { if(e.key === 'Enter') go(); };
+    });
+    updateCount();
+    return;
+  }
+  if(pickerMode === 'repos' && pickerOwner){
+    $('picker-list').innerHTML = shown.map(i => i.kind === 'group'
+      ? `<div class="item nav-row" role="button" tabindex="0" data-sub="${esc(i.name)}"><span class="name">${esc(i.name)}</span>
+          <span class="pill">subgroup</span><span class="go">›</span></div>`
+      : `<label class="item"><input type="checkbox" class="repo-cb" value="${esc(i.target)}"${pickerSel.has(i.target) ? ' checked' : ''}>
+          <span class="name">${esc(i.target)}</span>${i.private ? ' <span class="pill">private</span>' : ''}${i.archived ? ' <span class="pill warn">archived</span>' : ''}
+          <span class="meta">${esc(i.updated || '')}</span></label>`).join('');
+    $('picker-list').querySelectorAll('.nav-row').forEach(el => {
+      const sub = shown.find(i => i.kind === 'group' && i.name === el.dataset.sub);
+      const go = () => { pickerNav.push(sub); openPicker('repos', sub, true); };
+      el.onclick = go;
+      el.onkeydown = e => { if(e.key === 'Enter') go(); };
+    });
+    $('picker-list').querySelectorAll('.repo-cb').forEach(b => b.onchange = () => {
+      b.checked ? pickerSel.add(b.value) : pickerSel.delete(b.value);
+      updateCount();
+    });
     updateCount();
     return;
   }
@@ -1000,6 +1053,12 @@ $('picker-add').onclick = () => {
   closePicker();
 };
 $('pick-repos').onclick = () => openPicker('repos');
+$('pick-ws').onclick = () => { pickerNav = []; openPicker('workspaces'); };
+$('picker-back').onclick = () => {
+  pickerNav.pop();
+  const up = pickerNav[pickerNav.length - 1];
+  up ? openPicker('repos', up, true) : openPicker('workspaces', null, true);
+};
 $('pick-group').onclick = () => openPicker('owners');
 $('clear-targets').onclick = () => { $('targets').value = ''; };
 

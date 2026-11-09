@@ -275,9 +275,58 @@ def bb_forks(ctx):
 BROWSE_PAGE = 100
 
 
-def cloud_repos_page(token: str, page: int = 1, api_base: str = BITBUCKET_CLOUD_BASE) -> dict:
-    """One page of the repos the token's user is a member of, across every workspace."""
-    url = (f"{api_base.rstrip('/')}/repositories?role=member&sort=-updated_on"
+def _cloud_all(url: str, headers: dict, max_pages: int = 50) -> list:
+    """Every value of a Bitbucket Cloud listing, following its `next` links on the same origin only."""
+    values: list = []
+    nxt = url
+    for _ in range(max_pages):
+        data, _link, _hdrs = supplementary._json_page(nxt, headers=headers)
+        values += data.get("values", []) if isinstance(data, dict) else []
+        follow = data.get("next") if isinstance(data, dict) else None
+        if not follow:
+            break
+        nxt = require_same_origin(url, follow)
+    return values
+
+
+def cloud_workspaces_page(token: str, page: int = 1, api_base: str = BITBUCKET_CLOUD_BASE) -> dict:
+    """The workspaces the token's user belongs to, by name, the user's own (personal) workspace last.
+
+    Bitbucket Cloud retired its cross-workspace endpoints (CHANGE-2770); /2.0/user/workspaces is the one it keeps. The older
+    /2.0/user/permissions/workspaces is tried when the new one is missing (an older or self-proxied API)."""
+    base, headers = api_base.rstrip("/"), cloud_headers(token)
+    try:
+        values = _cloud_all(f"{base}/user/workspaces?pagelen={BROWSE_PAGE}", headers)
+    except MigrationError as exc:
+        if not any(code in str(exc) for code in ("HTTP 404", "HTTP 410")):
+            raise
+        values = _cloud_all(f"{base}/user/permissions/workspaces?pagelen={BROWSE_PAGE}", headers)
+    me = ""
+    try:
+        data, _link, _hdrs = supplementary._json_page(f"{base}/user", headers=headers)
+        me = (data or {}).get("username", "") if isinstance(data, dict) else ""
+    except MigrationError:
+        pass
+    items, seen = [], set()
+    for v in values:
+        ws = v.get("workspace") if isinstance(v.get("workspace"), dict) else v
+        slug = ws.get("slug") or ""
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        items.append({"name": slug, "label": ws.get("name") or slug, "kind": "personal" if me and slug == me else "workspace",
+                      "description": ""})
+    items.sort(key=lambda i: (i["kind"] == "personal", i["label"].lower()))
+    return {"items": items, "has_more": False, "notes": []}
+
+
+def cloud_repos_page(token: str, page: int = 1, api_base: str = BITBUCKET_CLOUD_BASE, workspace: str = "") -> dict:
+    """One page of the repos inside one workspace (Browse workspaces, then click one). Bitbucket no longer lists repos across
+    workspaces (GET /2.0/repositories?role=member answers 404 since CHANGE-2770), so a workspace is required."""
+    if not workspace.strip("/"):
+        raise MigrationError("choose a workspace first: Bitbucket Cloud no longer lists repositories across workspaces "
+                             "(use Browse workspaces)")
+    url = (f"{api_base.rstrip('/')}/repositories/{urllib.parse.quote(workspace.strip('/'), safe='')}?sort=-updated_on"
            f"&pagelen={BROWSE_PAGE}&page={page}")
     data, _link, _hdrs = supplementary._json_page(url, headers=cloud_headers(token))
     values = data.get("values", []) if isinstance(data, dict) else []
