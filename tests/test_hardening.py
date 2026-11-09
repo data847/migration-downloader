@@ -510,7 +510,7 @@ class TestSafety:
     def test_a_run_refuses_to_start_on_a_full_disk(self, tmp_path, monkeypatch):
         monkeypatch.setattr(runner, "run_dir", lambda spec: tmp_path)
         monkeypatch.setattr(runner, "check_disk", lambda *a, **k: (_ for _ in ()).throw(MigrationError("only 1 MB free")))
-        spec = runner.JobSpec(provider="bitbucket", token="t", targets=["ws/r"], extras=["refs"])
+        spec = runner.JobSpec(provider="bitbucket", token="t", targets=["ws/r"], mirror=False, extras=["refs"])
         with pytest.raises(MigrationError, match="MB free"):
             runner.run_job(spec, log=lambda _m: None)
 
@@ -723,7 +723,7 @@ class TestIssues:
         monkeypatch.setattr(runner, "run_dir", lambda spec: tmp_path)
         monkeypatch.setattr(supplementary, "_json_page", lambda u, *, headers, timeout=60: (_ for _ in ()).throw(
             MigrationError("HTTP 403 GET https://api.bitbucket.org/2.0/x — nope")))
-        spec = runner.JobSpec(provider="bitbucket", token="t", targets=["ws/r"], extras=["refs"])
+        spec = runner.JobSpec(provider="bitbucket", token="t", targets=["ws/r"], mirror=False, extras=["refs"])
         manifest = runner.run_job(spec, log=lambda _m: None)
         assert manifest["failed"] == 1 and manifest["issues"][0]["step"] == "refs"
         assert json.loads((tmp_path / "manifest.json").read_text())["issues"] == manifest["issues"]
@@ -732,7 +732,7 @@ class TestIssues:
         monkeypatch.setattr(runner, "run_dir", lambda spec: tmp_path)
         monkeypatch.setattr(supplementary, "_json_page", lambda u, *, headers, timeout=60: (
             {"values": [{}, {}, {}], "next": "https://api.bitbucket.org/2.0/more"}, None, {}))
-        spec = runner.JobSpec(provider="bitbucket", token="t", targets=["ws/r"], extras=["refs"], max_items=2)
+        spec = runner.JobSpec(provider="bitbucket", token="t", targets=["ws/r"], mirror=False, extras=["refs"], max_items=2)
         manifest = runner.run_job(spec, log=lambda _m: None)
         assert manifest["extras"][0]["truncated"] and manifest["failed"] == 0
         assert [i["kind"] for i in manifest["issues"]] == ["limit"]

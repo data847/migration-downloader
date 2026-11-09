@@ -15,6 +15,8 @@ not collected.
 
 from __future__ import annotations
 
+import shutil
+import tarfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -34,6 +36,69 @@ import supplementary
 BITBUCKET_CLOUD_BASE = "https://api.bitbucket.org/2.0"
 PR_STATES = ("OPEN", "MERGED", "DECLINED", "SUPERSEDED")
 PR_PAGELEN = 50  # the pull request listings answer 400 "Invalid pagelen" above 50
+
+
+# ── full history: git clone --mirror, with the same token ───────────────────
+#
+# Bitbucket Cloud has no export archive, so the repository itself comes from git. The token the
+# REST calls use works for git over HTTPS too (scope read:repository):
+#   an API token, pasted as email:token -> user x-bitbucket-api-token-auth, password the token
+#   an access token (workspace, project or repo), pasted bare -> user x-token-auth
+# The credentials go through git's environment (supplementary.git_env), never the URL or argv.
+# The mirror (every branch, tag and note; refs/pull-requests are not in a Cloud mirror) is packed
+# as <workspace>-<repo>.tar.gz holding <repo>.git/, recorded as the target's archive, so the
+# download bundle puts it in one zip with that repo's extras/<workspace>-<repo>/ metadata.
+
+def git_credentials(token: str) -> tuple:
+    """(username, password) git uses for a Bitbucket Cloud token."""
+    token = token.strip()
+    if ":" in token:                                   # email:api-token
+        return "x-bitbucket-api-token-auth", token.split(":", 1)[1]
+    return "x-token-auth", token
+
+
+def clone_url(api_base: str, target: str) -> str:
+    """https://bitbucket.org/<workspace>/<repo>.git for a target, from the API base's host."""
+    ws, repo = (target.strip("/").split("/", 1) + [""])[:2]
+    if not ws or not repo:
+        raise MigrationError(f"'{target}' is not workspace/repo")
+    parsed = urllib.parse.urlparse(api_base or BITBUCKET_CLOUD_BASE)
+    host = parsed.netloc or "api.bitbucket.org"
+    if host.startswith("api."):
+        host = host[len("api."):]
+    return f"{parsed.scheme or 'https'}://{host}/{urllib.parse.quote(ws)}/{urllib.parse.quote(repo)}.git"
+
+
+def mirror_archive(target: str, token: str, api_base: str, dest_dir: Path, log: Callable[[str], None]) -> Path:
+    """Clone target with --mirror and pack it as dest_dir/<safe target>.tar.gz (written as .part, then renamed)."""
+    url = supplementary.http_url(clone_url(api_base, target))
+    repo = target.strip("/").split("/", 1)[1]
+    work = dest_dir / ".mirror-work" / safe_name(target)
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    bare = work / f"{safe_name(repo)}.git"
+    user, password = git_credentials(token)
+    try:
+        log(f"  git clone --mirror {url}")
+        proc = supplementary.run_git(["clone", "--mirror", "--", url, str(bare)], env=supplementary.git_env(user, password))
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip().splitlines()
+            raise MigrationError(f"git clone --mirror failed: {err[-1] if err else proc.returncode}"
+                                 + (" (check the token has read:repository and can see this repo)"
+                                    if any(w in " ".join(err).lower() for w in ("403", "401", "authentication", "not found")) else ""))
+        dest = dest_dir / f"{safe_name(target)}.tar.gz"
+        part = dest.with_name(dest.name + ".part")
+        with tarfile.open(part, "w:gz") as tar:
+            tar.add(bare, arcname=bare.name)
+        part.replace(dest)
+        return dest
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            (dest_dir / ".mirror-work").rmdir()
+        except OSError:
+            pass
 
 
 def _q(job_id: str) -> str:

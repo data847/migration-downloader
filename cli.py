@@ -45,6 +45,9 @@ def main(argv=None) -> int:
     p.add_argument("--no-checksum", action="store_true")
     p.add_argument("--no-for-check", action="store_true",
                    help="do not write <archive>.for-check.csv (source-side counts/refs/file list for Garmr)")
+    p.add_argument("--no-mirror", action="store_true",
+                   help="Bitbucket Cloud: skip the git clone --mirror of each repo (its full history, packed as "
+                        "<workspace>-<repo>.tar.gz); on by default")
     p.add_argument("--per-repo-bundles", action="store_true",
                    help="after the run, also write each target's standalone <target>.zip (archive + "
                         "for-check + extras) and run-files.zip into the run folder; originals untouched")
@@ -107,6 +110,7 @@ def main(argv=None) -> int:
         description=args.description,
         dc_action=args.dc_action,
         dc_job_id=args.dc_job_id,
+        mirror=not args.no_mirror,
     )
     try:
         manifest = run_job(spec, log=print)
