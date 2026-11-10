@@ -246,6 +246,32 @@ def test_item_errors_make_the_run_partial_with_an_issue(outputs, fake_bb):
     assert any(i["kind"] == "incomplete" and "1 item(s)" in i["message"] for i in m["issues"])
 
 
+def test_a_404_for_something_the_repo_lacks_is_unavailable_not_an_error(outputs, fake_bb):
+    """An item 404 (one commit's statuses) and a whole collector 404 (no branching model) in a repo that answers are things
+    the repo does not have: said so in the log, never counted as failures."""
+    gone = MigrationError('HTTP 404 GET x\n{"error":{"message":"Not found"}}')
+    fake_bb({"/commit/old/statuses": gone, "/statuses": {"values": []}, "/commits": {"values": [{"hash": "ok"}, {"hash": "old"}]},
+             "/refs": {"values": []}, "/branching-model": gone})
+    lines = []
+    m = runner.run_job(bb_spec(targets=["ws/a"], extras=["refs", "commit-statuses", "branching-model"]), log=lines.append)
+    rec = {e["extra"]: e for e in m["extras"]}
+    assert rec["commit-statuses"]["error"] == "" and "item_errors" not in rec["commit-statuses"]
+    assert rec["commit-statuses"]["unavailable_items"] == 1
+    assert rec["branching-model"]["error"] == "" and rec["branching-model"]["unavailable"] is True
+    assert m["failed"] == 0 and m["extras_incomplete"] == 0
+    assert sum("unavailable for this repo, not an error" in l for l in lines) == 2
+    assert not any("HTTP 404" in l for l in lines)
+
+
+def test_when_every_call_404s_the_repo_itself_is_missing_and_that_is_an_error(outputs, fake_bb):
+    gone = MigrationError('HTTP 404 GET x\n{"error":{"message":"Repository not found"}}')
+    fake_bb({"/refs": gone, "/branching-model": gone})
+    lines = []
+    m = runner.run_job(bb_spec(targets=["ws/typo"], extras=["refs", "branching-model"]), log=lines.append)
+    assert all(e["error"] for e in m["extras"]) and m["extras_failed"] == 2
+    assert not any("unavailable" in l for l in lines)
+
+
 def test_a_run_killed_mid_way_keeps_a_manifest_of_what_it_finished(outputs, fake_bb, monkeypatch):
     fake_bb({"/refs": {"values": [{"name": "main"}]}, "/commits": {"values": []}})
     real = supplementary.REGISTRY["bitbucket"]["refs"]

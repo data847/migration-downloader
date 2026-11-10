@@ -48,6 +48,7 @@ import ratelimit  # noqa: E402
 from safety import MIN_FREE_MB, check_disk, http_url, require_valid_target, trusted_api_base, valid_target  # noqa: E402
 from bitbucket import BITBUCKET_CLOUD_BASE, BitbucketDCExport, cloud_headers  # noqa: E402
 from supplementary import REGISTRY, Ctx, resolve_names  # noqa: E402
+import supplementary  # noqa: E402
 
 COMPONENT = "migration-downloader"
 PROVIDERS = {"github", "gitlab", "bitbucket", "bitbucket-dc"}
@@ -945,6 +946,8 @@ def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous
                   headers=headers, out=out, log=log,
                   org=_extras_org(spec, target, login),
                   scope=spec.scope, max_items=spec.max_items, shared=shared, cancelled=cancelled)
+        reached = False        # some call for this repo answered: a 404 then means "not there", not "no such repo"
+        pending404: List[dict] = []
         for name in names:
             earlier = _already_collected(done_before, target, name, out.resolve())
             if earlier:
@@ -954,6 +957,7 @@ def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous
             record = {"target": target, "extra": name, "files": [], "error": ""}
             ctx.truncated.clear()
             ctx.item_errors.clear()
+            ctx.unavailable.clear()
             log(f"  {name} …")
             try:
                 if cancelled and cancelled():
@@ -961,10 +965,17 @@ def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous
                 record["files"] = REGISTRY[spec.provider][name](ctx)
             except MigrationError as exc:
                 record["error"] = brief_error(exc)
-                log(f"    ERROR {record['error']}")
+                if supplementary.not_found(record["error"]) and name != "repo-metadata":
+                    pending404.append(record)    # decided below: unavailable if the repo itself answered
+                else:
+                    log(f"    ERROR {record['error']}")
             except Exception as exc:  # one collector's surprise must not stop the other collectors and targets
                 record["error"] = redact.scrub(f"{type(exc).__name__}: {exc}")[:600]
                 log(f"    ERROR {record['error']}")
+            if not record["error"]:
+                reached = True
+            if ctx.unavailable:
+                record["unavailable_items"] = len(ctx.unavailable)
             if ctx.truncated:
                 record["truncated"] = list(ctx.truncated)
             if ctx.item_errors:
@@ -972,6 +983,12 @@ def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous
                 record["item_error_examples"] = [dict(e) for e in ctx.item_errors[:5]]
                 log(f"    {len(ctx.item_errors)} item(s) could not be fetched")
             records.append(record)
+        for record in pending404:
+            if reached:      # the repo is there; it just has none of this (no wiki, no Pipelines, no branching model)
+                record["unavailable"], record["error"] = True, ""
+                log(f"  {record['extra']}: unavailable for this repo, not an error")
+            else:            # every call 404'd: the repo is missing or this token cannot see it
+                log(f"  {record['extra']}: ERROR {record['error']}")
         if checkpoint:
             checkpoint(records)
     return records

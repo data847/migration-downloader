@@ -401,6 +401,7 @@ def _pipelines_part(ctx: Ctx, url: str, what: str, fetch):
         if "cancelled" in str(exc):
             raise
         if "http 404" in brief_error(exc).lower():
+            ctx.log(f"    {what}: unavailable for this repo, not an error")
             return dict(NOT_SET_UP)
         return ctx.item_error(what, exc)
 

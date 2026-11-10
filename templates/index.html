@@ -545,7 +545,12 @@ function stateFor(job){
   if(job.state !== 'running' && issues && (job.state === 'partial' || job.state === 'done'))
     setState(plural(issues, 'issue'), 'warn', () => openIssues(job.id));
   else if(job.state === 'partial') setState('issues', 'warn', () => openIssues(job.id));
-  else setState(job.state, STATE_CLS[job.state] || '');
+  else if(job.state === 'running' && job.paused_until && job.paused_until * 1000 > Date.now()){
+    const at = new Date(job.paused_until * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    setState(`paused · resumes ${at}`, 'warn');
+    $('state').title = 'Paused for the rate limit. Leave this running in the background: it resumes on its own and carries on where it stopped.';
+  }
+  else { setState(job.state, STATE_CLS[job.state] || ''); $('state').title = ''; }
 }
 const STATE_CLS = {running:'run', done:'ok', partial:'warn', error:'bad', cancelled:'warn', interrupted:'warn'};
 
