@@ -95,11 +95,17 @@ class Ctx:
     cancelled: Optional[Callable[[], bool]] = None
     truncated: list = field(default_factory=list)   # listings cut short by max_items
     item_errors: list = field(default_factory=list)  # per-item failures inside a collector that otherwise ran
+    unavailable: list = field(default_factory=list)  # per-item 404s: things this repo does not have
 
     def item_error(self, what: str, exc) -> dict:
         """Record one item that could not be fetched (one commit's statuses, one PR diff...). The collector carries on,
-        but the run reports it as incomplete instead of silently succeeding."""
+        but the run reports it as incomplete instead of silently succeeding. A 404 inside a collector that otherwise
+        ran is a thing this repo does not have (no Pipelines, a deleted branch): said as such, not counted."""
         message = brief_error(exc) if isinstance(exc, Exception) else str(exc)
+        if not_found(message):
+            self.unavailable.append(what)
+            self.log(f"    {what}: unavailable for this repo, not an error")
+            return {"unavailable": True}
         self.item_errors.append({"what": what, "error": message})
         self.log(f"    {what}: {message}")
         return {"error": message}
@@ -192,6 +198,12 @@ def feature_off(exc: MigrationError) -> bool:
     return (("http 403" in text or "http 404" in text)
             and any(w in text for w in ("disabled", "must be enabled", "not enabled",
                                         "advanced security", "no analysis found")))
+
+
+def not_found(message: str) -> bool:
+    """An HTTP 404 that means "nothing there" (not Bitbucket's "temporarily unavailable" outage, which is retried)."""
+    text = (message or "").lower()
+    return "http 404" in text and "temporarily unavailable" not in text
 
 
 def skip_when_off(fn: Collector) -> Collector:

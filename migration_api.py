@@ -138,14 +138,27 @@ def _request(
     host = urllib.parse.urlparse(url).netloc
     safe_to_repeat = method in {"GET", "HEAD", "DELETE"}
     attempt = 0
+    rate_pauses = 0
     while True:
-        ratelimit.before(host)
+        try:
+            ratelimit.before(host)
+        except ratelimit.Cancelled:
+            raise MigrationError("cancelled while paused for a rate limit") from None
         req = urllib.request.Request(url, data=body, method=method)
         for key, value in headers.items():
             req.add_header(key, value)
         try:
             resp = _opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
+            if exc.code == 429 and not (exc.headers or {}).get("Retry-After"):
+                # Bitbucket's rolling hour: pause the host (no probing) and try again once the window has freed up; a
+                # pause is not a failed attempt
+                rate_pauses += 1
+                if rate_pauses > ratelimit.MAX_RATE_PAUSES:
+                    raise MigrationError(f"HTTP 429 from {host}: still rate limited after {ratelimit.MAX_RATE_PAUSES} "
+                                         "pauses; another client may be using up this account's limit") from None
+                ratelimit.on_429(host)
+                continue
             raw = b""
             if exc.code in (403, 404):      # the body says whether it was a limit or a passing outage
                 raw = _error_body(exc)

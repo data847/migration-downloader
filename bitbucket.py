@@ -389,17 +389,35 @@ def _pipeline_steps(ctx: Ctx, pipelines: list) -> dict:
     return steps
 
 
+NOT_SET_UP = {"enabled": False, "note": "Bitbucket Pipelines was never set up for this repository (HTTP 404)"}
+
+
+def _pipelines_part(ctx: Ctx, url: str, what: str, fetch):
+    """A Pipelines settings call. Bitbucket answers 404 when Pipelines was never set up for the repo: that is a fact about
+    the repo, recorded as such, not a missing item. Any other failure is counted as before."""
+    try:
+        return fetch(url)
+    except MigrationError as exc:
+        if "cancelled" in str(exc):
+            raise
+        if "http 404" in brief_error(exc).lower():
+            ctx.log(f"    {what}: unavailable for this repo, not an error")
+            return dict(NOT_SET_UP)
+        return ctx.item_error(what, exc)
+
+
 @collector("bitbucket", "pipelines")
 def bb_pipelines(ctx):
     pipelines = cloud_paged(ctx, bb_url(ctx, "/pipelines?sort=-created_on"))
     steps = _pipeline_steps(ctx, pipelines)
+    config = _pipelines_part(ctx, bb_url(ctx, "/pipelines_config"), "pipelines config", lambda u: get_json(u, ctx.headers))
     return [
-        ctx.save_json("pipelines-config", try_json(ctx, bb_url(ctx, "/pipelines_config"), "pipelines config")),
+        ctx.save_json("pipelines-config", config),
         ctx.save_json("pipelines", pipelines),
         ctx.save_json("pipeline-steps", steps),
         # variable names only: secured values are never returned
-        ctx.save_json("pipeline-variables", _all_or_error(ctx, bb_url(ctx, "/pipelines_config/variables"),
-                                                          "pipeline variables")),
+        ctx.save_json("pipeline-variables", _pipelines_part(ctx, bb_url(ctx, "/pipelines_config/variables"), "pipeline variables",
+                                                            lambda u: {"values": cloud_paged(ctx, u, pagelen=100)})),
     ]
 
 

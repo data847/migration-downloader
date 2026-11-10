@@ -504,6 +504,22 @@ roll over. When Bitbucket answers `X-RateLimit-NearLimit: true`, calls to it are
 spaced 4 seconds apart until it stops saying so. A Bitbucket `404` whose body
 says "Site temporarily unavailable" is treated as an outage and retried.
 
+**Pause instead of retrying.** Bitbucket's limit is a rolling hour (a call frees up exactly one hour after it was made) and
+its 429 names no wait (https://support.atlassian.com/bitbucket-cloud/docs/api-request-limits/), so the tool counts its own
+calls to `api.bitbucket.org` (budget 1,000 an hour, or `X-RateLimit-Limit` when Bitbucket sends it) and pauses before the
+budget runs out, until a quarter of it is free again. If Bitbucket still answers 429 (the same account used elsewhere), the
+whole host is paused: the log says `⏸ PAUSED: ... it resumes on its own at HH:MM ... Nothing is sent ... until then`, the
+page's status shows `paused · resumes HH:MM`, every repo and thread waits on that one pause, and no call goes out until it
+ends, so waiting never pushes the limit further. When the run's own calls explain the limit, the resume time is exact (and
+the budget learnt is kept); when they do not (a fresh run on an hour already used up), it waits 15 minutes and tries one
+call. A pause is never a failed attempt; a call fails only after 6 pauses in a row. Leave the run going: it resumes and
+completes on its own.
+
+**404 means "not there".** A 404 for something a repository simply does not have (no Pipelines, no branching model, one
+commit's statuses, a deleted branch) is logged as `unavailable for this repo, not an error` and is not counted as a failure.
+When every call for a repository answers 404, the repository itself is missing or the token cannot see it, and that stays an
+error.
+
 The per-commit collectors (`commit-statuses`, `commit-diffstat`,
 `commit-patches`) make one call per commit each, so on a long history they take
 hours under that budget. They are heavy (left out of `all`), and the run log says

@@ -110,18 +110,19 @@ class TestRateLimit:
             mig._json_request("https://api.bitbucket.org/2.0/x", headers={})
         assert len(calls) == 1
 
-    def test_a_429_without_retry_after_waits_out_a_rolling_hour(self, opener):
-        """Bitbucket's 429 names no wait; giving up after ~7 minutes lost every remaining item."""
+    def test_a_429_without_retry_after_pauses_for_hours_before_giving_up(self, opener):
+        """Bitbucket's 429 names no wait: the host is paused (15 min at a time while the cause is unknown), one call after
+        each pause, and only after MAX_RATE_PAUSES pauses (hours) does the call fail."""
         calls = opener(http_error(429))
-        with pytest.raises(MigrationError):
+        with pytest.raises(MigrationError, match="still rate limited"):
             mig._json_request("https://api.bitbucket.org/2.0/x", headers={})
-        assert len(calls) == ratelimit.BLIND_429_ATTEMPTS
-        assert sum(opener.waits) > 3600
+        assert len(calls) == ratelimit.MAX_RATE_PAUSES + 1
+        assert sum(opener.waits) >= ratelimit.MAX_RATE_PAUSES * ratelimit.UNKNOWN_PAUSE - 60
 
     def test_a_429_without_retry_after_then_success(self, opener):
         calls = opener(http_error(429), http_error(429), FakeResp(b'{"ok": 3}'))
         assert mig._json_request("https://api.bitbucket.org/2.0/x", headers={})[1] == {"ok": 3}
-        assert opener.waits == [60, 120]
+        assert [round(w) for w in opener.waits] == [900, 900]
 
     def test_bitbucket_temporarily_unavailable_404_is_retried(self, opener):
         body = '{"errorMessage": "Site temporarily unavailable", "errorCode": "OTHER"}'

@@ -34,6 +34,7 @@ from supplementary import HEAVY, REGISTRY  # noqa: E402
 import bitbucket  # noqa: E402
 import bundle  # noqa: E402
 import jobstore  # noqa: E402
+import ratelimit  # noqa: E402
 import redact  # noqa: E402
 from safety import request_host_allowed, trusted_api_base  # noqa: E402
 
@@ -197,6 +198,8 @@ def job_status(job_id: str):
         lines=redact.scrub_lines(job["log"][since:]),
         total_lines=len(job["log"]),
         resumable=bool(jobstore.resume_plan(job)),
+        # a rate-limit pause in progress (epoch seconds it ends, 0 when none): the page says when it resumes
+        paused_until=ratelimit.paused_until() if job["state"] == "running" else 0,
     )
 
 
