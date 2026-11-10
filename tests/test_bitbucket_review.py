@@ -283,3 +283,23 @@ def test_log_header_says_unknown_without_a_manifest():
     lines = app._header_counts({"ok": 0, "archives_failed": 0, "extras_failed": 1, "extras_incomplete": 2,
                                 "complete": False})
     assert "2 incomplete" in lines[1] and "did not finish" in lines[1]
+
+
+# Pipelines never set up: Bitbucket answers 404 on its settings. That is recorded as "not set up", not as a missing item, so the
+# run is not marked incomplete; any other failure still counts.
+def test_pipelines_never_set_up_is_not_an_item_error(tmp_path, fake_bb):
+    gone = MigrationError('HTTP 404 GET x\n{"error":{"message":"Not found"}}')
+    fake_bb({"/pipelines?": {"values": []}, "/pipelines_config/variables": gone, "/pipelines_config": gone})
+    ctx = ctx_for(tmp_path)
+    run("pipelines", ctx)
+    assert not ctx.item_errors
+    assert saved(ctx, "pipelines-config")["enabled"] is False
+    assert saved(ctx, "pipeline-variables")["enabled"] is False
+
+
+def test_pipelines_config_forbidden_still_counts(tmp_path, fake_bb):
+    fake_bb({"/pipelines?": {"values": []}, "/pipelines_config/variables": {"values": []},
+             "/pipelines_config": MigrationError("HTTP 403 GET x\nforbidden")})
+    ctx = ctx_for(tmp_path)
+    run("pipelines", ctx)
+    assert len(ctx.item_errors) == 1
