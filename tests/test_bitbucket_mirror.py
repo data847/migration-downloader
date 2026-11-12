@@ -34,6 +34,16 @@ def git(*args, cwd=None):
                         "GIT_COMMITTER_EMAIL": "a@x", "HOME": str(cwd or "/tmp"), "PATH": "/usr/bin:/bin"})
 
 
+@pytest.fixture(autouse=True)
+def empty_api(monkeypatch):
+    """The archive's metadata calls (see test_bitbucket_archive.py) answer with empty listings here."""
+    def page(url, *, headers, timeout=60):
+        return {"values": []}, None, {}
+
+    monkeypatch.setattr(supplementary, "_json_page", page)
+    monkeypatch.setattr(supplementary, "_json_request", lambda url, **kw: (200, {"values": []}))
+
+
 @pytest.fixture
 def remote(tmp_path):
     """A small repository with two branches and a tag, as a bare repo standing in for bitbucket.org."""

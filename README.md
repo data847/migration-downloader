@@ -107,6 +107,12 @@ is taken from Bitbucket's own API specification (`swagger.v3.json`, the
 | `hooks` (repo) | `GET …/hooks` | `read:webhook:bitbucket` | **admin** on the repo |
 | `hooks` (workspace) | `GET /2.0/workspaces/<ws>/hooks` | `read:webhook:bitbucket` | **workspace admin** |
 | `snippets` | `GET /2.0/snippets/<ws>`, `…/<id>/files/<path>`, `…/<id>/commits` | `read:snippet:bitbucket` | workspace member |
+| Archive metadata (always, inside `<ws>-<repo>.tar.gz`) | the repo, `GET /2.0/workspaces/<ws>` and `…/projects/<key>`, the PR listing (`fields=+values.reviewers,+values.participants`), `…/pullrequests/activity`, `…/branch-restrictions`, `…/branching-model`, `…/downloads`, `…/hooks`, `…/pipelines`, `…/pipelines_config/schedules` | as the rows above, plus `read:workspace:bitbucket` and `read:project:bitbucket` for the workspace and project (a repository access token cannot read those: the copies inside the repo object are used and `schema.json` says so) | read access; **admin** for restrictions and hooks |
+| Archive LFS objects (only when the history uses LFS) | `git lfs fetch --all`, same credentials as the mirror | `read:repository:bitbucket` | read access |
+| `pr-tasks` | `GET …/pullrequests/<id>/tasks`, only for PRs whose listing shows tasks | `read:pullrequest:bitbucket` | read access |
+| `deployments` | `GET …/environments/`, `…/deployments/` | `read:pipeline:bitbucket` (not yet checked against the spec) | read access |
+| `commit-comments` | `GET …/commit/<sha>/comments`, one per commit | `read:repository:bitbucket` (not yet checked against the spec) | read access |
+| `test-reports` | `GET …/pipelines/<id>/steps/<id>/test_reports`, `…/test_cases` | `read:pipeline:bitbucket` (not yet checked against the spec) | read access |
 
 A 403 that says "Your credentials lack one or more required privilege scopes"
 means the scope in this table is missing from the token. Scopes cannot be added
@@ -379,7 +385,10 @@ an export runs; a checker should only fail when the archive holds fewer than the
 
 `--extras` runs read-only collectors after the export flow and writes them
 under `<run>/extras/<target>/`. **The web UI runs every collector by default**
-(`everything`) when you press Start; the CLI runs only what you ask for.
+(`everything`) when you press Start. The CLI runs only what you ask for, except
+for Bitbucket Cloud, which runs `everything` unless `--extras` names a set
+(`--extras none` for the archive alone). Extras are opt out: `--skip-extras a,b`
+leaves those out of whatever `--extras` selects, for any provider.
 Names go in a comma list;
 `all` runs every light collector, `everything` adds the heavy ones (wikis,
 CI logs). `--list-extras` prints the names per provider. A
@@ -396,11 +405,19 @@ remembered in the browser). Leaving everything ticked is the default.
 |---|---|---|
 | `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `branch-protection` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `wiki` `actions-logs` |
 | `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `hooks` | `wiki` `job-traces` `job-artifacts` `relations-export` |
-| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `pullrequests` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `forks` | `commit-statuses` `commit-diffstat` `commit-patches` `pr-diffs` `pipeline-logs` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `pullrequests` `pr-tasks` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `deployments` `forks` | `commit-statuses` `commit-comments` `commit-diffstat` `commit-patches` `pr-diffs` `pipeline-logs` `test-reports` |
 | `bitbucket-dc` | | `archive` |
 
-Not collected on purpose: issue/PR/commit comments, discussions, activity and
-tasks.
+Not collected on purpose (GitHub, GitLab): issue/PR/commit comments,
+discussions, activity and tasks. For Bitbucket Cloud, PR comments, reviews and
+activity are in the archive itself (below), and `pr-tasks` / `commit-comments`
+are extras.
+
+For Bitbucket Cloud, `commits`, `commit-diffstat` and `commit-patches` are
+computed from the repo's git mirror when the run has one: no API calls instead
+of one per commit each. `commit-statuses`, `commit-comments` and `test-reports`
+have no bulk form on Bitbucket and still cost one call per commit or step;
+untick them for a fast run.
 
 The permission each collector needs is listed per step in
 [Step 1: the token](#step-1-the-token) (put a Bitbucket token in `BITBUCKET_TOKEN`).
@@ -408,22 +425,39 @@ The permission each collector needs is listed per step in
 `wiki` shells out to `git` (the image installs it). Credentials are passed
 through git's environment config, never the URL or argv.
 
-Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo --extras all`
-clones each repo with `git clone --mirror` (same token) and packs it as
-`<workspace>-<repo>.tar.gz` holding `<repo>.git/`, recorded as that repo's
-archive: the download bundle then puts it in one `<workspace>-<repo>.zip` with
-its `extras/<workspace>-<repo>/` metadata (pull requests, refs, commits …), and
-Squirrel pairs the two by that name. A repo git cannot read fails on its own
+Bitbucket Cloud has no export archive, so `cli.py bitbucket ws/repo` assembles
+one per repo, at GitHub/GitLab parity: `<workspace>-<repo>.tar.gz` holds the
+`git clone --mirror` (same token) as `<repo>.git/`, its LFS objects when the
+history uses LFS (`git lfs fetch --all`; the image installs git-lfs), a
+`refs/pull/<id>/head` for every PR whose source commit the mirror holds, and,
+at its root, GitHub-archive-named JSON: `repositories_000001.json`,
+`organizations_000001.json`, `pull_requests_000001.json` (every state, with
+reviewers and participants), `pull_request_reviews_000001.json`,
+`pull_request_review_comments_000001.json` (inline),
+`issue_comments_000001.json` (PR conversation), `issue_events_000001.json`,
+`raw/pullrequest_activity.json`, `protected_branches_000001.json`,
+`releases_000001.json` (the Downloads listing), `webhooks_000001.json`,
+`pipelines_000001.json`, `pipeline_schedules_000001.json`, `users_000001.json`
+and `schema.json` (what each file is, what Bitbucket does not have, what is
+omitted by policy, and any part that failed). The PR history comes from one
+repository-wide activity feed, so a repo with 2,000 PRs costs a few hundred
+calls, not thousands. A part that fails does not stop the archive; it is listed
+in `schema.json` and the run shows it as an issue. A `for-check.csv` is written
+beside it like GitHub/GitLab's. The download bundle then puts it in one
+`<workspace>-<repo>.zip` with its `extras/<workspace>-<repo>/` files, and
+Squirrel pairs the two by that name. The design is in
+[docs/bitbucket-cloud-archive.md](docs/bitbucket-cloud-archive.md). A repo git cannot read fails on its own
 (with a hint about `read:repository`); a resumed run (`--skip-done`) does not
-clone a repo whose archive is already there. Pull request refs
-(`refs/pull-requests/*`) are not in a Cloud mirror; the `pullrequests` extra
-keeps the PR data. `--no-mirror` makes the run extras-only, as before. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
+clone a repo whose archive is already there. Bitbucket serves no pull request
+refs to a mirror, hence the `refs/pull/<id>/head` written locally; PRs whose
+source commit is gone (deleted branch, fork) are listed in `schema.json`.
+`--no-mirror` makes the run extras-only, as before. Bitbucket Data Center (`bitbucket-dc PROJ/repo --api-base URL`,
 token `BITBUCKET_DC_TOKEN`) starts and monitors the server-side export job
 (`--dc-action export|preview|cancel|none`, `--dc-job-id` for cancel); the
 resulting `.tar` is written to the server's shared home, not downloaded here.
 
 In the web UI, one **Bitbucket** button covers both products, the way GitLab
-covers gitlab.com and self-hosted: host `bitbucket.org` is Cloud (extras only),
+covers gitlab.com and self-hosted: host `bitbucket.org` is Cloud (the assembled archive plus extras),
 and `Data Center (self-hosted)` takes a base URL plus an export-job selector
 (start, preview, cancel or none). A run's extras and export jobs show in
 their own results card.

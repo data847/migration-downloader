@@ -40,7 +40,9 @@ from migration_api import MigrationError
 COLUMNS = ["repo", "section", "key", "value"]
 FORMAT_VERSION = 1
 REF_KEEP = re.compile(r"^refs/(heads/.+|tags/.+|pull/\d+/head|merge-requests/\d+/head)$")
-OBJECTS = re.compile(r"^repositories/[^/]+/[^/]+\.git/objects/")
+# git objects (and LFS objects) are summarised, not listed: a GitHub archive nests the repo under
+# repositories/<owner>/, a Bitbucket Cloud archive has <repo>.git/ at its root
+OBJECTS = re.compile(r"^(?:repositories/[^/]+/)?[^/]+\.git/(?:lfs/)?objects/")
 ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar", ".zip")
 
 GITHUB_QUERY = """
@@ -182,6 +184,34 @@ def gitlab_counts(project: str, *, headers: dict, api_base: str) -> Dict[str, ob
     return c
 
 
+def bitbucket_counts(target: str, *, headers: dict, api_base: str) -> Dict[str, object]:
+    """Two calls: the repo object, and the PR listing's `size` over every state. Branches and tags come from the refs
+    (see snapshot); issues, labels and milestones do not exist on Bitbucket Cloud; the rest is not countable cheaply."""
+    errors: list = []
+    ws, repo = (target.split("/", 1) + [""])[:2]
+    base = (f"{api_base.rstrip('/')}/repositories/{urllib.parse.quote(ws, safe='')}/"
+            f"{urllib.parse.quote(repo, safe='')}")
+    c: Dict[str, object] = {k: "" for k in (
+        "prs", "issues", "labels", "milestones", "releases", "branches", "tags", "commits", "default_branch",
+        "size_kb", "issue_comments", "review_comments", "commit_comments", "collaborators")}
+    try:
+        info, _ = _get(base, headers)
+        c["default_branch"] = ((info or {}).get("mainbranch") or {}).get("name", "")
+        if isinstance((info or {}).get("size"), int):
+            c["size_kb"] = info["size"] // 1024
+    except Exception as exc:
+        errors.append(f"repository: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+    states = "&".join(f"state={s}" for s in ("OPEN", "MERGED", "DECLINED", "SUPERSEDED"))
+    try:
+        data, _ = _get(f"{base}/pullrequests?{states}&pagelen=1&fields=size", headers)
+        if isinstance((data or {}).get("size"), int):
+            c["prs"] = data["size"]
+    except Exception as exc:
+        errors.append(f"prs: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+    c["_errors"] = errors
+    return c
+
+
 # ---------------------------------------------------------------- refs
 
 def ls_remote_refs(url: str, user: str, token: str, run: Callable = subprocess.run) -> Dict[str, str]:
@@ -231,6 +261,8 @@ def snapshot(provider: str, label: str, *, headers: dict, api_base: str, token: 
     try:
         if provider == "github":
             counts = github_counts(owner, repo, headers=headers, api_base=api_base)
+        elif provider == "bitbucket":
+            counts = bitbucket_counts(label, headers=headers, api_base=api_base)
         else:
             counts = gitlab_counts(label, headers=headers, api_base=api_base)
         errors += counts.pop("_errors", [])
@@ -240,10 +272,17 @@ def snapshot(provider: str, label: str, *, headers: dict, api_base: str, token: 
         if provider == "github":
             url = f"{github_web_base(api_base)}/{owner}/{repo}.git"
             refs = ls_remote_refs(url, "x-access-token", token)
+        elif provider == "bitbucket":
+            import bitbucket
+            user, password = bitbucket.git_credentials(token)
+            refs = ls_remote_refs(bitbucket.clone_url(api_base, label), user, password)
         else:
             refs = ls_remote_refs(f"{api_base.rstrip('/')}/{label}.git", "oauth2", token)
     except Exception as exc:
         errors.append(f"refs: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+    if provider == "bitbucket" and refs and counts:      # no REST count for these on Bitbucket: the refs say it
+        counts["branches"] = sum(1 for r in refs if r.startswith("refs/heads/"))
+        counts["tags"] = sum(1 for r in refs if r.startswith("refs/tags/"))
     return {"counts": counts, "refs": refs, "errors": errors}
 
 
