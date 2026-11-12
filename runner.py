@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 import tarfile
 import threading
@@ -45,6 +46,7 @@ from migration_api import (  # noqa: E402
 )
 
 import bitbucket  # noqa: E402,F401  (registers the bitbucket collectors)
+import bitbucket_archive  # noqa: E402
 import redact  # noqa: E402
 import ratelimit  # noqa: E402
 from safety import MIN_FREE_MB, check_disk, http_url, require_valid_target, trusted_api_base, valid_target  # noqa: E402
@@ -119,6 +121,7 @@ class JobSpec:
     for_check: bool = True            # write <archive>.for-check.csv (source-side counts/refs/file list) for Garmr
     # supplementary collectors (see supplementary.py / bitbucket.py)
     extras: List[str] = field(default_factory=list)   # names, or all / everything
+    skip_extras: List[str] = field(default_factory=list)  # names unticked from `extras` (opt out)
     max_items: int = 0                # cap per unbounded listing (runs, commits, PRs…)
     # github migration options
     exclude: List[str] = field(default_factory=list)  # metadata, git_data, attachments, releases, owner_projects
@@ -159,6 +162,7 @@ class JobSpec:
             run_name=(data.get("run_name") or "").strip(),
             for_check=str(data.get("for_check", "1")).lower() not in {"0", "false", "off", "no"},
             extras=_split(data.get("extras", "")),
+            skip_extras=_split(data.get("skip_extras", "")),
             max_items=_max_items(data.get("max_items")),
             exclude=_split(data.get("exclude", "")),
             org_metadata_only=flag("org_metadata_only"),
@@ -218,6 +222,8 @@ class JobSpec:
                 raise MigrationError("dc_action cancel needs dc_job_id")
         if self.extras:
             resolve_names(self.provider, self.extras)   # fail fast on a typo
+        if self.skip_extras:
+            resolve_names(self.provider, self.skip_extras)
         if self.upload_url and self.provider != "gitlab":
             raise MigrationError("upload_url only applies to GitLab")
         if self.upload_url:
@@ -348,9 +354,13 @@ def run_job(
         # after every target, so a crash or kill keeps what was collected and a resume can skip it
         _write_manifest(manifest_path, assemble(extras_so_far, complete=False))
 
-    extras = (_run_extras(spec, token, dest_dir, log, cancelled, checkpoint=checkpoint,
-                          previous=(previous or {}).get("extras", []))
-              if spec.extras else [])
+    archives = {r.target: r.path for r in results if r.path and not r.error}
+    try:
+        extras = (_run_extras(spec, token, dest_dir, log, cancelled, checkpoint=checkpoint,
+                              previous=(previous or {}).get("extras", []), archives=archives)
+                  if spec.extras else [])
+    finally:
+        shutil.rmtree(dest_dir / ".mirror-work", ignore_errors=True)   # mirrors unpacked for the per-commit extras
 
     if spec.verify_checksum:
         for r in results:
@@ -416,7 +426,9 @@ def _finish_counts(m: dict) -> None:
     m["extras_failed"] = sum(1 for e in extras if e.get("error"))
     # a collector that ran but lost some of its items (one commit's statuses, one PR diff) makes the run partial too
     m["extras_incomplete"] = sum(1 for e in extras if not e.get("error") and e.get("item_errors"))
-    m["failed"] = m["archives_failed"] + m["extras_failed"] + m["extras_incomplete"] + m["jobs_failed"]
+    m["archives_incomplete"] = sum(1 for a in m.get("archives", []) if not a.get("error") and a.get("incomplete"))
+    m["failed"] = (m["archives_failed"] + m["archives_incomplete"] + m["extras_failed"] + m["extras_incomplete"]
+                   + m["jobs_failed"])
     m["issues"] = issues_from_manifest(m)
 
 
@@ -523,6 +535,8 @@ def issues_from_manifest(manifest: dict) -> List[dict]:
     for a in manifest.get("archives", []):
         if a.get("error"):
             add("archive", a.get("target", ""), "export + download", a["error"])
+        for part in a.get("incomplete") or []:
+            add("incomplete", a.get("target", ""), f"archive: {part.get('part', '')}", part.get("error", ""))
     for j in manifest.get("export_jobs", []):
         if j.get("error"):
             add("export-job", ", ".join(j.get("targets", [])), f"export job ({j.get('action', '')})", j["error"])
@@ -859,9 +873,42 @@ def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled) -> List[Archiv
                 results.append(result)
                 continue
             check_disk(dest_dir, MIN_FREE_MB, what=f"the mirror of {target}")
-            dest = bitbucket.mirror_archive(target, token, api_base, dest_dir, log)
-            result.path, result.bytes, result.state = dest, dest.stat().st_size, "mirrored"
+            headers = cloud_headers(token)
+            fc = None
+            if spec.for_check:
+                log(f"  for-check: snapshot before {target}")
+                fc = {"archive_label": target, "requested": [target], "exported": [target], "errors": [],
+                      "repos": [{"label": target}],
+                      "meta": {"provider": "bitbucket", "host": api_base, "scope": "repository", "org": "",
+                               "api_version": "2.0", "started_at": _now(), "opt_excludes": "none"}}
+                fc["repos"][0]["before"] = for_check.snapshot("bitbucket", target, headers=headers,
+                                                              api_base=api_base, token=token)
+            core: dict = {}
+
+            def add_metadata(work: Path, bare: Path) -> None:
+                user, password = bitbucket.git_credentials(token)
+                ctx = Ctx(provider="bitbucket", target=target, token=token, api_base=api_base.rstrip("/"),
+                          headers=headers, out=work, log=log, cancelled=cancelled)
+                try:
+                    core.update(bitbucket_archive.build_core(ctx, bare, user=user, password=password))
+                except MigrationError as exc:
+                    if "cancelled" in str(exc):
+                        raise
+                    core["errors"] = [{"part": "metadata", "error": brief_error(exc)}]
+                except Exception as exc:  # a surprise in the metadata must not cost the repo its git history
+                    core["errors"] = [{"part": "metadata", "error": redact.scrub(f"{type(exc).__name__}: {exc}")[:600]}]
+
+            dest = bitbucket.mirror_archive(target, token, api_base, dest_dir, log, before_pack=add_metadata)
+            result.path, result.bytes, result.state = dest, dest.stat().st_size, "archived"
+            result.meta["incomplete"] = core.get("errors", [])
+            if fc:
+                fc["repos"][0]["after"] = for_check.snapshot("bitbucket", target, headers=headers,
+                                                             api_base=api_base, token=token)
+                fc["meta"].update(state=result.state, finished_at=_now())
+                result.meta["for_check"] = fc
             log(f"  saved {dest.name} ({human(result.bytes)})")
+            for part in result.meta["incomplete"]:
+                log(f"  ! archive part {part['part']} missing: {part['error']}")
         except MigrationError as exc:
             result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
@@ -942,13 +989,16 @@ def _already_collected(previous: dict, target: str, name: str, out: Path) -> Opt
     return rec
 
 
-def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous=()) -> List[dict]:
-    names = resolve_names(spec.provider, spec.extras)
+def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous=(), archives=None) -> List[dict]:
+    skipped = set(resolve_names(spec.provider, spec.skip_extras))
+    names = [n for n in resolve_names(spec.provider, spec.extras) if n not in skipped]
+    if skipped:
+        log(f"extras unticked: {', '.join(sorted(skipped))}")
     done_before = {(e.get("target"), e.get("extra")): e for e in previous} if spec.skip_done else {}
     if spec.provider == "bitbucket":
-        _warn_per_commit_cost(names, log)
+        _warn_per_commit_cost(names, log, mirrored=bool(archives))
     headers, api_base, normalise = _extras_context(spec, token, log)
-    shared: dict = {}
+    shared: dict = {"bb_archives": dict(archives or {})}
     records: List[dict] = []
     login = ""
     if spec.provider == "github" and spec.scope == "auto":
@@ -1016,12 +1066,13 @@ def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous
 
 
 # collectors that make one call per commit, and roughly how many calls Bitbucket allows an hour
-PER_COMMIT = ("commit-statuses", "commit-diffstat", "commit-patches")
+PER_COMMIT = ("commit-statuses", "commit-comments", "commit-diffstat", "commit-patches")
+FROM_MIRROR = ("commit-diffstat", "commit-patches")     # computed from the repo's mirror when the run has one
 BITBUCKET_CALLS_PER_HOUR = 1000
 
 
-def _warn_per_commit_cost(names: List[str], log) -> None:
-    chosen = [n for n in names if n in PER_COMMIT]
+def _warn_per_commit_cost(names: List[str], log, mirrored: bool = False) -> None:
+    chosen = [n for n in names if n in PER_COMMIT and not (mirrored and n in FROM_MIRROR)]
     if chosen:
         log(f"note: {', '.join(chosen)} make one API call per commit, per collector. Bitbucket allows about "
             f"{BITBUCKET_CALLS_PER_HOUR} calls an hour, so a repo with 5,000 commits needs about "

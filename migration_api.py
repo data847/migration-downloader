@@ -412,6 +412,8 @@ class ArchiveResult:
             "error": self.error,
             "skipped": self.skipped,
             "ok": (bool(self.path) or bool(self.meta.get("uploaded_to"))) and not self.error,
+            # parts of an assembled archive that could not be collected (Bitbucket Cloud); the archive still ships
+            "incomplete": list(self.meta.get("incomplete", [])),
         }
 
 

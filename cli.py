@@ -7,7 +7,9 @@
   ./.venv/bin/python cli.py gitlab google/guava --poll-interval 20
   ./.venv/bin/python cli.py github --file github_repos.txt
   ./.venv/bin/python cli.py github org/repo --extras all            # + wikis, CI, alerts, hooks…
-  ./.venv/bin/python cli.py bitbucket ws/repo --extras all          # Cloud: extras only
+  ./.venv/bin/python cli.py bitbucket ws/repo                       # Cloud: archive + every extra (opt out below)
+  ./.venv/bin/python cli.py bitbucket ws/repo --skip-extras commit-statuses,pipeline-logs
+  ./.venv/bin/python cli.py bitbucket ws/repo --extras none         # the archive alone
   ./.venv/bin/python cli.py github org/repo --per-repo-bundles      # + standalone <target>.zip per repo
   ./.venv/bin/python cli.py bitbucket-dc PROJ/repo --api-base https://bb.example.com
 """
@@ -24,6 +26,17 @@ import bundle  # noqa: E402
 from migration_api import MigrationError  # noqa: E402
 from runner import PROVIDERS, JobSpec, run_job  # noqa: E402
 from supplementary import HEAVY, REGISTRY  # noqa: E402
+
+
+def _extras(args) -> list:
+    """Bitbucket Cloud: every extra unless --extras names a set (`none` for the archive alone). GitHub and GitLab keep
+    their archive-only default."""
+    named = [e.strip() for e in args.extras.split(",") if e.strip()]
+    if [n.lower() for n in named] == ["none"]:
+        return []
+    if not named and args.provider == "bitbucket":
+        return ["everything"]
+    return named
 
 
 def main(argv=None) -> int:
@@ -57,6 +70,9 @@ def main(argv=None) -> int:
     p.add_argument("--extras", default="",
                    help="comma list of supplementary collectors, or all (light ones) / everything; "
                         "see --list-extras")
+    p.add_argument("--skip-extras", default="",
+                   help="comma list of collectors to leave out of --extras (opt out); Bitbucket runs everything "
+                        "unless told otherwise")
     p.add_argument("--list-extras", action="store_true", help="print collector names per provider and exit")
     p.add_argument("--max-items", type=int, default=0,
                    help="cap on items collected per listing for extras (default 0 = no limit)")
@@ -106,7 +122,8 @@ def main(argv=None) -> int:
         skip_done=args.resume,
         concurrency=max(1, min(16, args.concurrency)),
         for_check=not args.no_for_check,
-        extras=[e for e in args.extras.split(",") if e.strip()],
+        extras=_extras(args),
+        skip_extras=[e.strip() for e in args.skip_extras.split(",") if e.strip()],
         max_items=args.max_items,
         exclude=[e for e in args.exclude.split(",") if e.strip()],
         org_metadata_only=args.org_metadata_only,

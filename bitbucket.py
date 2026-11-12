@@ -20,7 +20,7 @@ import tarfile
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Optional
 
 from migration_api import MigrationError, _download, _json_request, brief_error, safe_name
 from safety import require_same_origin
@@ -69,8 +69,11 @@ def clone_url(api_base: str, target: str) -> str:
     return f"{parsed.scheme or 'https'}://{host}/{urllib.parse.quote(ws)}/{urllib.parse.quote(repo)}.git"
 
 
-def mirror_archive(target: str, token: str, api_base: str, dest_dir: Path, log: Callable[[str], None]) -> Path:
-    """Clone target with --mirror and pack it as dest_dir/<safe target>.tar.gz (written as .part, then renamed)."""
+def mirror_archive(target: str, token: str, api_base: str, dest_dir: Path, log: Callable[[str], None],
+                   before_pack: Optional[Callable[[Path, Path], None]] = None) -> Path:
+    """Clone target with --mirror and pack it as dest_dir/<safe target>.tar.gz (written as .part, then renamed).
+    `before_pack(work, bare)` may add files beside <repo>.git/ in work (the archive's metadata) and refs to the
+    mirror; everything in work is packed at the archive's root."""
     url = supplementary.http_url(clone_url(api_base, target))
     repo = target.strip("/").split("/", 1)[1]
     work = dest_dir / ".mirror-work" / safe_name(target)
@@ -87,10 +90,14 @@ def mirror_archive(target: str, token: str, api_base: str, dest_dir: Path, log: 
             raise MigrationError(f"git clone --mirror failed: {err[-1] if err else proc.returncode}"
                                  + (" (check the token has read:repository and can see this repo)"
                                     if any(w in " ".join(err).lower() for w in ("403", "401", "authentication", "not found")) else ""))
+        if before_pack:
+            before_pack(work, bare)
         dest = dest_dir / f"{safe_name(target)}.tar.gz"
         part = dest.with_name(dest.name + ".part")
         with tarfile.open(part, "w:gz") as tar:
             tar.add(bare, arcname=bare.name)
+            for extra in sorted(p for p in work.iterdir() if p != bare):
+                tar.add(extra, arcname=extra.name)
         part.replace(dest)
         return dest
     finally:
@@ -202,7 +209,9 @@ def bb_refs(ctx):
 
 @collector("bitbucket", "commits")
 def bb_commits(ctx):
-    commits = cloud_paged(ctx, bb_url(ctx, "/commits"))
+    import bitbucket_archive
+    git_dir = bitbucket_archive.local_git(ctx)
+    commits = bitbucket_archive.commits(ctx, git_dir) if git_dir else cloud_paged(ctx, bb_url(ctx, "/commits"))
     ctx.shared.setdefault("bb_commits", {})[ctx.target] = [c["hash"] for c in commits]
     return [ctx.save_json("commits", commits)]
 
@@ -211,7 +220,14 @@ def _commit_hashes(ctx: Ctx) -> list:
     known = ctx.shared.get("bb_commits", {}).get(ctx.target)
     if known is not None:
         return known
-    return [c["hash"] for c in cloud_paged(ctx, bb_url(ctx, "/commits"))]
+    import bitbucket_archive
+    git_dir = bitbucket_archive.local_git(ctx)
+    if git_dir:
+        hashes = [c["hash"] for c in bitbucket_archive.commits(ctx, git_dir)]
+    else:
+        hashes = [c["hash"] for c in cloud_paged(ctx, bb_url(ctx, "/commits"))]
+    ctx.shared.setdefault("bb_commits", {})[ctx.target] = hashes
+    return hashes
 
 
 # One call per commit each: on a long history these take hours under Bitbucket's hourly limit, so they are heavy
@@ -227,7 +243,17 @@ def bb_commit_statuses(ctx):
 
 @collector("bitbucket", "commit-diffstat", heavy=True)
 def bb_commit_diffstat(ctx):
+    import bitbucket_archive
     out = {}
+    git_dir = bitbucket_archive.local_git(ctx)
+    if git_dir:                       # the same numbers from the mirror, no API calls
+        for sha in _commit_hashes(ctx):
+            ctx.check_cancelled()
+            try:
+                out[sha] = {"values": bitbucket_archive.diffstat(git_dir, sha), "source": "git mirror"}
+            except MigrationError as exc:
+                out[sha] = ctx.item_error(f"commit {sha[:10]} diffstat", exc)
+        return [ctx.save_json("commit-diffstat", out)]
     for sha in _commit_hashes(ctx):
         ctx.check_cancelled()
         out[sha] = _all_or_error(ctx, bb_url(ctx, f"/diffstat/{_seg(sha)}"), f"commit {sha[:10]} diffstat")
@@ -236,7 +262,21 @@ def bb_commit_diffstat(ctx):
 
 @collector("bitbucket", "commit-patches", heavy=True)
 def bb_commit_patches(ctx):
+    import bitbucket_archive
     written = []
+    git_dir = bitbucket_archive.local_git(ctx)
+    if git_dir:                       # git format-patch from the mirror, no API calls
+        for sha in _commit_hashes(ctx):
+            ctx.check_cancelled()
+            rel = f"commit-patches/{sha}.patch"
+            try:
+                dest = supplementary.safe_join(ctx.out, rel)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(bitbucket_archive.patch(git_dir, sha))
+                written.append(rel)
+            except MigrationError as exc:
+                ctx.item_error(f"commit {sha[:10]} patch", exc)
+        return written
     for sha in _commit_hashes(ctx):
         ctx.check_cancelled()
         try:
@@ -445,6 +485,72 @@ def bb_pipeline_logs(ctx):
 @collector("bitbucket", "forks")
 def bb_forks(ctx):
     return [ctx.save_json("forks", cloud_paged(ctx, bb_url(ctx, "/forks")))]
+
+
+@collector("bitbucket", "pr-tasks")
+def bb_pr_tasks(ctx):
+    """Only pull requests whose listing says they have tasks; every PR when the listing does not say."""
+    prs = _prs(ctx)
+    counted = any("task_count" in pr for pr in prs)
+    out = {}
+    for pr in prs:
+        if counted and not pr.get("task_count"):
+            continue
+        ctx.check_cancelled()
+        pid = pr["id"]
+        out[str(pid)] = _all_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/tasks"), f"PR {pid} tasks", PR_PAGELEN)
+    return [ctx.save_json("pr-tasks", out)]
+
+
+@collector("bitbucket", "deployments")
+def bb_deployments(ctx):
+    data = {}
+    for key, suffix in (("environments", "/environments/"), ("deployments", "/deployments/")):
+        try:
+            data[key] = cloud_paged(ctx, bb_url(ctx, suffix))
+        except MigrationError as exc:
+            if not supplementary.not_found(brief_error(exc)):
+                raise
+            data[key] = []                   # no Pipelines, so no deployments: nothing to have, not an error
+    return [ctx.save_json("deployments", data)]
+
+
+@collector("bitbucket", "commit-comments", heavy=True)
+def bb_commit_comments(ctx):
+    """One call per commit: Bitbucket has no repository-wide list of commit comments."""
+    out = {}
+    for sha in _commit_hashes(ctx):
+        ctx.check_cancelled()
+        out[sha] = _all_or_error(ctx, bb_url(ctx, f"/commit/{_seg(sha)}/comments"), f"commit {sha[:10]} comments")
+    return [ctx.save_json("commit-comments", out)]
+
+
+@collector("bitbucket", "test-reports", heavy=True)
+def bb_test_reports(ctx):
+    """Test reports and their cases, per pipeline step. A step without reports answers 404: skipped quietly."""
+    steps = ctx.shared.get("bb_steps", {}).get(ctx.target)
+    if steps is None:
+        pipelines = _pipelines_part(ctx, bb_url(ctx, "/pipelines/?sort=-created_on"), "pipelines",
+                                    lambda url: cloud_paged(ctx, url))
+        steps = _pipeline_steps(ctx, pipelines if isinstance(pipelines, list) else [])
+    out = {}
+    for pipe_uuid, listing in steps.items():
+        for step in (listing.get("values", []) if isinstance(listing, dict) else []):
+            ctx.check_cancelled()
+            base = bb_url(ctx, f"/pipelines/{_seg(pipe_uuid)}/steps/{_seg(step['uuid'])}/test_reports")
+            try:
+                summary = get_json(base, ctx.headers)
+            except MigrationError as exc:
+                if supplementary.not_found(brief_error(exc)):
+                    continue
+                ctx.item_error(f"step {step['uuid']} test report", exc)
+                continue
+            out[f"{pipe_uuid}/{step['uuid']}"] = {
+                "summary": summary,
+                "test_cases": _all_or_error(ctx, base + "/test_cases", f"step {step['uuid']} test cases")
+                .get("values", []),
+            }
+    return [ctx.save_json("test-reports", out)]
 
 
 # ── browsing repos for the picker ────────────────────────────────────────────
