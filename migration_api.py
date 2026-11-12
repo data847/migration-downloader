@@ -656,7 +656,9 @@ class GitLabExport:
     """Steps 2-4 of the GitLab project export API."""
 
     TERMINAL_OK = "finished"
-    TERMINAL_BAD = {"none", "regeneration_in_progress_failed"}
+    TERMINAL_BAD = {"failed", "regeneration_in_progress_failed"}
+    # GitLab reports `none` until a worker picks the export up, so it only counts as a failure after this long
+    NONE_GRACE = 120
 
     def __init__(self, token: str, *, api_base: str = GITLAB_API_BASE, log: Logger = _noop):
         if not token:
@@ -805,9 +807,9 @@ class GitLabExport:
         return data
 
     def wait(self, project: str, *, interval: int = 15, timeout: int = 3600, cancelled=None) -> dict:
-        deadline = time.time() + timeout
+        started = time.time()
+        deadline = started + timeout
         last = ""
-        first = True
         while True:
             if cancelled and cancelled():
                 raise MigrationError("cancelled while waiting for the export")
@@ -818,9 +820,8 @@ class GitLabExport:
                 last = state
             if state == self.TERMINAL_OK:
                 return data
-            if state in self.TERMINAL_BAD and not first:
+            if state in self.TERMINAL_BAD or (state == "none" and time.time() - started >= self.NONE_GRACE):
                 raise MigrationError(f"export of {project} ended in state '{state}'")
-            first = False
             if time.time() > deadline:
                 raise MigrationError(
                     f"timed out after {timeout}s waiting for the export of {project} (last state '{state}')"

@@ -11,7 +11,9 @@ import json
 import re
 import sys
 import tarfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +115,7 @@ class JobSpec:
     # resume: {target label -> migration/export id already known}
     known_ids: dict = field(default_factory=dict)
     skip_done: bool = False           # don't re-download targets already on disk
+    concurrency: int = 1              # gitlab: projects exported in parallel
     for_check: bool = True            # write <archive>.for-check.csv (source-side counts/refs/file list) for Garmr
     # supplementary collectors (see supplementary.py / bitbucket.py)
     extras: List[str] = field(default_factory=list)   # names, or all / everything
@@ -150,6 +153,7 @@ class JobSpec:
             lock_repositories=flag("lock_repositories"),
             single_archive=flag("single_archive"),
             poll_interval=max(5, _int(data, "poll_interval", 15)),
+            concurrency=min(16, max(1, _int(data, "concurrency", 1))),
             timeout=max(60, _int(data, "timeout", 3600)),
             verify_checksum=flag("verify_checksum"),
             run_name=(data.get("run_name") or "").strip(),
@@ -744,12 +748,12 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
     except MigrationError as exc:
         log(f"warning: token check failed ({brief_error(exc)})")
 
-    results: List[ArchiveResult] = []
-    for index, raw in enumerate(spec.targets, 1):
+    def one(index, raw, plog) -> ArchiveResult:
+        client = GitLabExport(token, api_base=spec.api_base or "https://gitlab.com", log=plog)
         project = client.normalise(raw)
         result = ArchiveResult(target=project)
-        log("")
-        log(f"[{index}/{len(spec.targets)}] {project}")
+        plog("")
+        plog(f"[{index}/{len(spec.targets)}] {project}")
         # id-suffixed, like GitHub's naming — two distinct projects can
         # normalise to the same safe_name() stem (e.g. "team-a/proj" and
         # "team/a-proj" both -> "team-a-proj"), which would otherwise let one
@@ -763,15 +767,14 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
                 raise MigrationError("cancelled")
             if precheck_dest:
                 # resume: the archive is already on disk, don't re-export it
-                log(f"  already downloaded ({human(precheck_dest.stat().st_size)}) — skipping")
+                plog(f"  already downloaded ({human(precheck_dest.stat().st_size)}) — skipping")
                 result.skipped = True
                 result.path = precheck_dest
                 result.bytes = precheck_dest.stat().st_size
-                results.append(result)
-                continue
+                return result
             fc = None
             if spec.for_check:
-                log(f"  for-check: snapshot before {project}")
+                plog(f"  for-check: snapshot before {project}")
                 fc = {"archive_label": project, "requested": [project], "exported": [project], "errors": [],
                       "repos": [{"label": project}],
                       "meta": {"provider": "gitlab", "host": client.api_base, "scope": "project", "org": "",
@@ -800,20 +803,38 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
             if spec.upload_url:
                 # host only: a presigned URL's query string is a credential
                 result.meta["uploaded_to"] = _upload_host(spec.upload_url)
-                log(f"  export finished; GitLab uploads it to {result.meta['uploaded_to']}")
-                results.append(result)
-                continue
+                plog(f"  export finished; GitLab uploads it to {result.meta['uploaded_to']}")
+                return result
             dest = dest_dir / (f"{stem}-{project_id}.tar.gz" if project_id else f"{stem}.tar.gz")
             client.download(project, dest, project_id=project_id)
             result.meta["content_length"] = client.download_info.get("content_length", "")
             result.path = dest
             result.bytes = dest.stat().st_size
-            log(f"  saved {dest.name} ({human(result.bytes)})")
+            plog(f"  saved {dest.name} ({human(result.bytes)})")
         except MigrationError as exc:
             result.error = brief_error(exc)
-            log(f"  ERROR {result.error}")
-        results.append(result)
-    return results
+            plog(f"  ERROR {result.error}")
+        return result
+
+    workers = max(1, min(spec.concurrency, len(spec.targets)))
+    if workers == 1:
+        return [one(i, raw, log) for i, raw in enumerate(spec.targets, 1)]
+
+    lock = threading.Lock()
+    log(f"exporting {workers} projects at a time")
+
+    def work(arg) -> ArchiveResult:
+        i, raw = arg
+
+        def tagged(message: str) -> None:
+            with lock:
+                log(f"[{i}] {message}" if message else message)
+
+        ratelimit.bind(cancelled, tagged)   # rate-limit state is shared, but its log/cancel binding is per thread
+        return one(i, raw, tagged)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(work, enumerate(spec.targets, 1)))
 
 
 def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:

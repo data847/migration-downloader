@@ -43,6 +43,9 @@ def main(argv=None) -> int:
     p.add_argument("--lock-repositories", action="store_true")
     p.add_argument("--single-archive", action="store_true", help="GitHub: one migration for all repos")
     p.add_argument("--no-checksum", action="store_true")
+    p.add_argument("--concurrency", type=int, default=1, help="GitLab: projects exported in parallel (default 1)")
+    p.add_argument("--resume", action="store_true",
+                   help="skip targets already downloaded into --run-name's folder")
     p.add_argument("--no-for-check", action="store_true",
                    help="do not write <archive>.for-check.csv (source-side counts/refs/file list for Garmr)")
     p.add_argument("--no-mirror", action="store_true",
@@ -71,6 +74,8 @@ def main(argv=None) -> int:
                    help="bitbucket-dc export job action")
     p.add_argument("--dc-job-id", default="", help="bitbucket-dc job to cancel")
     args = p.parse_args(argv)
+    if args.resume and not args.run_name:
+        p.error("--resume needs --run-name, the output folder of the run to continue")
 
     if args.list_extras:
         for provider, names in sorted(REGISTRY.items()):
@@ -98,6 +103,8 @@ def main(argv=None) -> int:
         timeout=args.timeout,
         verify_checksum=not args.no_checksum,
         run_name=args.run_name,
+        skip_done=args.resume,
+        concurrency=max(1, min(16, args.concurrency)),
         for_check=not args.no_for_check,
         extras=[e for e in args.extras.split(",") if e.strip()],
         max_items=args.max_items,

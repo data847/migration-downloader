@@ -271,6 +271,8 @@
           <input type="number" id="poll" value="15" min="5" max="300"></div>
         <div><label for="timeout">Timeout (s)</label>
           <input type="number" id="timeout" value="3600" min="60" step="60"></div>
+        <div data-only="gitlab"><label for="concurrency">In parallel</label>
+          <input type="number" id="concurrency" value="1" min="1" max="16"></div>
       </div>
     </fieldset>
 
@@ -704,6 +706,7 @@ $('form').onsubmit = async (ev) => {
   const payload = { provider, scope: 'auto',
     token: $('token').value, targets: $('targets').value,
     poll_interval: $('poll').value, timeout: $('timeout').value,
+    concurrency: $('concurrency').value,
     api_base: host === 'self' ? $('api_base').value.trim() : '',
     dc_action: $('dc_action').value, dc_job_id: $('dc_job_id').value.trim(),
     api_version: $('api_version').value,
