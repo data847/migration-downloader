@@ -49,7 +49,7 @@ the file list. Unknown counts stay blank.
 - The UI already ticks every extra by default; that stays.
 - CLI: Bitbucket runs `everything` unless `--extras` names a set; `--skip-extras a,b` (any provider) unticks some;
   `--extras none` turns them off.
-- `commits`, `commit-diffstat`, `commit-patches` are computed from the repo's mirror when the run has it (0 calls
+- `commits`, `commit-diffstat` are computed from the repo's mirror when the run has it (0 calls
   instead of one call per commit); without a mirror they use the API as before.
 - New extras: `pr-tasks` (only PRs with tasks), `deployments` (deployments + environments), `commit-comments` (heavy,
   one call per commit), `test-reports` (heavy, one call per pipeline step).

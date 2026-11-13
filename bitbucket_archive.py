@@ -15,7 +15,7 @@ LFS objects come through git (`git lfs fetch --all`) when the history uses LFS, 
 into the mirror for every PR whose source commit it holds, as a GitHub archive has. A part that fails does not stop
 the archive: `schema.json` lists it and the run reports it as an issue.
 
-The per-commit extras (`commits`, `commit-diffstat`, `commit-patches`) are computed here from the mirror when the run
+The per-commit extras (`commits`, `commit-diffstat`) are computed here from the mirror when the run
 has one, instead of one API call per commit each.
 """
 
@@ -383,11 +383,3 @@ def diffstat(git_dir: Path, sha: str) -> list:
                     "old": None if status == "added" else {"path": old},
                     "new": None if status == "removed" else {"path": new}})
     return out
-
-
-def patch(git_dir: Path, sha: str) -> bytes:
-    parents = _text(_git(git_dir, "rev-parse", f"{sha}^@")).split()
-    if len(parents) <= 1:
-        return _git(git_dir, "format-patch", "-1", "--root", "--stdout", "-M", sha)
-    header = _git(git_dir, "show", "-s", "--format=From %H %ad%nFrom: %an <%ae>%nDate: %aD%nSubject: %s%n%n%b", sha)
-    return header + b"---\n" + _git(git_dir, "diff", "-M", parents[0], sha)
