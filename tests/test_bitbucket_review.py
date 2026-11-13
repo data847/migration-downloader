@@ -108,33 +108,17 @@ def test_per_item_listings_follow_every_page(tmp_path, fake_bb):
     assert len(saved(ctx, "pipeline-variables")["values"]) == 11
 
 
-def test_pipeline_and_step_uuids_are_encoded_in_paths(tmp_path, fake_bb):
-    fake = fake_bb({"/steps": {"values": [{"uuid": "{s1}"}]}, "/pipelines?": {"values": [{"uuid": "{p1}"}]}},
-                   files={"/log": b"build ok"})
-    run("pipeline-logs", ctx_for(tmp_path))
-    assert any("/pipelines/%7Bp1%7D/steps/%7Bs1%7D/log" in c for c in fake.calls)
-    assert not any("{p1}" in c for c in fake.calls)
-
-
 # ── items that fail are counted, not hidden ─────────────────────────────────
 
 
 def test_a_failed_commit_is_counted_and_the_others_kept(tmp_path, fake_bb):
-    fake_bb({"/commit/bad/statuses": MigrationError("HTTP 502 GET x"), "/statuses": {"values": [{"state": "OK"}]},
+    fake_bb({"/commit/bad/comments": MigrationError("HTTP 502 GET x"), "/comments": {"values": [{"content": "OK"}]},
              "/commits": {"values": [{"hash": "good"}, {"hash": "bad"}]}})
     ctx = ctx_for(tmp_path)
-    run("commit-statuses", ctx)
-    out = saved(ctx, "commit-statuses")
-    assert out["good"] == {"values": [{"state": "OK"}]} and "error" in out["bad"]
-    assert [e["what"] for e in ctx.item_errors] == ["commit bad statuses"]
-
-
-def test_pr_diff_failures_are_counted(tmp_path, fake_bb):
-    fake_bb({"/pullrequests?": {"values": [{"id": 7}]}, "/diffstat": {"values": []}},
-            files={"/7/diff": MigrationError("HTTP 555 GET diff timeout"), "/7/patch": b"patch"})
-    ctx = ctx_for(tmp_path)
-    run("pr-diffs", ctx)
-    assert [e["what"] for e in ctx.item_errors] == ["PR 7 diff"]
+    run("commit-comments", ctx)
+    out = saved(ctx, "commit-comments")
+    assert out["good"] == {"values": [{"content": "OK"}]} and "error" in out["bad"]
+    assert [e["what"] for e in ctx.item_errors] == ["commit bad comments"]
 
 
 # ── one failure loses only its own item ─────────────────────────────────────
@@ -178,14 +162,6 @@ def test_failed_snippets_are_not_retried_for_every_repo(tmp_path, fake_bb):
     assert sum("/snippets/ws" in c for c in fake.calls) == 1
 
 
-def test_pipeline_logs_find_their_own_steps(tmp_path, fake_bb):
-    fake_bb({"/steps": {"values": [{"uuid": "{s}"}]}, "/pipelines?": {"values": [{"uuid": "{p}"}]}},
-            files={"/log": b"ok"})
-    ctx = ctx_for(tmp_path)     # no `pipelines` collector ran before it, so no steps are shared
-    written = run("pipeline-logs", ctx)
-    assert len(written) == 1 and (ctx.out / written[0]).read_bytes() == b"ok"
-
-
 def test_pull_requests_survive_a_refused_superseded_state(tmp_path, fake_bb):
     def prs(url):
         if "SUPERSEDED" in url:
@@ -195,6 +171,15 @@ def test_pull_requests_survive_a_refused_superseded_state(tmp_path, fake_bb):
     ctx = ctx_for(tmp_path)
     run("pullrequests", ctx)
     assert [p["id"] for p in saved(ctx, "pullrequests")] == [1]
+
+
+def test_removed_bitbucket_extras_are_gone_and_skipped_quietly():
+    gone = {"commit-statuses", "commit-patches", "pr-diffs", "pipeline-logs"}
+    assert not gone & set(supplementary.REGISTRY["bitbucket"])
+    assert not gone & set(supplementary.resolve_names("bitbucket", ["everything"]))
+    assert supplementary.resolve_names("bitbucket", ["refs", "pr-diffs", "commit-statuses"]) == ["refs"]
+    with pytest.raises(MigrationError, match="unknown extra"):
+        supplementary.resolve_names("github", ["pr-diffs"])
 
 
 def test_per_commit_collectors_are_heavy():
@@ -232,31 +217,31 @@ def outputs(tmp_path, monkeypatch):
 
 def bb_spec(**kw):
     base = dict(provider="bitbucket", mirror=False, token="me@x.com:tok", targets=["ws/a", "ws/b"], run_name="bbrun",
-                extras=["refs", "commit-statuses"])
+                extras=["refs", "commit-comments"])
     return runner.JobSpec(**{**base, **kw})
 
 
 def test_item_errors_make_the_run_partial_with_an_issue(outputs, fake_bb):
-    fake_bb({"/commit/bad/statuses": MigrationError("HTTP 502 GET x"), "/statuses": {"values": []},
+    fake_bb({"/commit/bad/comments": MigrationError("HTTP 502 GET x"), "/comments": {"values": []},
              "/commits": {"values": [{"hash": "ok"}, {"hash": "bad"}]}, "/refs": {"values": []}})
     m = runner.run_job(bb_spec(targets=["ws/a"]), log=lambda s: None)
-    rec = next(e for e in m["extras"] if e["extra"] == "commit-statuses")
+    rec = next(e for e in m["extras"] if e["extra"] == "commit-comments")
     assert rec["error"] == "" and rec["item_errors"] == 1
     assert m["extras_incomplete"] == 1 and m["failed"] == 1
     assert any(i["kind"] == "incomplete" and "1 item(s)" in i["message"] for i in m["issues"])
 
 
 def test_a_404_for_something_the_repo_lacks_is_unavailable_not_an_error(outputs, fake_bb):
-    """An item 404 (one commit's statuses) and a whole collector 404 (no branching model) in a repo that answers are things
+    """An item 404 (one commit's comments) and a whole collector 404 (no branching model) in a repo that answers are things
     the repo does not have: said so in the log, never counted as failures."""
     gone = MigrationError('HTTP 404 GET x\n{"error":{"message":"Not found"}}')
-    fake_bb({"/commit/old/statuses": gone, "/statuses": {"values": []}, "/commits": {"values": [{"hash": "ok"}, {"hash": "old"}]},
+    fake_bb({"/commit/old/comments": gone, "/comments": {"values": []}, "/commits": {"values": [{"hash": "ok"}, {"hash": "old"}]},
              "/refs": {"values": []}, "/branching-model": gone})
     lines = []
-    m = runner.run_job(bb_spec(targets=["ws/a"], extras=["refs", "commit-statuses", "branching-model"]), log=lines.append)
+    m = runner.run_job(bb_spec(targets=["ws/a"], extras=["refs", "commit-comments", "branching-model"]), log=lines.append)
     rec = {e["extra"]: e for e in m["extras"]}
-    assert rec["commit-statuses"]["error"] == "" and "item_errors" not in rec["commit-statuses"]
-    assert rec["commit-statuses"]["unavailable_items"] == 1
+    assert rec["commit-comments"]["error"] == "" and "item_errors" not in rec["commit-comments"]
+    assert rec["commit-comments"]["unavailable_items"] == 1
     assert rec["branching-model"]["error"] == "" and rec["branching-model"]["unavailable"] is True
     assert m["failed"] == 0 and m["extras_incomplete"] == 0
     assert sum("unavailable for this repo, not an error" in l for l in lines) == 2
@@ -285,20 +270,20 @@ def test_a_run_killed_mid_way_keeps_a_manifest_of_what_it_finished(outputs, fake
         runner.run_job(bb_spec(), log=lambda s: None)
     m = json.loads((outputs / "bbrun" / "manifest.json").read_text())
     assert m["complete"] is False
-    assert {(e["target"], e["extra"]) for e in m["extras"]} == {("ws/a", "refs"), ("ws/a", "commit-statuses")}
+    assert {(e["target"], e["extra"]) for e in m["extras"]} == {("ws/a", "refs"), ("ws/a", "commit-comments")}
 
 
 def test_a_resume_skips_what_finished_and_redoes_what_failed(outputs, fake_bb):
-    fake = fake_bb({"/commit/bad/statuses": MigrationError("HTTP 502 GET x"), "/statuses": {"values": []},
+    fake = fake_bb({"/commit/bad/comments": MigrationError("HTTP 502 GET x"), "/comments": {"values": []},
                     "/commits": {"values": [{"hash": "ok"}, {"hash": "bad"}]}, "/refs": {"values": []}})
     runner.run_job(bb_spec(targets=["ws/a"]), log=lambda s: None)
     fake.calls.clear()
-    fake.routes.pop("/commit/bad/statuses")
+    fake.routes.pop("/commit/bad/comments")
     lines = []
     m = runner.run_job(bb_spec(targets=["ws/a"], skip_done=True), log=lines.append)
     assert "  refs: already collected, skipped" in lines
     assert not any("/refs" in c for c in fake.calls)
-    assert any("/commit/bad/statuses" in c for c in fake.calls)
+    assert any("/commit/bad/comments" in c for c in fake.calls)
     assert m["failed"] == 0 and m["complete"] is True
     assert len(m["extras"]) == 2
 

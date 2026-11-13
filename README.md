@@ -99,9 +99,9 @@ is taken from Bitbucket's own API specification (`swagger.v3.json`, the
 | Browse: the workspace list | `GET /2.0/user/workspaces` | `read:workspace:bitbucket` | workspace member |
 | Browse: which workspace is your personal one | `GET /2.0/user` | `read:user:bitbucket` | — |
 | Browse: the repos in a workspace | `GET /2.0/repositories/<workspace>` | `read:repository:bitbucket` | read access |
-| `repo-metadata`, `refs`, `commits`, `commit-statuses`, `commit-diffstat`, `commit-patches`, `branching-model`, `downloads`, `forks` | `GET /2.0/repositories/<ws>/<repo>` and `…/refs`, `…/commits`, `…/commit/<sha>/statuses`, `…/diffstat/<sha>`, `…/patch/<sha>`, `…/branching-model`, `…/downloads`, `…/forks` | `read:repository:bitbucket` | read access |
-| `pullrequests`, `pr-diffs` | `GET …/pullrequests`, `…/pullrequests/<id>`, `…/commits`, `…/statuses`, `…/diff`, `…/patch`, `…/diffstat` | `read:pullrequest:bitbucket` | read access |
-| `pipelines`, `pipeline-logs`, pipeline variables | `GET …/pipelines`, `…/pipelines/<id>/steps`, `…/steps/<id>/log`, `…/pipelines_config/variables` | `read:pipeline:bitbucket` | read access |
+| `repo-metadata`, `refs`, `commits`, `commit-diffstat`, `branching-model`, `downloads`, `forks` | `GET /2.0/repositories/<ws>/<repo>` and `…/refs`, `…/commits`, `…/diffstat/<sha>`, `…/branching-model`, `…/downloads`, `…/forks` | `read:repository:bitbucket` | read access |
+| `pullrequests` | `GET …/pullrequests`, `…/pullrequests/<id>`, `…/commits`, `…/statuses` | `read:pullrequest:bitbucket` | read access |
+| `pipelines`, pipeline variables | `GET …/pipelines`, `…/pipelines/<id>/steps`, `…/pipelines_config/variables` | `read:pipeline:bitbucket` | read access |
 | Pipelines config | `GET …/pipelines_config` | `admin:repository:bitbucket` | **admin** on the repo |
 | `branch-restrictions` | `GET …/branch-restrictions` | `admin:repository:bitbucket` | **admin** on the repo |
 | `hooks` (repo) | `GET …/hooks` | `read:webhook:bitbucket` | **admin** on the repo |
@@ -405,7 +405,7 @@ remembered in the browser). Leaving everything ticked is the default.
 |---|---|---|
 | `github` | `repo-metadata` `releases` `actions` `actions-artifacts` `hooks` `branch-protection` `dependabot-alerts` `code-scanning` `secret-scanning` `projects-v2` `packages` | `wiki` `actions-logs` |
 | `gitlab` | `repo-archive` `wiki-pages` `releases` `pipelines` `hooks` | `wiki` `job-traces` `job-artifacts` `relations-export` |
-| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `pullrequests` `pr-tasks` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `deployments` `forks` | `commit-statuses` `commit-comments` `commit-diffstat` `commit-patches` `pr-diffs` `pipeline-logs` `test-reports` |
+| `bitbucket` (Cloud) | `repo-metadata` `refs` `commits` `pullrequests` `pr-tasks` `branch-restrictions` `branching-model` `downloads` `snippets` `hooks` `pipelines` `deployments` `forks` | `commit-comments` `commit-diffstat` `test-reports` |
 | `bitbucket-dc` | | `archive` |
 
 Not collected on purpose (GitHub, GitLab): issue/PR/commit comments,
@@ -413,11 +413,16 @@ discussions, activity and tasks. For Bitbucket Cloud, PR comments, reviews and
 activity are in the archive itself (below), and `pr-tasks` / `commit-comments`
 are extras.
 
-For Bitbucket Cloud, `commits`, `commit-diffstat` and `commit-patches` are
-computed from the repo's git mirror when the run has one: no API calls instead
-of one per commit each. `commit-statuses`, `commit-comments` and `test-reports`
-have no bulk form on Bitbucket and still cost one call per commit or step;
-untick them for a fast run.
+For Bitbucket Cloud, `commits` and `commit-diffstat` are computed from the
+repo's git mirror when the run has one: no API calls instead of one per commit
+each. `commit-comments` and `test-reports` have no bulk form on Bitbucket and
+still cost one call per commit or step; untick them for a fast run.
+
+Bitbucket Cloud no longer offers commit statuses, commit patches, PR diffs or
+pipeline step logs as extras. Patches and PR diffs can be rebuilt from the git
+mirror (`git format-patch`, `git diff base...head`). A saved job or script that
+still names `commit-statuses`, `commit-patches`, `pr-diffs` or `pipeline-logs`
+skips them instead of failing.
 
 The permission each collector needs is listed per step in
 [Step 1: the token](#step-1-the-token) (put a Bitbucket token in `BITBUCKET_TOKEN`).
@@ -550,12 +555,12 @@ call. A pause is never a failed attempt; a call fails only after 6 pauses in a r
 completes on its own.
 
 **404 means "not there".** A 404 for something a repository simply does not have (no Pipelines, no branching model, one
-commit's statuses, a deleted branch) is logged as `unavailable for this repo, not an error` and is not counted as a failure.
+commit's comments, a deleted branch) is logged as `unavailable for this repo, not an error` and is not counted as a failure.
 When every call for a repository answers 404, the repository itself is missing or the token cannot see it, and that stays an
 error.
 
-The per-commit collectors (`commit-statuses`, `commit-diffstat`,
-`commit-patches`) make one call per commit each, so on a long history they take
+The per-commit collectors (`commit-comments`, `commit-diffstat` without a
+mirror) make one call per commit each, so on a long history they take
 hours under that budget. They are heavy (left out of `all`), and the run log says
 up front what they cost when they are selected.
 

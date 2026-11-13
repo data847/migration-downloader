@@ -8,7 +8,7 @@
   ./.venv/bin/python cli.py github --file github_repos.txt
   ./.venv/bin/python cli.py github org/repo --extras all            # + wikis, CI, alerts, hooks…
   ./.venv/bin/python cli.py bitbucket ws/repo                       # Cloud: archive + every extra (opt out below)
-  ./.venv/bin/python cli.py bitbucket ws/repo --skip-extras commit-statuses,pipeline-logs
+  ./.venv/bin/python cli.py bitbucket ws/repo --skip-extras commit-comments,test-reports
   ./.venv/bin/python cli.py bitbucket ws/repo --extras none         # the archive alone
   ./.venv/bin/python cli.py github org/repo --per-repo-bundles      # + standalone <target>.zip per repo
   ./.venv/bin/python cli.py bitbucket-dc PROJ/repo --api-base https://bb.example.com

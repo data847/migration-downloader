@@ -1066,8 +1066,8 @@ def _run_extras(spec, token, dest_dir, log, cancelled, checkpoint=None, previous
 
 
 # collectors that make one call per commit, and roughly how many calls Bitbucket allows an hour
-PER_COMMIT = ("commit-statuses", "commit-comments", "commit-diffstat", "commit-patches")
-FROM_MIRROR = ("commit-diffstat", "commit-patches")     # computed from the repo's mirror when the run has one
+PER_COMMIT = ("commit-comments", "commit-diffstat")
+FROM_MIRROR = ("commit-diffstat",)     # computed from the repo's mirror when the run has one
 BITBUCKET_CALLS_PER_HOUR = 1000
 
 

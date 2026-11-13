@@ -232,15 +232,6 @@ def _commit_hashes(ctx: Ctx) -> list:
 
 # One call per commit each: on a long history these take hours under Bitbucket's hourly limit, so they are heavy
 # (left out of `all`, run by `everything` or by name) and the run says up front what they cost.
-@collector("bitbucket", "commit-statuses", heavy=True)
-def bb_commit_statuses(ctx):
-    out = {}
-    for sha in _commit_hashes(ctx):
-        ctx.check_cancelled()
-        out[sha] = _all_or_error(ctx, bb_url(ctx, f"/commit/{_seg(sha)}/statuses"), f"commit {sha[:10]} statuses")
-    return [ctx.save_json("commit-statuses", out)]
-
-
 @collector("bitbucket", "commit-diffstat", heavy=True)
 def bb_commit_diffstat(ctx):
     import bitbucket_archive
@@ -258,32 +249,6 @@ def bb_commit_diffstat(ctx):
         ctx.check_cancelled()
         out[sha] = _all_or_error(ctx, bb_url(ctx, f"/diffstat/{_seg(sha)}"), f"commit {sha[:10]} diffstat")
     return [ctx.save_json("commit-diffstat", out)]
-
-
-@collector("bitbucket", "commit-patches", heavy=True)
-def bb_commit_patches(ctx):
-    import bitbucket_archive
-    written = []
-    git_dir = bitbucket_archive.local_git(ctx)
-    if git_dir:                       # git format-patch from the mirror, no API calls
-        for sha in _commit_hashes(ctx):
-            ctx.check_cancelled()
-            rel = f"commit-patches/{sha}.patch"
-            try:
-                dest = supplementary.safe_join(ctx.out, rel)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(bitbucket_archive.patch(git_dir, sha))
-                written.append(rel)
-            except MigrationError as exc:
-                ctx.item_error(f"commit {sha[:10]} patch", exc)
-        return written
-    for sha in _commit_hashes(ctx):
-        ctx.check_cancelled()
-        try:
-            written.append(fetch_file(ctx, bb_url(ctx, f"/patch/{_seg(sha)}"), f"commit-patches/{sha}.patch"))
-        except MigrationError as exc:
-            ctx.item_error(f"commit {sha[:10]} patch", exc)
-    return written
 
 
 def _prs(ctx: Ctx) -> list:
@@ -322,24 +287,6 @@ def bb_pullrequests(ctx):
                                       PR_PAGELEN),
         }
     return [ctx.save_json("pullrequests", prs), ctx.save_json("pullrequest-details", detail)]
-
-
-@collector("bitbucket", "pr-diffs", heavy=True)
-def bb_pr_diffs(ctx):
-    written = []
-    for pr in _prs(ctx):
-        ctx.check_cancelled()
-        pid = pr["id"]
-        for kind in ("diff", "patch"):
-            try:
-                written.append(fetch_file(ctx, bb_url(ctx, f"/pullrequests/{pid}/{kind}"),
-                                          f"pr-diffs/{pid}.{kind}"))
-            except MigrationError as exc:
-                ctx.item_error(f"PR {pid} {kind}", exc)
-        written.append(ctx.save_json(f"pr-diffs/{pid}-diffstat",
-                                     _all_or_error(ctx, bb_url(ctx, f"/pullrequests/{pid}/diffstat"),
-                                                   f"PR {pid} diffstat", PR_PAGELEN)))
-    return written
 
 
 @collector("bitbucket", "branch-restrictions")
@@ -459,27 +406,6 @@ def bb_pipelines(ctx):
         ctx.save_json("pipeline-variables", _pipelines_part(ctx, bb_url(ctx, "/pipelines_config/variables"), "pipeline variables",
                                                             lambda u: {"values": cloud_paged(ctx, u, pagelen=100)})),
     ]
-
-
-@collector("bitbucket", "pipeline-logs", heavy=True)
-def bb_pipeline_logs(ctx):
-    steps = ctx.shared.get("bb_steps", {}).get(ctx.target)
-    if steps is None:   # run on its own, or `pipelines` failed or was skipped on a resume: find the steps here
-        steps = _pipeline_steps(ctx, cloud_paged(ctx, bb_url(ctx, "/pipelines?sort=-created_on")))
-    written = []
-    for pipe_uuid, listing in steps.items():
-        for step in (listing.get("values", []) if isinstance(listing, dict) else []):
-            ctx.check_cancelled()
-            try:
-                written.append(fetch_file(
-                    ctx, bb_url(ctx, f"/pipelines/{_seg(pipe_uuid)}/steps/{_seg(step['uuid'])}/log"),
-                    f"pipeline-logs/{safe_name(pipe_uuid)}-{safe_name(step['uuid'])}.log",
-                    scrub="text"))
-            except MigrationError as exc:
-                if "HTTP 404" in str(exc):      # a step that never ran (skipped, not started) has no log
-                    continue
-                ctx.item_error(f"pipeline step {step['uuid']} log", exc)
-    return written
 
 
 @collector("bitbucket", "forks")

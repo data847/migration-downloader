@@ -54,13 +54,18 @@ def collector(provider: str, name: str, *, heavy: bool = False):
     return register
 
 
+# Extras that were offered once and then removed. A saved job, a resumed run or a script that still names one skips it
+# quietly instead of failing with "unknown extra".
+RETIRED = {"bitbucket": {"commit-statuses", "commit-patches", "pr-diffs", "pipeline-logs"}}
+
+
 def resolve_names(provider: str, requested: List[str]) -> List[str]:
     """Expand `all` / `everything`; reject names the provider doesn't have."""
     available = REGISTRY.get(provider, {})
     names: List[str] = []
     for item in requested:
         item = item.strip().lower()
-        if not item:
+        if not item or item in RETIRED.get(provider, ()):
             continue
         if item == "all":
             names += [n for n in available if n not in HEAVY.get(provider, set())]

@@ -316,9 +316,9 @@ def test_no_lfs_fetch_when_the_history_does_not_use_it(outputs, fake_git, fake_b
 def test_per_commit_extras_come_from_the_mirror_with_no_api_calls(outputs, fake_git, fake_bb, remote):
     _, shas = remote
     fake = fake_bb(routes(shas))
-    manifest = run(outputs, extras=["commits", "commit-diffstat", "commit-patches"])
+    manifest = run(outputs, extras=["commits", "commit-diffstat"])
     assert manifest["failed"] == 0, manifest["issues"]
-    assert not [c for c in fake.calls if "/commits" in c or "/diffstat/" in c or "/patch/" in c]
+    assert not [c for c in fake.calls if "/commits" in c or "/diffstat/" in c]
     out = outputs / "r1" / "extras" / "ws-shop"
     commits = load(out, "commits.json")
     assert {c["hash"] for c in commits} == {shas["main"], shas["feature"]}
@@ -327,8 +327,7 @@ def test_per_commit_extras_come_from_the_mirror_with_no_api_calls(outputs, fake_
     diffstat = load(out, "commit-diffstat.json")[shas["feature"]]["values"]
     assert diffstat == [{"status": "added", "lines_added": 2, "lines_removed": 0, "old": None,
                          "new": {"path": "b.txt"}}]
-    patch = (out / "commit-patches" / f"{shas['feature']}.patch").read_text()
-    assert "+++ b/b.txt" in patch and "second" in patch
+    assert not (out / "commit-patches").exists()
     assert not (outputs / "r1" / ".mirror-work").exists()
 
 
@@ -399,8 +398,8 @@ def captured(monkeypatch):
 def test_cli_bitbucket_runs_every_extra_unless_told_otherwise(captured):
     cli.main(["bitbucket", "ws/shop"])
     assert captured[-1].extras == ["everything"] and captured[-1].skip_extras == []
-    cli.main(["bitbucket", "ws/shop", "--skip-extras", "commit-statuses,pipeline-logs"])
-    assert captured[-1].skip_extras == ["commit-statuses", "pipeline-logs"]
+    cli.main(["bitbucket", "ws/shop", "--skip-extras", "commit-comments,test-reports"])
+    assert captured[-1].skip_extras == ["commit-comments", "test-reports"]
     cli.main(["bitbucket", "ws/shop", "--extras", "none"])
     assert captured[-1].extras == []
     cli.main(["github", "o/r"])
