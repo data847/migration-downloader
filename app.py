@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
+import binascii
 import io
 import json
 import os
 import sys
 import threading
 import traceback
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -29,7 +32,8 @@ import bootstrap  # noqa: F401  (sets sys.path)
 
 from datalabs_paths import ENV_FILE, github_token, gitlab_token, outputs_for  # noqa: E402
 from migration_api import GitHubMigration, GitLabExport, MigrationError, brief_error, mask  # noqa: E402
-from runner import COMPONENT, JobSpec, issues_from_manifest, list_runs, run_job  # noqa: E402
+from runner import COMPONENT, PROFILER_UPLOADS, JobSpec, issues_from_manifest, list_runs, run_job  # noqa: E402
+import check_report  # noqa: E402
 from supplementary import HEAVY, REGISTRY  # noqa: E402
 import bitbucket  # noqa: E402
 import bundle  # noqa: E402
@@ -42,6 +46,8 @@ app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 # pick up template edits without a restart
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+# the largest body is a profiler upload (base64 in JSON): summary.csv or the profiler's zip
+app.config["MAX_CONTENT_LENGTH"] = 96 * 1024 * 1024
 atexit.register(jobstore.flush_all)
 
 
@@ -200,7 +206,31 @@ def job_status(job_id: str):
         resumable=bool(jobstore.resume_plan(job)),
         # a rate-limit pause in progress (epoch seconds it ends, 0 when none): the page says when it resumes
         paused_until=ratelimit.paused_until() if job["state"] == "running" else 0,
+        # check-report.json as it stands (rewritten after every repo): the page's mismatch banner
+        check=redact.scrub_obj(_check_summary(job)),
     )
+
+
+def _report_dir(run: str) -> Path:
+    """`<outputs>/migration-downloader/<run>` holding a check-report.json, refusing path escapes. Unlike `_run_root`
+    it does not need manifest.json, which a running job has not written yet."""
+    root = outputs_for(COMPONENT).resolve()
+    path = (root / run).resolve()
+    if (not run or run.startswith(".") or root != path.parent or not path.is_dir()
+            or not (path / check_report.REPORT_NAME).is_file()):
+        abort(404)
+    return path
+
+
+def _check_summary(job: dict) -> dict:
+    run = jobstore._run_dir_name(job, job.get("manifest") or {})
+    if not run or run.startswith(".") or "/" in run:
+        return {}
+    data = check_report.summary(outputs_for(COMPONENT, run) / check_report.REPORT_NAME)
+    if not data:
+        return {}
+    data["run"] = run
+    return data
 
 
 @app.get("/api/jobs/<job_id>/log")
@@ -382,6 +412,45 @@ def archive(run: str, name: str):
     if path.parent != _run_root(run) or not path.is_file():
         abort(404)
     return send_file(path, as_attachment=True, download_name=path.name)
+
+
+@app.get("/api/check-report/<run>")
+def check_report_file(run: str):
+    """The run's check-report.json (also inside run-files.zip once the run is done)."""
+    path = _report_dir(run) / check_report.REPORT_NAME
+    return send_file(path, mimetype="application/json", as_attachment=True,
+                     download_name=f"{run}-{check_report.REPORT_NAME}", max_age=0)
+
+
+@app.post("/api/profiler")
+def profiler_upload():
+    """Store an uploaded Codebase Profiler output (JSON body: {filename, data: base64}) under the outputs folder,
+    parse it, and answer with the repos it names per provider, so the page can tick them. The browser later names
+    the upload by the returned id; it never sends a path."""
+    body = _body()
+    filename = os.path.basename(str(body.get("filename") or "").replace("\\", "/")).strip()
+    suffix = Path(filename).suffix.lower()
+    if suffix not in check_report.PROFILER_SUFFIXES:
+        return jsonify(error="upload the profiler's summary.csv, summary.xlsx or its .zip"), 400
+    try:
+        raw = base64.b64decode(str(body.get("data") or ""), validate=True)
+    except (binascii.Error, ValueError):
+        return jsonify(error="the upload is not valid base64"), 400
+    if not raw:
+        return jsonify(error="the file is empty"), 400
+    folder = outputs_for(COMPONENT, PROFILER_UPLOADS)
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in Path(filename).stem).strip("-.")[:80]
+    name = f"{uuid.uuid4().hex}-{stem or 'summary'}{suffix}"
+    path = folder / name
+    path.write_bytes(raw)
+    try:
+        rows = check_report.load_profiler(path)
+    except MigrationError as exc:
+        path.unlink(missing_ok=True)
+        return jsonify(error=str(exc)), 400
+    targets = {p: check_report.targets_from_profiler(rows, p) for p in ("github", "gitlab", "bitbucket")}
+    return jsonify(upload=name, filename=filename, rows=len(rows), targets=targets)
 
 
 @app.get("/api/archive-zip/<run>")

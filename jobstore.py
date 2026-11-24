@@ -76,6 +76,9 @@ def _public_spec(spec: JobSpec) -> dict:
         "dc_action": spec.dc_action,
         "dc_job_id": spec.dc_job_id,
         "for_check": spec.for_check,
+        "profiler_path": spec.profiler_path,
+        "loc_tolerance_pct": spec.loc_tolerance_pct,
+        "pr_tolerance_pct": spec.pr_tolerance_pct,
         "upload_method": spec.upload_method,
         # upload_url is deliberately not stored: a presigned URL is a credential.
         # The flag lets resume refuse instead of silently downloading instead.
@@ -320,6 +323,22 @@ def _already_on_disk(job: dict, manifest: dict, known: dict) -> set:
     return settled
 
 
+def _resume_profiler(s: dict, run: str) -> str:
+    """The profiler file the run checked against. The stored spec is scrubbed (home dir -> ~), so expand it; if the
+    file is gone, the run folder keeps its own copy (profiler-<name>)."""
+    raw = str(s.get("profiler_path") or "")
+    if not raw:
+        return ""
+    path = Path(os.path.expanduser(raw))
+    if path.is_file():
+        return str(path)
+    if run and not run.startswith("."):
+        copies = sorted(outputs_for(COMPONENT, run).glob("profiler-*"))
+        if copies:
+            return str(copies[0])
+    return str(path)      # validate() then says the file is missing
+
+
 def spec_for_resume(job: dict, token: str = "") -> JobSpec:
     plan = resume_plan(job) or {"targets": job["spec"]["targets"], "known_ids": {}, "run_name": ""}
     s = job["spec"]
@@ -346,6 +365,9 @@ def spec_for_resume(job: dict, token: str = "") -> JobSpec:
         delete_archive=s.get("delete_archive", False),
         description=s.get("description", ""),
         for_check=s.get("for_check", True),
+        profiler_path=_resume_profiler(s, plan["run_name"] or s["run_name"]),
+        loc_tolerance_pct=s.get("loc_tolerance_pct", 5.0),
+        pr_tolerance_pct=s.get("pr_tolerance_pct", 5.0),
         upload_method=s.get("upload_method", ""),
         dc_job_id=s.get("dc_job_id", ""),
         # never start a second Data Center export job on resume; extras re-run

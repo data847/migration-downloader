@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 import bootstrap  # noqa: F401  (sets sys.path)
 
+import check_report  # noqa: E402
 import for_check  # noqa: E402
 from datalabs_paths import (  # noqa: E402
     ensure_outputs,
@@ -41,6 +42,7 @@ from migration_api import (  # noqa: E402
     brief_error,
     human,
     mask,
+    normalise_gitlab_project,
     safe_name,
     sha256,
 )
@@ -99,6 +101,32 @@ def _split(raw) -> List[str]:
     return [t.strip() for chunk in str(raw or "").splitlines() for t in chunk.split(",") if t.strip()]
 
 
+def _pct(data: dict, key: str) -> float:
+    raw = data.get(key)
+    if raw in (None, ""):
+        return check_report.DEFAULT_TOLERANCE
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise MigrationError(f"{key} must be a number (a percentage)") from None
+
+
+# the UI's profiler uploads: outputs/migration-downloader/.profiler-uploads/<32 hex>-<file name>
+PROFILER_UPLOADS = ".profiler-uploads"
+_UPLOAD_NAME = re.compile(r"[0-9a-f]{32}-[A-Za-z0-9._-]{1,120}")
+
+
+def profiler_upload_path(name: str) -> Path:
+    """The stored upload a form names. Only the server's own upload names resolve: the browser never sends a path."""
+    name = (name or "").strip()
+    if not _UPLOAD_NAME.fullmatch(name) or name.startswith("."):
+        raise MigrationError("unknown profiler upload; upload the file again")
+    path = outputs_for(COMPONENT, PROFILER_UPLOADS, name)
+    if not path.is_file():
+        raise MigrationError("the uploaded profiler file is gone; upload it again")
+    return path
+
+
 @dataclass
 class JobSpec:
     provider: str = "github"          # github | gitlab
@@ -137,6 +165,11 @@ class JobSpec:
     dc_job_id: str = ""               # for cancel
     # bitbucket cloud: the full git history by git clone --mirror, packed as the repo's archive
     mirror: bool = True
+    # check-report.json: the Codebase Profiler output (summary.csv / .xlsx / its .zip) to check each archive against;
+    # blank -> validity / visibility / PR checks only. Given with no targets, its repos become the targets.
+    profiler_path: str = ""
+    loc_tolerance_pct: float = check_report.DEFAULT_TOLERANCE   # migration LOC may be this % below the profiler's
+    pr_tolerance_pct: float = check_report.DEFAULT_TOLERANCE    # merged PRs likewise
 
     @classmethod
     def from_form(cls, data: dict) -> "JobSpec":
@@ -174,6 +207,11 @@ class JobSpec:
             dc_action=(data.get("dc_action") or "export").strip().lower(),
             dc_job_id=(data.get("dc_job_id") or "").strip(),
             mirror=str(data.get("mirror", "1")).lower() not in {"0", "false", "off", "no"},
+            # the browser names one of the server's own uploads, never a path
+            profiler_path=(str(profiler_upload_path(str(data["profiler_upload"])))
+                           if str(data.get("profiler_upload") or "").strip() else ""),
+            loc_tolerance_pct=_pct(data, "loc_tolerance"),
+            pr_tolerance_pct=_pct(data, "pr_tolerance"),
         )
 
     def resolved_token(self) -> str:
@@ -198,6 +236,16 @@ class JobSpec:
         if self.provider not in PROVIDERS:
             raise MigrationError(f"provider must be one of {sorted(PROVIDERS)}")
         check_run_name(self.run_name)
+        for name, value in (("loc tolerance", self.loc_tolerance_pct), ("PR tolerance", self.pr_tolerance_pct)):
+            if not isinstance(value, (int, float)) or not 0 <= float(value) <= 100:
+                raise MigrationError(f"{name} must be a percentage between 0 and 100")
+        if self.profiler_path:
+            rows = check_report.load_profiler(self.profiler_path)     # raises on a missing or unreadable file
+            if not self.targets:
+                # autoselect: every repo the profiler measured is migrated, no ticking needed
+                self.targets = check_report.targets_from_profiler(rows, self.provider, self.scope, self.org)
+                if not self.targets:
+                    raise MigrationError("the profiler output names no repository for this provider / org")
         cancel_only = self.provider == "bitbucket-dc" and self.dc_action == "cancel"
         if not self.targets and not cancel_only:
             raise MigrationError("give at least one repository / project")
@@ -330,14 +378,16 @@ def run_job(
         log(f"resuming with {len(spec.known_ids)} known id(s) — step 2 skipped for those")
         log("")
     export_jobs: List[dict] = []
+    checks = _make_checks(spec, dest_dir, log)
+    kw = {"checks": checks} if checks is not None else {}
     if spec.provider == "github":
-        results = _run_github(spec, token, dest_dir, log, cancelled)
+        results = _run_github(spec, token, dest_dir, log, cancelled, **kw)
     elif spec.provider == "gitlab":
-        results = _run_gitlab(spec, token, dest_dir, log, cancelled)
+        results = _run_gitlab(spec, token, dest_dir, log, cancelled, **kw)
     elif spec.provider == "bitbucket-dc":
         export_jobs = _run_bitbucket_dc(spec, token, dest_dir, log, cancelled)
     elif spec.provider == "bitbucket" and spec.mirror:
-        results = _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled)
+        results = _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled, **kw)
 
     manifest_path = dest_dir / "manifest.json"
     previous = _load_manifest(manifest_path) if spec.skip_done else None
@@ -347,6 +397,8 @@ def run_job(
         if previous:
             _merge_resumed(m, previous)
         m["complete"] = complete
+        if checks is not None:
+            m["check_report"] = check_report.REPORT_NAME
         _finish_counts(m)
         return m
 
@@ -372,6 +424,9 @@ def run_job(
         info = r.meta.pop("for_check", None)
         if spec.for_check and info and r.path and r.path.exists():
             _write_for_check(info, r, log)
+
+    if checks is not None:
+        _finish_checks(checks, dest_dir, log)
 
     manifest = assemble(extras, complete=True)
     _write_manifest(manifest_path, manifest)
@@ -581,6 +636,89 @@ def _write_for_check(info: dict, result: ArchiveResult, log) -> None:
         log(f"  warning: could not write for-check.csv ({type(exc).__name__}: {exc})")
 
 
+# ── check-report.json ────────────────────────────────────────────────────────
+
+def check_label(spec: JobSpec, target: str) -> str:
+    """The repo's source path as the report names it: GitHub owner/repo, GitLab group/.../project, Bitbucket ws/repo."""
+    if spec.provider == "gitlab":
+        return normalise_gitlab_project(target)
+    if spec.provider == "github":
+        owner, repo = _owner_repo(spec, _strip_url(target))
+        return f"{owner}/{repo}"
+    return _strip_url(target).strip("/")
+
+
+def _make_checks(spec: JobSpec, dest_dir: Path, log) -> Optional[check_report.CheckReport]:
+    """The run's report, or None (Bitbucket Data Center downloads nothing). A problem here costs the report, never
+    the run."""
+    if spec.provider not in {"github", "gitlab", "bitbucket"}:
+        return None
+    try:
+        rows, shown = [], ""
+        if spec.profiler_path:
+            src = Path(spec.profiler_path)
+            rows = check_report.load_profiler(src)
+            shown = src.name
+            # keep the run's own copy beside manifest.json, so the report can always be traced to its input
+            copy = dest_dir / ("profiler-" + safe_name(src.name.split("-", 1)[1] if re.fullmatch(
+                r"[0-9a-f]{32}-.+", src.name) else src.name))
+            if src.resolve() != copy.resolve() and not copy.exists():
+                shutil.copyfile(src, copy)
+            shown = copy.name
+        labels = [check_label(spec, t) for t in spec.targets]
+        checks = check_report.CheckReport(dest_dir, spec.provider, rows=rows, profiler_file=shown,
+                                          loc_tolerance=spec.loc_tolerance_pct, pr_tolerance=spec.pr_tolerance_pct,
+                                          expected=labels, log=log)
+        if spec.skip_done:
+            checks.load_previous()
+        checks.record_failure([], "")      # writes the (empty) report, so the page can link it from the start
+        log(f"checks     : {check_report.REPORT_NAME}"
+            + (f" against {shown} ({len(rows)} profiler row(s), tolerance loc {spec.loc_tolerance_pct:g}% / "
+               f"merged PRs {spec.pr_tolerance_pct:g}%)" if rows else " (no profiler output: validity, visibility "
+                                                                       "and PRs only)"))
+        if shutil.which("scc") is None and rows:
+            log("  note: scc is not installed, so LOC cannot be compared (reported as null, not a mismatch)")
+        return checks
+    except Exception as exc:
+        log(f"warning: {check_report.REPORT_NAME} disabled ({type(exc).__name__}: {redact.scrub(str(exc))[:300]})")
+        return None
+
+
+def _run_checks(checks: Optional[check_report.CheckReport], result: ArchiveResult, labels: List[str], log) -> None:
+    """Right after a repo's archive is on disk (or failed): check it and rewrite the report. Never raises."""
+    if checks is None:
+        return
+    try:
+        if result.path and not result.error and Path(result.path).is_file():
+            info = result.meta.get("for_check")
+            for entry in checks.check_archive(Path(result.path), labels, info, reuse=result.skipped):
+                log(f"  check: {redact.scrub(check_report.one_line(entry))}")
+        else:
+            reason = result.error or (f"uploaded by GitLab to {result.meta['uploaded_to']}; not on this machine"
+                                      if result.meta.get("uploaded_to") else "no archive")
+            checks.record_failure(labels, reason)
+    except Exception as exc:  # the report is a by-product: it never fails the download
+        log(f"  warning: check failed ({type(exc).__name__}: {redact.scrub(str(exc))[:300]})")
+
+
+def _finish_checks(checks: check_report.CheckReport, dest_dir: Path, log) -> None:
+    try:
+        data = checks.finish(dest_dir / "extras")
+    except Exception as exc:
+        log(f"warning: could not finish {check_report.REPORT_NAME} ({type(exc).__name__}: {exc})")
+        return
+    log("")
+    log(f"check report: {dest_dir / check_report.REPORT_NAME}")
+    if data["mismatch"]:
+        log(f"  MISMATCH ({len(data['mismatch'])}): {', '.join(data['mismatch'])}")
+    else:
+        log("  no mismatch")
+    if data["not_migrated"]:
+        log(f"  not migrated ({len(data['not_migrated'])}): {', '.join(data['not_migrated'])}")
+    if data["not_in_profiler"]:
+        log(f"  not in the profiler output ({len(data['not_in_profiler'])}): {', '.join(data['not_in_profiler'])}")
+
+
 def _github_client(spec: JobSpec, token: str, log) -> GitHubMigration:
     return GitHubMigration(
         token,
@@ -625,15 +763,16 @@ def _github_login(spec, token, log) -> str:
             f"({brief_error(exc)})") from None
 
 
-def _run_github(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+def _run_github(spec, token, dest_dir, log, cancelled, checks=None) -> List[ArchiveResult]:
     results: List[ArchiveResult] = []
+    kw = {"checks": checks} if checks is not None else {}
     for scope, org, targets in _github_groups(spec, token, log):
         group = replace(spec, scope=scope, org=org, targets=targets)
-        results += _run_github_scope(group, token, dest_dir, log, cancelled)
+        results += _run_github_scope(group, token, dest_dir, log, cancelled, **kw)
     return results
 
 
-def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+def _run_github_scope(spec, token, dest_dir, log, cancelled, checks=None) -> List[ArchiveResult]:
     client = _github_client(spec, token, log)
     try:
         log(f"authenticated as {client.whoami()}")
@@ -718,6 +857,7 @@ def _run_github_scope(spec, token, dest_dir, log, cancelled) -> List[ArchiveResu
         except MigrationError as exc:
             result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
+        _run_checks(checks, result, [check_label(spec, t) for t in batch], log)
         results.append(result)
     return results
 
@@ -755,7 +895,7 @@ def _github_cleanup(spec, client, migration_id, batch, log, dest: Path, expected
             log(f"  warning: delete archive failed ({brief_error(exc)})")
 
 
-def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+def _run_gitlab(spec, token, dest_dir, log, cancelled, checks=None) -> List[ArchiveResult]:
     client = GitLabExport(token, api_base=spec.api_base or "https://gitlab.com", log=log)
     try:
         log(f"authenticated as {client.whoami()}")
@@ -763,6 +903,11 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
         log(f"warning: token check failed ({brief_error(exc)})")
 
     def one(index, raw, plog) -> ArchiveResult:
+        result = export_one(index, raw, plog)
+        _run_checks(checks, result, [result.target], plog)     # right after this project, as the exports run
+        return result
+
+    def export_one(index, raw, plog) -> ArchiveResult:
         client = GitLabExport(token, api_base=spec.api_base or "https://gitlab.com", log=plog)
         project = client.normalise(raw)
         result = ArchiveResult(target=project)
@@ -851,7 +996,7 @@ def _run_gitlab(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
         return list(pool.map(work, enumerate(spec.targets, 1)))
 
 
-def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled) -> List[ArchiveResult]:
+def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled, checks=None) -> List[ArchiveResult]:
     """Bitbucket Cloud: each repo's full git history by `git clone --mirror` with the run's token, packed as
     <workspace>-<repo>.tar.gz (holding <repo>.git/) and recorded as the target's archive, so the bundle ships it
     together with that repo's extras."""
@@ -870,6 +1015,7 @@ def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled) -> List[Archiv
             if done:
                 log(f"  already cloned ({human(done.stat().st_size)}) — skipping")
                 result.skipped, result.path, result.bytes = True, done, done.stat().st_size
+                _run_checks(checks, result, [target], log)
                 results.append(result)
                 continue
             check_disk(dest_dir, MIN_FREE_MB, what=f"the mirror of {target}")
@@ -912,6 +1058,7 @@ def _run_bitbucket_mirrors(spec, token, dest_dir, log, cancelled) -> List[Archiv
         except MigrationError as exc:
             result.error = brief_error(exc)
             log(f"  ERROR {result.error}")
+        _run_checks(checks, result, [target], log)
         results.append(result)
     return results
 

@@ -12,6 +12,7 @@
   ./.venv/bin/python cli.py bitbucket ws/repo --extras none         # the archive alone
   ./.venv/bin/python cli.py github org/repo --per-repo-bundles      # + standalone <target>.zip per repo
   ./.venv/bin/python cli.py bitbucket-dc PROJ/repo --api-base https://bb.example.com
+  ./.venv/bin/python cli.py github --profiler summary.csv           # every profiled repo + check-report.json
 """
 
 from __future__ import annotations
@@ -89,6 +90,13 @@ def main(argv=None) -> int:
     p.add_argument("--dc-action", default="export", choices=["export", "preview", "cancel", "none"],
                    help="bitbucket-dc export job action")
     p.add_argument("--dc-job-id", default="", help="bitbucket-dc job to cancel")
+    p.add_argument("--profiler", type=Path, default=None,
+                   help="Codebase Profiler output (summary.csv, summary.xlsx or its .zip) to check every archive "
+                        "against in check-report.json; with no targets, every repo in it is migrated")
+    p.add_argument("--loc-tolerance", type=float, default=5.0,
+                   help="check-report: migration LOC may be this %% below the profiler's loc (default 5)")
+    p.add_argument("--pr-tolerance", type=float, default=5.0,
+                   help="check-report: merged PRs may be this %% below the profiler's merged_prs (default 5)")
     args = p.parse_args(argv)
     if args.resume and not args.run_name:
         p.error("--resume needs --run-name, the output folder of the run to continue")
@@ -135,6 +143,9 @@ def main(argv=None) -> int:
         dc_action=args.dc_action,
         dc_job_id=args.dc_job_id,
         mirror=not args.no_mirror,
+        profiler_path=str(args.profiler.expanduser().resolve()) if args.profiler else "",
+        loc_tolerance_pct=args.loc_tolerance,
+        pr_tolerance_pct=args.pr_tolerance,
     )
     try:
         manifest = run_job(spec, log=print)

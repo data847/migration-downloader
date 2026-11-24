@@ -360,6 +360,7 @@ paste a token in the form.
 ./.venv/bin/python cli.py github --scope org --org TEST_ORG guava
 ./.venv/bin/python cli.py gitlab google/guava --poll-interval 20
 ./.venv/bin/python cli.py github --file ../github_repos.txt --single-archive
+./.venv/bin/python cli.py github --profiler summary.csv --loc-tolerance 5 --pr-tolerance 5   # profiled repos + check-report.json
 ```
 
 Exit status: 0 all archives downloaded, 1 some failed, 2 bad invocation.
@@ -381,6 +382,69 @@ without a token or network. Long format, columns `repo,section,key,value`; a bla
 
 Disable with `--no-for-check` (CLI) or `for_check=false` in the job spec. Counts are two snapshots because things change while
 an export runs; a checker should only fail when the archive holds fewer than the lower of the two.
+
+## `check-report.json` (checks against the Codebase Profiler)
+
+Every run checks each archive right after it is downloaded and writes `check-report.json` beside `manifest.json`. It is
+rewritten after every repo (temp file + rename), so it is useful while the run is still going; the final pass sets
+`"complete": true`. Checking never fails or slows a download beyond the check itself: any error is recorded in the repo's
+entry.
+
+Optionally give the **Codebase Profiler output** first: `summary.csv`, `summary.xlsx` (only when `openpyxl` is installed)
+or the profiler's run `.zip` (its `summary.csv` is read from the zip in memory). In the UI, upload it under *Codebase
+Profiler output* above the start button; on the CLI pass `--profiler PATH`. Then:
+
+- **Autoselect.** With no repos typed or ticked, every repo in the file is migrated: GitHub `org/repo`, GitLab
+  `org/subgroup/repo`, Bitbucket `workspace/repo` (GitHub `--scope org`: the org's bare repo names). The UI adds them to
+  the list, ticks them in *Browse & select*, and names the ones the source does not show. Typed targets still win.
+- **Matching.** Archive repos are matched to profiler rows exactly: lowercased, no `.git`, URL host or archive suffix,
+  first by full path, then `owner/repo`, then the bare repo name, each only when unique on both sides. A name shared
+  by two profiler rows (or two repos of the run) is left unmatched and listed, never guessed.
+- **Tolerances.** `--loc-tolerance` / `--pr-tolerance` (UI: two fields, default 5 %). The profiler value is a floor:
+  `diff_pct = (migration - profiler) / profiler * 100`; migration at or above the profiler is OK, lower by up to the
+  tolerance is OK, lower by more is a mismatch. A profiler value of 0 or blank is not comparable (`ok: null`, never a
+  mismatch).
+
+Checks per repo:
+
+| Check | How |
+|---|---|
+| `valid` | the archive opens and holds git data (`repositories/<owner>/<repo>.git`, GitLab `project.bundle`, Bitbucket `<repo>.git`) from which `git` reads a commit on the branch; otherwise `false` with `valid_reason` |
+| `visibility` | the archive's repository record (GitHub `private` / `visibility`, GitLab `tree/project.json` `visibility_level` 0/10/20, Bitbucket `is_private`), else `extras/<repo>/repo-metadata.json`, else the for-check source snapshot; `null` with a reason when none says |
+| `prs` | `in_archive`: PR records in the PR files only (`pull_requests_*.json`, `tree/project/merge_requests.ndjson`, Bitbucket `extras/<repo>/pullrequests.json` when the archive has none), never activity, event or review files; `merged`: `merged_at` set or state merged; `with_metadata`: records carrying their number/id and title; `source_total` from for-check's `counts_after` (else `counts_before`); `count_match`: `in_archive == source_total` (informational) |
+| `loc` | the profiler row's `measured_branch` (else `default_branch`, else the repo's HEAD) is checked out from the archive into a temp folder (no hooks, the archive's git config ignored, no LFS smudge), measured with `scc --format json` summing `Code` exactly as the profiler does, then deleted. Without `scc` on the machine LOC is `null` ("scc not installed"); the Docker image ships the profiler's scc version |
+| `merged_prs` | merged PRs in the archive vs profiler `merged_prs`; when that is blank, vs `local_merges` (merge commits, said in `profiler_field` and `notes`) |
+
+A repo is listed in `mismatch` when it is invalid, or its LOC or merged-PR check is a mismatch (`mismatch_reasons` says
+which). The file starts with the lists:
+
+```json
+{
+  "mismatch": ["acme/gadgets"],
+  "not_migrated": ["acme/broken"],
+  "not_in_profiler": ["acme/extra-tool"],
+  "generated_at": "2026-11-24T10:12:03+00:00", "run": "github-20261124T100000Z", "complete": true,
+  "provider": "github", "profiler_file": "profiler-summary.csv", "tolerances": {"loc_pct": 5.0, "pr_pct": 5.0},
+  "failed_downloads": [{"repo": "acme/broken", "error": "HTTP 404 POST /orgs/acme/migrations"}],
+  "repos": [{"repo": "acme/gadgets", "archive": "acme-gadgets-42.tar.gz", "profiler_repo": "acme/gadgets",
+             "profiler_match": "path", "valid": true, "valid_reason": "", "visibility": "private",
+             "visibility_source": "archive",
+             "prs": {"source_total": 12, "in_archive": 12, "merged": 9, "with_metadata": 12, "count_match": true,
+                     "files": ["pull_requests_000001.json"]},
+             "loc": {"migration": 9280, "profiler": 10000, "diff_pct": -7.2, "ok": false, "branch": "main",
+                     "commit": "3f2c…", "reason": ""},
+             "merged_prs": {"migration": 9, "profiler": 9, "profiler_field": "merged_prs", "diff_pct": 0.0,
+                            "ok": true, "reason": ""},
+             "mismatch_reasons": ["loc 7.2% below profiler (9280 vs 10000)"], "notes": [], "errors": []}]
+}
+```
+
+`not_migrated` lists profiler repos with no archive (a failed download, or never reached); while the run is going only
+the failures are listed. `not_in_profiler` lists archives with no profiler row. Without a profiler file the report still
+gives validity, visibility and PRs, and `mismatch` holds the invalid archives. The run keeps a copy of the profiler file
+as `profiler-<name>` beside the report; a resume reuses it and the tolerances. The UI shows the mismatch list as a red
+banner at the top of the run with a link to download the report (`/api/check-report/<run>`); it is also in
+`run-files.zip`.
 ## Extras: what the archives leave out
 
 `--extras` runs read-only collectors after the export flow and writes them
