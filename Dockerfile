@@ -11,10 +11,28 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# git backs the `wiki` extras
+ARG TARGETARCH=amd64
+# same scc as the Codebase Profiler, so check-report.json measures LOC exactly the way the profiler did
+ARG SCC_VERSION=3.7.0
+
+# git backs the `wiki` extras and the archive checks; curl only fetches scc below
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git git-lfs \
+ && apt-get install -y --no-install-recommends git git-lfs ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      arm64) SCC_ARCH=arm64 ;; \
+      *) SCC_ARCH=x86_64 ;; \
+    esac; \
+    for attempt in 1 2 3; do \
+      curl -fsSL "https://github.com/boyter/scc/releases/download/v${SCC_VERSION}/scc_Linux_${SCC_ARCH}.tar.gz" \
+        -o /tmp/scc.tgz && break || ([ $attempt -eq 3 ] && exit 1); \
+      sleep 2; \
+    done; \
+    tar -xzf /tmp/scc.tgz -C /usr/local/bin scc; \
+    rm /tmp/scc.tgz; \
+    scc --version
 
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
@@ -22,7 +40,7 @@ RUN pip install -r requirements.txt
 # vendor/datalabs_paths.py is the workspace's single definition of the three
 # invariants; bootstrap.py prefers the real workspace copy on the host and this
 # vendored one inside the image, so the container needs no repo-root mount.
-COPY bootstrap.py errors.py ratelimit.py safety.py bundle.py migration_api.py supplementary.py bitbucket.py bitbucket_archive.py for_check.py runner.py jobstore.py redact.py app.py cli.py ./
+COPY bootstrap.py errors.py ratelimit.py safety.py bundle.py migration_api.py supplementary.py bitbucket.py bitbucket_archive.py for_check.py check_report.py runner.py jobstore.py redact.py app.py cli.py ./
 COPY vendor/ ./vendor/
 COPY templates/ ./templates/
 

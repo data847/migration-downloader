@@ -197,6 +197,13 @@
   .pill-btn.bad:hover,.pill-btn.bad:focus-visible{background:var(--bad);color:var(--accent-fg)}
   .picker .more{color:var(--muted);font-size:12.5px;padding:12px 18px;text-align:center}
   .picker .sso{padding:8px 18px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+  .banner.check{border-color:var(--ok)}
+  .banner.check.bad{border-color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,var(--panel-2))}
+  .banner.check.bad #check-text{color:var(--bad)}
+  .banner.check .check-sub{display:block;color:var(--muted);font-size:12.5px;margin-top:2px}
+  .check-reasons{flex-basis:100%;margin:0;padding-left:18px;font-family:var(--mono);font-size:12px;
+    color:var(--muted);word-break:break-word}
+  input[type=file]{width:100%;font:inherit;font-size:13px;color:var(--muted)}
   [hidden]{display:none!important}
 </style>
 </head>
@@ -293,6 +300,20 @@
         <input type="checkbox" id="verify_checksum" checked> Compute SHA-256 of each archive</label>
     </details>
 
+    <fieldset id="profiler-box">
+      <label for="profiler">Codebase Profiler output (summary.csv / .xlsx / .zip) · optional</label>
+      <input type="file" id="profiler" accept=".csv,.xlsx,.zip">
+      <div class="inline-act"><button class="ghost" type="button" id="profiler-clear" hidden>Remove profiler output</button></div>
+      <div class="hint" id="profiler-hint">Every repo in it is selected for you, and each archive is checked against it
+        as it downloads (<code>check-report.json</code>: valid, public/private, PRs, LOC and merged PRs).</div>
+      <div class="row" style="margin-top:10px">
+        <div><label for="loc_tol">LOC tolerance (%)</label>
+          <input type="number" id="loc_tol" value="5" min="0" max="100" step="0.1"></div>
+        <div><label for="pr_tol">Merged PR tolerance (%)</label>
+          <input type="number" id="pr_tol" value="5" min="0" max="100" step="0.1"></div>
+      </div>
+    </fieldset>
+
     <button class="primary" id="go" type="submit">Start migration &amp; download</button>
     <div class="hint" style="margin-top:12px">
       <span id="extras-note">Each run also collects everything the archive omits (wikis, CI history,
@@ -302,6 +323,14 @@
   </form>
 
   <div class="right">
+    <div class="banner check" id="check-banner" hidden role="status">
+      <span><strong id="check-text"></strong><span class="check-sub" id="check-sub"></span></span>
+      <span class="acts" style="display:flex;gap:8px">
+        <a class="ghost" id="check-dl" href="#">⬇ check-report.json</a>
+      </span>
+      <ul class="check-reasons" id="check-reasons" hidden></ul>
+    </div>
+
     <div class="banner" id="banner" hidden>
       <span id="banner-text"></span>
       <span class="acts" style="display:flex;gap:8px">
@@ -512,8 +541,96 @@ function syncVisibility(){
     ? `Leave blank to use the token in <code>{{ env_file }}</code> — ${esc(env)}`
     : `No ${provider} token found in <code>{{ env_file }}</code>; paste one above.`;
   updateExtrasNote();
+  if(profiler) applyProfiler();
 }
 $('dc_action').onchange = syncVisibility;
+
+/* ── Codebase Profiler output: autoselect its repos, check each archive against it ── */
+let profiler = null;                 // {upload, filename, rows, targets: {github, gitlab, bitbucket}}
+let profilerAdded = [];              // what applyProfiler put in the targets box (removed again on a provider switch)
+let profilerMissing = null;          // profiler repos the picker could not find on the source (null = not looked yet)
+const profilerTargets = () => profiler
+  ? (profiler.targets[provider.startsWith('bitbucket') ? 'bitbucket' : provider] || []) : [];
+function fileB64(f){
+  return new Promise((ok, bad) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result).split(',')[1] || '');
+    r.onerror = () => bad(r.error);
+    r.readAsDataURL(f);
+  });
+}
+function profilerHint(){
+  if(!profiler){
+    $('profiler-hint').innerHTML = 'Every repo in it is selected for you, and each archive is checked against it as it downloads (<code>check-report.json</code>: valid, public/private, PRs, LOC and merged PRs).';
+    return;
+  }
+  const t = profilerTargets();
+  let html = `<b>${esc(profiler.filename)}</b>: ${plural(profiler.rows, 'row')}, ${plural(t.length, 'repo')} selected for ${esc(provider)} (added to the list above and ticked in Browse).`;
+  if(profilerMissing && profilerMissing.length)
+    html += `<br><span style="color:var(--bad)">Not found on the source (${profilerMissing.length}): ${esc(profilerMissing.join(', '))}</span>`;
+  else if(profilerMissing) html += ' All of them were found on the source.';
+  $('profiler-hint').innerHTML = html;
+}
+function applyProfiler(){
+  const t = profilerTargets();
+  const gone = new Set(profilerAdded.map(x => x.toLowerCase()));
+  const existing = $('targets').value.split('\n').map(x => x.trim()).filter(x => x && !gone.has(x.toLowerCase()));
+  const have = new Set(existing.map(x => x.toLowerCase()));
+  profilerAdded = t.filter(x => !have.has(x.toLowerCase()));
+  $('targets').value = existing.concat(profilerAdded).join('\n') + (existing.length || profilerAdded.length ? '\n' : '');
+  t.forEach(x => pickerSel.add(x));
+  profilerMissing = null;
+  profilerHint();
+}
+$('profiler').onchange = async () => {
+  const f = $('profiler').files[0];
+  if(!f) return;
+  $('profiler-hint').textContent = `reading ${f.name}…`;
+  let res, d;
+  try {
+    res = await fetch('/api/profiler', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({filename: f.name, data: await fileB64(f)})});
+    d = await res.json();
+  } catch(e){ d = {error: String(e)}; res = {ok: false}; }
+  if(!res.ok){
+    profiler = null; $('profiler').value = ''; $('profiler-clear').hidden = true;
+    $('profiler-hint').innerHTML = `<span style="color:var(--bad)">${esc(d.error || 'upload failed')}</span>`;
+    return;
+  }
+  profiler = d;
+  $('profiler-clear').hidden = false;
+  applyProfiler();
+};
+$('profiler-clear').onclick = () => {
+  const gone = new Set(profilerAdded.map(x => x.toLowerCase()));
+  $('targets').value = $('targets').value.split('\n').filter(x => !gone.has(x.trim().toLowerCase())).join('\n');
+  profilerTargets().forEach(x => pickerSel.delete(x));
+  profiler = null; profilerAdded = []; profilerMissing = null;
+  $('profiler').value = ''; $('profiler-clear').hidden = true;
+  profilerHint();
+};
+
+/* the check-report banner, at the top of the run: mismatches in red, with the report to download */
+function renderCheck(check){
+  const b = $('check-banner');
+  if(!check || !check.run){ b.hidden = true; return; }
+  const mm = check.mismatch || [], nm = check.not_migrated || [], np = check.not_in_profiler || [];
+  b.hidden = false;
+  b.className = 'banner check' + (mm.length ? ' bad' : '');
+  $('check-text').textContent = mm.length ? `Mismatch: ${mm.join(', ')}`
+    : (check.complete ? 'Checks passed: no mismatch' : 'Checks: no mismatch so far');
+  const sub = [];
+  if(!check.complete) sub.push('updated after every repo');
+  if(nm.length) sub.push(`not migrated (${nm.length}): ${nm.slice(0, 8).join(', ')}${nm.length > 8 ? ' …' : ''}`);
+  if(np.length) sub.push(`not in the profiler output (${np.length}): ${np.slice(0, 8).join(', ')}${np.length > 8 ? ' …' : ''}`);
+  if(!check.profiler_file) sub.push('no profiler output: validity, visibility and PR checks only');
+  $('check-sub').textContent = sub.join(' · ');
+  $('check-dl').href = `/api/check-report/${encodeURIComponent(check.run)}`;
+  const reasons = Object.entries(check.reasons || {});
+  $('check-reasons').hidden = !reasons.length;
+  $('check-reasons').innerHTML = reasons.map(([r, why]) =>
+    `<li>${esc(r)}: ${esc((why || []).join('; '))}</li>`).join('');
+}
 
 /* Bitbucket is one button; the host picks the backend provider, like github.com vs
    Enterprise: bitbucket.org -> Cloud ('bitbucket'), self-hosted -> 'bitbucket-dc'. */
@@ -672,6 +789,7 @@ async function poll(){
   $('dl-log').hidden = false;
   $('dl-log').href = `/api/jobs/${job.id}/log`;
   $('go').disabled = running;
+  renderCheck(job.check);
   renderResults(job.manifest);
   if(!running){
     clearInterval(timer);
@@ -713,8 +831,10 @@ $('form').onsubmit = async (ev) => {
     run_name: $('run_name').value,
     extras: selectedExtras(), max_items: maxItems,
     lock_repositories: $('lock_repositories').checked,
-    single_archive: $('single_archive').checked,    verify_checksum: $('verify_checksum').checked };
-  $('go').disabled = true; $('banner').hidden = true;
+    single_archive: $('single_archive').checked,    verify_checksum: $('verify_checksum').checked,
+    profiler_upload: profiler ? profiler.upload : '',
+    loc_tolerance: $('loc_tol').value, pr_tolerance: $('pr_tol').value };
+  $('go').disabled = true; $('banner').hidden = true; $('check-banner').hidden = true;
   $('log').textContent = ''; $('results-card').hidden = true; $('extras-card').hidden = true; since = 0;
   setState('starting', 'run');
   const res = await fetch('/api/jobs', {method:'POST',
@@ -869,6 +989,7 @@ async function openPicker(mode, owner = null, keepSelection = false){
   $('picker-sso').hidden = provider !== 'github';
   $('picker-search').value = '';
   if(!keepSelection) pickerSel = new Set();      // moving between workspaces keeps what is ticked
+  profilerTargets().forEach(t => pickerSel.add(t));   // a profiler output ticks its repos for you
   pickerOpen = new Set();
   pickerItems = []; pickerPage = 0; pickerMore = true; pickerLoading = false;
   pickerNotes = new Set(); pickerError = '';
@@ -899,6 +1020,12 @@ async function loadPickerPage(){
     pickerPage += 1;
     pickerMore = !!data.has_more;
     pickerItems.push(...data.items);
+    // a profiler repo ticks the listed repo even when its case differs (the source's spelling wins)
+    const want = new Map(profilerTargets().map(t => [t.toLowerCase(), t]));
+    data.items.forEach(i => {
+      const p = i.target && want.get(i.target.toLowerCase());
+      if(p && p !== i.target && pickerSel.has(p)){ pickerSel.delete(p); pickerSel.add(i.target); }
+    });
     (data.notes || []).forEach(n => pickerNotes.add(n));
     if(!pickerItems.length){ $('picker-list').innerHTML = '<div class="note">nothing visible to this token</div>'; pickerNote(); return; }
   }
@@ -917,6 +1044,17 @@ function maybeLoadMore(){
 function pickerNote(){
   const parts = [`${pickerItems.length} loaded`, pickerMore ? 'scroll for more' : 'all loaded'];
   if(pickerError) parts.push(pickerError);
+  // once the whole list is in, name the profiler repos the source does not show
+  const want = profilerTargets();
+  if(want.length && pickerMode === 'repos' && !pickerMore && !pickerError && pickerItems.length){
+    const seen = new Set(pickerItems.filter(i => i.target).map(i => i.target.toLowerCase()));
+    const prefix = pickerOwner && pickerOwner.kind !== 'personal' ? pickerOwner.name.toLowerCase() + '/' : '';
+    const scoped = want.filter(t => !prefix || t.toLowerCase().startsWith(prefix));
+    const missing = scoped.filter(t => !seen.has(t.toLowerCase()));
+    if(!pickerOwner || prefix){ profilerMissing = missing; profilerHint(); }
+    if(missing.length) parts.push(`${missing.length} profiler repo(s) not found here: ${missing.slice(0, 6).join(', ')}${missing.length > 6 ? ' …' : ''}`);
+    else if(scoped.length) parts.push(`all ${scoped.length} profiler repo(s) found and ticked`);
+  }
   $('picker-note').textContent = parts.join(' · ');
   const warn = [...pickerNotes];
   if(warn.length){ $('picker-sso').hidden = false; $('picker-sso').textContent = warn.join(' '); }
@@ -1055,7 +1193,9 @@ $('picker-none').onclick = () => {
 $('picker-add').onclick = () => {
   const picked = [...pickerSel];
   const existing = $('targets').value.split('\n').map(t => t.trim()).filter(Boolean);
-  $('targets').value = [...new Set([...existing, ...picked])].join('\n') + (picked.length ? '\n' : '');
+  const merged = new Map();             // one line per repo, whatever its case
+  [...existing, ...picked].forEach(t => { if(!merged.has(t.toLowerCase())) merged.set(t.toLowerCase(), t); });
+  $('targets').value = [...merged.values()].join('\n') + (picked.length ? '\n' : '');
   closePicker();
 };
 $('pick-repos').onclick = () => openPicker('repos');

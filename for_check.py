@@ -50,7 +50,7 @@ query($o:String!,$r:String!){repository(owner:$o,name:$r){
   defaultBranchRef{name target{... on Commit{history{totalCount}}}}
   pullRequests{totalCount} issues{totalCount} labels{totalCount} milestones{totalCount} releases{totalCount}
   branches:refs(refPrefix:"refs/heads/"){totalCount} tags:refs(refPrefix:"refs/tags/"){totalCount}
-  diskUsage hasWikiEnabled hasIssuesEnabled}}
+  diskUsage hasWikiEnabled hasIssuesEnabled isPrivate}}
 """
 
 
@@ -150,6 +150,8 @@ def github_counts(owner: str, repo: str, *, headers: dict, api_base: str) -> Dic
                  default_branch=ref["name"] if ref else "",
                  has_wiki=str(bool(r.get("hasWikiEnabled"))).lower(),
                  has_issues=str(bool(r.get("hasIssuesEnabled"))).lower())
+        if isinstance(r.get("isPrivate"), bool):          # for check-report.json's visibility fallback
+            c["visibility"] = "private" if r["isPrivate"] else "public"
     except Exception as exc:
         errors.append(f"graphql: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
     base = f"{api_base.rstrip('/')}/repos/{owner}/{repo}"
@@ -173,6 +175,8 @@ def gitlab_counts(project: str, *, headers: dict, api_base: str) -> Dict[str, ob
         c["commits"] = (info.get("statistics") or {}).get("commit_count", "")
         c["default_branch"] = info.get("default_branch") or ""
         c["has_wiki"] = str(bool(info.get("wiki_enabled"))).lower()
+        if info.get("visibility"):
+            c["visibility"] = info["visibility"]
     except Exception as exc:
         errors.append(f"project: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
     for key, path in (("issues", "issues?scope=all"), ("prs", "merge_requests?scope=all&state=all"),
@@ -197,6 +201,8 @@ def bitbucket_counts(target: str, *, headers: dict, api_base: str) -> Dict[str, 
     try:
         info, _ = _get(base, headers)
         c["default_branch"] = ((info or {}).get("mainbranch") or {}).get("name", "")
+        if isinstance((info or {}).get("is_private"), bool):
+            c["visibility"] = "private" if info["is_private"] else "public"
         if isinstance((info or {}).get("size"), int):
             c["size_kb"] = info["size"] // 1024
     except Exception as exc:
